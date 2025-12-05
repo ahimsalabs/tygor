@@ -142,16 +142,16 @@ git tag "${TAG}"
 # Publish both packages (use bun to resolve workspace:* dependencies)
 echo ""
 echo "Publishing @tygor/client..."
-cd packages/client
+pushd packages/client
 bun publish
-cd ..
+popd
 
 echo ""
 echo "Publishing @tygor/vite-plugin..."
-cd packages/vite-plugin
+pushd packages/vite-plugin
 bun install --ignore-scripts
 bun publish
-cd ..
+popd
 
 echo ""
 echo "Successfully released ${TAG}. Run: git push && git push --tags"
