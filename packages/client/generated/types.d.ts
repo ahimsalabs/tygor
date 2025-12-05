@@ -1,0 +1,15 @@
+/**
+ * Error is the standard JSON error envelope.
+ * @see tygor.dev/tygor/errors.go#Error
+ */
+export interface Error {
+    code: ErrorCode;
+    message: string;
+    details?: Record<string, unknown>;
+}
+/**
+ * ErrorCode represents a machine-readable error code.
+ * @see tygor.dev/tygor/errors.go#ErrorCode
+ */
+export type ErrorCode = "already_exists" | "canceled" | "conflict" | "deadline_exceeded" | "gone" | "internal" | "invalid_argument" | "method_not_allowed" | "not_found" | "not_implemented" | "permission_denied" | "resource_exhausted" | "unauthenticated" | "unavailable";
+//# sourceMappingURL=types.d.ts.map

@@ -1,0 +1,60 @@
+{
+  "name": "@tygor/vite-plugin",
+  "version": "0.8.2",
+  "description": "Vite plugin for tygor - hot reload Go backend with error overlay",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node scripts/build-client.js && tsc",
+    "build:client": "bun scripts/build-client.js",
+    "dev:client": "node scripts/build-client.js --watch",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "vite",
+    "vite-plugin",
+    "tygor",
+    "hot-reload",
+    "go",
+    "golang",
+    "typescript"
+  ],
+  "author": "Ahimsa Labs",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://tygor.dev.git",
+    "directory": "vite-plugin"
+  },
+  "peerDependencies": {
+    "vite": "^5.0.0 || ^6.0.0"
+  },
+  "dependencies": {
+    "@tygor/client": "workspace:*",
+    "chokidar": "^3.6.0",
+    "picocolors": "^1.0.0",
+    "solid-js": "^1.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "esbuild-plugin-solid": "^0.6.0",
+    "typescript": "^5.0.0",
+    "vite": "^6.0.0"
+  }
+}

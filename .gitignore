@@ -1,0 +1,27 @@
+coverage.*
+node_modules
+package-lock.json
+
+# TypeScript build output (client runtime)
+client/runtime.js
+client/runtime.d.ts
+client/runtime.d.ts.map
+
+# Example build artifacts
+examples/*/server
+examples/blog/blog
+examples/starter-solid/starter-solid
+examples/multipackage/tygor
+
+# CLI binary (built at root)
+# Note: tygor/ directory contains library code, don't ignore it
+/tygor
+!/tygor/
+
+# Generated RPC files (machine-specific paths)
+**/discovery.json
+
+# Draft documentation (working notes, not part of spec)
+doc/drafts/
+examples/devtools/client/dist/
+examples/starter-solid/tmp/

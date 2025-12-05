@@ -1,0 +1,14 @@
+# Source files (only ship compiled JS and types)
+*.ts
+!*.d.ts
+
+# Config files
+tsconfig.json
+
+# Tests
+*.test.*
+*.spec.*
+
+# Development
+node_modules/
+.DS_Store

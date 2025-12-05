@@ -1,0 +1,8 @@
+{
+  "name": "tygor-monorepo",
+  "private": true,
+  "workspaces": ["packages/*", "doc/examples"],
+  "scripts": {
+    "build:client": "cd packages/client && bun run build"
+  }
+}

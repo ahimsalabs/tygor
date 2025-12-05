@@ -1,0 +1,50 @@
+{
+  "name": "@tygor/client",
+  "version": "0.8.2",
+  "description": "TypeScript runtime client for tygor RPC framework",
+  "main": "./runtime.js",
+  "types": "./runtime.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./runtime.d.ts",
+      "import": "./runtime.js"
+    }
+  },
+  "files": [
+    "runtime.js",
+    "runtime.d.ts",
+    "runtime.d.ts.map",
+    "generated/"
+  ],
+  "scripts": {
+    "build": "bunx tsc",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "rpc",
+    "typescript",
+    "type-safe",
+    "client",
+    "tygor",
+    "http",
+    "json",
+    "rest",
+    "golang",
+    "go"
+  ],
+  "author": "Ahimsa Labs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://tygor.dev.git",
+    "directory": "client"
+  },
+  "bugs": {
+    "url": "https://tygor.dev/issues"
+  },
+  "homepage": "https://tygor.dev#readme",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

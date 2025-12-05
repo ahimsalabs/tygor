@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  precommit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install all workspace packages
+        run: bun install --ignore-scripts
+
+      - name: Build client package
+        run: bun run --cwd packages/client build
+
+      - name: Build vite-plugin
+        run: bun run --cwd packages/vite-plugin build:client
+
+      - name: Run precommit checks
+        run: make precommit

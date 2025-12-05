@@ -1,0 +1,872 @@
+/* Tygor DevTools - CSS Variables */
+:host {
+  /* Colors */
+  --tygor-bg: #fff8f0;
+  --tygor-bg-dark: #1a1a1a;
+  --tygor-text: #222;
+  --tygor-text-muted: #555;
+  --tygor-text-hint: #888;
+  --tygor-accent: #ff9f43;
+  --tygor-accent-dark: #b35309;
+  --tygor-accent-light: rgba(255, 172, 66, 0.15);
+  --tygor-border: rgba(255, 172, 66, 0.3);
+  --tygor-success: #16a34a;
+  --tygor-error: #dc2626;
+
+  /* Sizes */
+  --tygor-sidebar-width: 300px;
+  --tygor-tiger-btn-size: 40px;
+  --tygor-radius: 4px;
+  --tygor-radius-sm: 3px;
+
+  /* Fonts */
+  --tygor-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --tygor-font-mono: ui-monospace, "SF Mono", Consolas, monospace;
+
+  /* Z-index */
+  --tygor-z-index: 2147483647;
+}
+
+/* ============================================
+   Global: Default cursor (not text cursor)
+   ============================================ */
+
+.tygor-tiger-btn,
+.tygor-sidebar {
+  cursor: default;
+}
+
+/* Text cursor for copyable content */
+.tygor-sidebar-error-output,
+.tygor-sidebar-error-cmd,
+.tygor-sidebar-rpc-code,
+.tygor-sidebar-rpc-message,
+.tygor-sidebar-rpc-endpoint {
+  cursor: text;
+}
+
+/* ============================================
+   Tiger Button (Overlay Mode)
+   ============================================ */
+
+.tygor-tiger-btn {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: var(--tygor-tiger-btn-size);
+  height: var(--tygor-tiger-btn-size);
+  border-radius: 50%;
+  background: var(--tygor-bg);
+  border: 1px solid var(--tygor-border);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
+  cursor: pointer;
+  z-index: var(--tygor-z-index);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s, box-shadow 0.15s;
+  padding: 0;
+}
+
+.tygor-tiger-btn:hover {
+  transform: scale(1.05);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+}
+
+.tygor-tiger-btn:active {
+  transform: scale(0.98);
+}
+
+.tygor-tiger-btn--error {
+  border-color: var(--tygor-error);
+  animation: tygor-pulse-error 2s ease-in-out infinite;
+}
+
+.tygor-tiger-btn--building {
+  border-color: var(--tygor-accent);
+  animation: tygor-glow-building 1.5s ease-in-out infinite;
+}
+
+.tygor-tiger-icon {
+  font-size: 20px;
+  line-height: 1;
+  user-select: none;
+}
+
+/* Pacing tiger animation - instant flip, smooth position */
+.tygor-tiger-runner {
+  font-size: 20px;
+  line-height: 1;
+  user-select: none;
+  animation: tygor-pace 0.8s steps(1) infinite;
+}
+
+@keyframes tygor-pace {
+  0%, 49.9% {
+    transform: scaleX(1);
+  }
+  50%, 100% {
+    transform: scaleX(-1);
+  }
+}
+
+@keyframes tygor-glow-building {
+  0%, 100% {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(255, 159, 67, 0.5), 0 0 30px rgba(255, 159, 67, 0.3);
+  }
+}
+
+/* Disconnected state */
+.tygor-tiger-btn--disconnected .tygor-tiger-icon {
+  opacity: 0.35;
+  filter: grayscale(80%);
+}
+
+/* Expanded error pill */
+.tygor-tiger-btn--expanded {
+  width: auto;
+  border-radius: 20px;
+  padding: 0 12px 0 0;
+  gap: 8px;
+  height: auto;
+  min-height: var(--tygor-tiger-btn-size);
+}
+
+.tygor-tiger-btn--expanded:hover {
+  transform: none;
+}
+
+.tygor-tiger-btn-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--tygor-tiger-btn-size);
+  height: var(--tygor-tiger-btn-size);
+  flex-shrink: 0;
+}
+
+.tygor-tiger-btn-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 6px 0;
+  min-width: 0;
+}
+
+.tygor-tiger-btn-title {
+  font-family: var(--tygor-font);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--tygor-error);
+  white-space: nowrap;
+}
+
+.tygor-tiger-btn-summary {
+  font-family: var(--tygor-font-mono);
+  font-size: 10px;
+  color: var(--tygor-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+
+@keyframes tygor-pulse-error {
+  0%, 100% {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
+  }
+  50% {
+    box-shadow: 0 2px 20px rgba(220, 38, 38, 0.4);
+  }
+}
+
+/* ============================================
+   Sidebar
+   ============================================ */
+
+.tygor-sidebar {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: var(--tygor-sidebar-width);
+  height: calc(100vh - 32px);
+  background: var(--tygor-bg);
+  border: 1px solid var(--tygor-border);
+  border-radius: 24px;
+  z-index: var(--tygor-z-index);
+  display: flex;
+  flex-direction: column;
+  font-family: var(--tygor-font);
+  font-size: 12px;
+  color: var(--tygor-text);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.12), 0 2px 12px rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+}
+
+.tygor-sidebar-panes {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.tygor-sidebar--left {
+  right: auto;
+  left: 16px;
+}
+
+/* Docked mode: snap to edges */
+.tygor-sidebar--docked {
+  top: 0;
+  right: 0;
+  height: 100vh;
+  border-radius: 0;
+  border: none;
+  border-left: 1px solid var(--tygor-border);
+  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.08);
+}
+
+.tygor-sidebar--docked.tygor-sidebar--left {
+  left: 0;
+  border-left: none;
+  border-right: 1px solid var(--tygor-border);
+  box-shadow: 4px 0 24px rgba(0, 0, 0, 0.08);
+}
+
+/* Header */
+.tygor-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--tygor-accent-light);
+  border-bottom: 1px solid var(--tygor-border);
+  border-radius: 24px 24px 0 0;
+}
+
+.tygor-sidebar--docked .tygor-sidebar-header {
+  border-radius: 0;
+  padding: 10px 12px;
+}
+
+.tygor-sidebar-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tygor-sidebar-icon {
+  font-size: 16px;
+  cursor: pointer;
+  transition: transform 0.15s;
+  user-select: none;
+}
+
+.tygor-sidebar-icon:hover {
+  transform: scale(1.15);
+}
+
+.tygor-sidebar-icon:active {
+  transform: scale(0.95);
+}
+
+.tygor-sidebar-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--tygor-accent-dark);
+}
+
+.tygor-sidebar-version {
+  font-size: 10px;
+  color: var(--tygor-text-hint);
+  font-weight: 400;
+}
+
+.tygor-sidebar-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tygor-sidebar-dock-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--tygor-text-hint);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: var(--tygor-radius-sm);
+  opacity: 0.6;
+  transition: opacity 0.15s, border-color 0.15s, color 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tygor-sidebar-dock-btn:hover {
+  opacity: 1;
+}
+
+.tygor-sidebar-dock-btn--active {
+  opacity: 1;
+  color: var(--tygor-accent-dark);
+  border-color: var(--tygor-accent-dark);
+}
+
+.tygor-sidebar-collapse {
+  background: none;
+  border: none;
+  font-size: 14px;
+  color: var(--tygor-text-hint);
+  cursor: pointer;
+  padding: 2px 6px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.tygor-sidebar-collapse:hover {
+  opacity: 1;
+}
+
+/* Status Grid */
+.tygor-sidebar-status-grid {
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tygor-sidebar-status-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tygor-sidebar-status-name {
+  font-size: 11px;
+  color: var(--tygor-text-hint);
+  width: 28px;
+}
+
+.tygor-sidebar-status-value {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.tygor-sidebar-status-value--ok {
+  color: var(--tygor-text-muted);
+}
+
+.tygor-sidebar-status-value--error {
+  color: var(--tygor-error);
+}
+
+.tygor-sidebar-status-value--building {
+  color: var(--tygor-accent-dark);
+}
+
+.tygor-sidebar-status-value--disconnected {
+  color: var(--tygor-text-hint);
+}
+
+.tygor-sidebar-status-duration {
+  font-size: 10px;
+  color: var(--tygor-text-hint);
+  font-variant-numeric: tabular-nums;
+}
+
+.tygor-sidebar-status-port {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--tygor-text-hint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Error Panel */
+.tygor-sidebar-error,
+.tygor-sidebar-rpc-error {
+  padding: 12px;
+  background: rgba(220, 38, 38, 0.05);
+  border-bottom: 1px solid rgba(220, 38, 38, 0.1);
+}
+
+.tygor-sidebar-error-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.tygor-sidebar-error-title {
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--tygor-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.tygor-sidebar-error-copy,
+.tygor-sidebar-error-dismiss {
+  background: none;
+  border: 1px solid var(--tygor-border);
+  color: var(--tygor-text-hint);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: var(--tygor-radius-sm);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.tygor-sidebar-error-dismiss {
+  font-size: 14px;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.tygor-sidebar-error-copy:hover,
+.tygor-sidebar-error-dismiss:hover {
+  border-color: var(--tygor-accent-dark);
+  color: var(--tygor-accent-dark);
+}
+
+.tygor-sidebar-error-copy--copied {
+  border-color: var(--tygor-success);
+  color: var(--tygor-success);
+}
+
+.tygor-sidebar-error-cmd {
+  color: var(--tygor-text-hint);
+  font-size: 10px;
+  margin: 0 0 8px;
+  font-family: var(--tygor-font-mono);
+}
+
+.tygor-sidebar-error-output {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: 11px;
+  line-height: 1.5;
+  font-family: var(--tygor-font-mono);
+  tab-size: 2;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.tygor-sidebar-error-hint {
+  color: var(--tygor-text-hint);
+  margin: 10px 0 0;
+  font-size: 10px;
+}
+
+/* RPC Error */
+.tygor-sidebar-rpc-endpoint {
+  font-family: var(--tygor-font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--tygor-text);
+  margin-bottom: 6px;
+}
+
+.tygor-sidebar-rpc-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tygor-sidebar-rpc-code {
+  font-family: var(--tygor-font-mono);
+  font-size: 10px;
+  color: var(--tygor-accent-dark);
+  background: var(--tygor-accent-light);
+  padding: 2px 6px;
+  border-radius: var(--tygor-radius-sm);
+  width: fit-content;
+}
+
+.tygor-sidebar-rpc-message {
+  font-size: 11px;
+  color: var(--tygor-text-muted);
+}
+
+/* Sections */
+.tygor-sidebar-section {
+  padding: 12px;
+  border-bottom: 1px solid var(--tygor-border);
+}
+
+.tygor-sidebar-section-title {
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--tygor-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.tygor-sidebar-services {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tygor-sidebar-service {
+  font-family: var(--tygor-font-mono);
+  font-size: 11px;
+  color: var(--tygor-text);
+}
+
+.tygor-sidebar-service-header {
+  display: flex;
+  align-items: center;
+  padding: 4px 0;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tygor-sidebar-service-header:hover {
+  color: var(--tygor-accent-dark);
+}
+
+.tygor-sidebar-service-toggle {
+  width: 12px;
+  font-size: 8px;
+  color: var(--tygor-text-hint);
+}
+
+.tygor-sidebar-service-name {
+  font-weight: 500;
+}
+
+.tygor-sidebar-service-count {
+  color: var(--tygor-text-hint);
+  font-size: 10px;
+  margin-left: 4px;
+  font-weight: 400;
+}
+
+.tygor-sidebar-endpoints {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 4px 0;
+}
+
+.tygor-sidebar-endpoint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 11px;
+  justify-content: space-between;
+}
+
+.tygor-sidebar-endpoint-verb {
+  font-size: 8px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 2px;
+  height: fit-content;
+  width: 36px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.tygor-sidebar-endpoint-verb--query {
+  background: rgba(34, 197, 94, 0.15);
+  color: #16a34a;
+}
+
+.tygor-sidebar-endpoint-verb--exec {
+  background: rgba(251, 146, 60, 0.15);
+  color: #c2410c;
+}
+
+.tygor-sidebar-endpoint-verb--stream {
+  background: rgba(139, 92, 246, 0.15);
+  color: #7c3aed;
+}
+
+.tygor-sidebar-endpoint-verb--atom {
+  background: rgba(6, 182, 212, 0.15);
+  color: #0891b2;
+}
+
+.tygor-sidebar-endpoint-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tygor-sidebar-endpoint-sig {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--tygor-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tygor-sidebar-endpoint-res {
+  color: var(--tygor-text-muted);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.tygor-sidebar-endpoint-arrow {
+  font-family: var(--tygor-font);
+}
+
+/* ============================================
+   Legacy Alert Component (kept for compatibility)
+   ============================================ */
+
+.tygor-alert {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: var(--tygor-z-index);
+  max-width: 520px;
+  max-height: 60vh;
+  background: var(--tygor-bg);
+  color: var(--tygor-text);
+  border-radius: var(--tygor-radius);
+  font-family: var(--tygor-font);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--tygor-border);
+}
+
+.tygor-alert-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--tygor-accent-light);
+  border-bottom: 1px solid rgba(255, 172, 66, 0.15);
+  gap: 12px;
+}
+
+.tygor-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--tygor-accent-dark);
+}
+
+.tygor-alert-icon {
+  font-size: 14px;
+  user-select: none;
+}
+
+.tygor-alert-prefix {
+  font-weight: 600;
+  opacity: 0.8;
+}
+
+.tygor-alert-title-text {
+  font-weight: 500;
+}
+
+.tygor-alert-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tygor-alert-duration {
+  font-size: 11px;
+  color: var(--tygor-text-hint);
+  font-variant-numeric: tabular-nums;
+}
+
+.tygor-alert-close {
+  background: none;
+  border: none;
+  color: var(--tygor-accent-dark);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 2px;
+  opacity: 0.6;
+  line-height: 1;
+}
+
+.tygor-alert-close:hover {
+  opacity: 1;
+}
+
+.tygor-alert-body {
+  padding: 12px;
+  overflow: auto;
+  font-size: 12px;
+  color: var(--tygor-text-muted);
+}
+
+.tygor-alert-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: 11px;
+  line-height: 1.6;
+  font-family: var(--tygor-font-mono);
+  tab-size: 2;
+}
+
+.tygor-alert-body .command {
+  color: var(--tygor-text-hint);
+  font-size: 10px;
+  margin: 0 0 8px;
+  font-family: var(--tygor-font-mono);
+}
+
+.tygor-alert-body .hint {
+  color: var(--tygor-text-hint);
+  margin: 10px 0 0;
+  font-size: 10px;
+}
+
+/* Action buttons */
+.tygor-btn {
+  background: none;
+  border: 1px solid var(--tygor-border);
+  color: var(--tygor-text-hint);
+  font-size: 11px;
+  cursor: pointer;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--tygor-radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.tygor-btn:hover {
+  border-color: var(--tygor-accent-dark);
+  color: var(--tygor-accent-dark);
+}
+
+.tygor-btn-copied {
+  border-color: var(--tygor-success);
+  color: var(--tygor-success);
+}
+
+/* RPC Error styles */
+.rpc-error {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rpc-error-endpoint {
+  font-family: var(--tygor-font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--tygor-text);
+}
+
+.rpc-error-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rpc-error-code {
+  font-family: var(--tygor-font-mono);
+  font-size: 10px;
+  color: var(--tygor-accent-dark);
+  background: var(--tygor-accent-light);
+  padding: 2px 6px;
+  border-radius: var(--tygor-radius-sm);
+  width: fit-content;
+}
+
+.rpc-error-message {
+  font-size: 12px;
+  color: var(--tygor-text-muted);
+}
+
+/* Status message */
+.status-message {
+  font-size: 12px;
+  color: var(--tygor-text);
+}
+
+/* ============================================
+   Pane Component
+   ============================================ */
+
+.tygor-pane {
+  border-bottom: 1px solid var(--tygor-border);
+}
+
+.tygor-pane--dragging {
+  opacity: 0.5;
+}
+
+.tygor-pane-drop-end {
+  height: 8px;
+  margin: -4px 0;
+  position: relative;
+  z-index: 1;
+}
+
+.tygor-pane-header {
+  display: flex;
+  align-items: center;
+  padding: 5px 12px;
+  background: var(--tygor-accent-light);
+  cursor: default;
+  user-select: none;
+  gap: 6px;
+}
+
+.tygor-pane-header:hover {
+  background: rgba(255, 172, 66, 0.2);
+}
+
+.tygor-pane-title {
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--tygor-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.tygor-pane-status {
+  margin-left: auto;
+  margin-right: 4px;
+  font-size: 10px;
+  color: var(--tygor-text-hint);
+  font-family: var(--tygor-font-mono);
+}
+
+.tygor-pane-chevron {
+  font-size: 10px;
+  color: var(--tygor-text-hint);
+  width: 12px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.tygor-pane-content {
+  /* Content styling inherits from existing section styles */
+}
+
+.tygor-pane--collapsed .tygor-pane-content {
+  display: none;
+}
+
+.tygor-pane-empty {
+  padding: 12px;
+  color: var(--tygor-text-hint);
+  font-size: 11px;
+}
+
+/* Services list inside pane */
+.tygor-pane-content .tygor-sidebar-services {
+  padding: 8px 12px;
+}

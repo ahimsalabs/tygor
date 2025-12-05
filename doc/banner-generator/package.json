@@ -1,0 +1,9 @@
+{
+  "name": "code2svg",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "satori": "^0.10.14",
+    "satori-html": "^0.3.2"
+  }
+}

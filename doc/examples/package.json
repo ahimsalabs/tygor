@@ -1,0 +1,10 @@
+{
+  "name": "tygor-doc-examples",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@tygor/client": "workspace:*",
+    "typescript": "^5.0.0",
+    "zod": "^3.23.0"
+  }
+}
