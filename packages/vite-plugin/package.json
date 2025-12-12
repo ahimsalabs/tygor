@@ -1,6 +1,6 @@
 {
   "name": "@tygor/vite-plugin",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "Vite plugin for tygor - hot reload Go backend with error overlay",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
