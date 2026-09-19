@@ -19,6 +19,7 @@
     "build:client": "bun scripts/build-client.js",
     "dev:client": "node scripts/build-client.js --watch",
     "typecheck": "tsc --noEmit",
+    "test": "bun run build && bun test",
     "dev": "tsc --watch",
     "prepublishOnly": "npm run build"
   },

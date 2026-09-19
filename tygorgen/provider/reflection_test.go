@@ -130,6 +130,7 @@ type CustomTags struct {
 type SkipFields struct {
 	Included string `json:"included"`
 	Skipped  string `json:"-"`
+	//lint:ignore SA5008 Intentionally malformed to verify only an exact "-" tag skips a field.
 	AlsoSkip string `json:"-,"`
 }
 

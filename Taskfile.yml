@@ -136,6 +136,7 @@ tasks:
     dir: packages/vite-plugin
     cmds:
       - bun run --silent typecheck
+      - bun run --silent test
 
   precommit:devserver:
     internal: true
