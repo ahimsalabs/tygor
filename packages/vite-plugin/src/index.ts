@@ -1,4 +1,4 @@
-import { spawn, ChildProcess, exec } from "node:child_process";
+import { spawn, spawnSync, ChildProcess, type SpawnOptions } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:net";
@@ -78,6 +78,46 @@ const DEFAULT_OPTIONS = {
   proxyPrefix: "/",
 };
 
+interface PluginLifecycle {
+  dispose(): Promise<void>;
+  disposeSync(): void;
+}
+
+const activeLifecycles = new Map<string, PluginLifecycle>();
+let handlingSignal = false;
+
+const onSignal = (signal: NodeJS.Signals) => {
+  if (handlingSignal) return;
+  handlingSignal = true;
+  void Promise.allSettled([...activeLifecycles.values()].map((lifecycle) => lifecycle.dispose())).then(() => {
+    process.exitCode = signal === "SIGINT" ? 130 : 143;
+    process.exit();
+  });
+};
+
+const onExit = () => {
+  for (const lifecycle of activeLifecycles.values()) lifecycle.disposeSync();
+};
+
+function registerLifecycle(key: string, lifecycle: PluginLifecycle): () => void {
+  if (activeLifecycles.size === 0) {
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    process.on("exit", onExit);
+  }
+  activeLifecycles.set(key, lifecycle);
+
+  return () => {
+    if (activeLifecycles.get(key) === lifecycle) activeLifecycles.delete(key);
+    if (activeLifecycles.size === 0) {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      process.off("exit", onExit);
+      handlingSignal = false;
+    }
+  };
+}
+
 /** Find an available port starting from the given port */
 async function findPort(startPort: number): Promise<number> {
   return new Promise((resolve) => {
@@ -134,6 +174,7 @@ export function tygor(options: TygorDevOptions): Plugin {
   // Auto-detect devtools bundle path when in tygor repo (for hot reload during development)
   const devtoolsBundlePath = getDevtoolsBundlePath();
   const workdir = resolve(process.cwd(), opts.workdir ?? ".");
+  const lifecycleKey = `${workdir}\0${opts.port}`;
 
   let currentServer: ServerState = { process: null, port: opts.port, ready: false };
   let nextServer: ServerState | null = null;
@@ -144,13 +185,200 @@ export function tygor(options: TygorDevOptions): Plugin {
   let errorExitCode: number | null = null;
   let currentPhase: "idle" | "prebuild" | "building" | "starting" = "idle";
   let isReloading = false;
+  let isDev = false;
   let ignoreFileChanges = false; // Ignore file changes during pregen/gen to prevent loops
+  let disposed = false;
+  let dispose: (() => Promise<void>) | null = null;
+  const managedProcesses = new Map<number, ChildProcess>();
+  const lifecycleTimers = new Set<ReturnType<typeof setTimeout>>();
+  const pendingCancellations = new Set<() => void>();
 
   const log = (msg: string) => console.log(pc.cyan("[tygor]"), msg);
   const logError = (msg: string) => console.log(pc.cyan("[tygor]"), pc.red(msg));
 
+  function schedule(callback: () => void, delay: number): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      lifecycleTimers.delete(timer);
+      callback();
+    }, delay);
+    lifecycleTimers.add(timer);
+    return timer;
+  }
+
+  function lifecycleDelay(delay: number): Promise<boolean> {
+    return new Promise((resolveDelay) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const cancel = () => {
+        clearTimeout(timer);
+        lifecycleTimers.delete(timer);
+        pendingCancellations.delete(cancel);
+        resolveDelay(false);
+      };
+      timer = schedule(() => {
+        pendingCancellations.delete(cancel);
+        resolveDelay(true);
+      }, delay);
+      pendingCancellations.add(cancel);
+    });
+  }
+
+  function trackProcess(proc: ChildProcess): ChildProcess {
+    if (!proc.pid) return proc;
+    const processGroup = proc.pid;
+    managedProcesses.set(processGroup, proc);
+    proc.once("close", () => {
+      if (!processTreeIsRunning(proc)) managedProcesses.delete(processGroup);
+    });
+    return proc;
+  }
+
+  function spawnManaged(command: string, args: string[], options: SpawnOptions): ChildProcess {
+    const proc = trackProcess(
+      spawn(command, args, {
+        ...options,
+        // Production build commands remain in the foreground process group so
+        // normal terminal signals reach them without dev-server lifecycle hooks.
+        detached: isDev && process.platform !== "win32",
+      }),
+    );
+    if (disposed) signalProcessTree(proc, "SIGTERM");
+    return proc;
+  }
+
+  function execManaged(command: string): Promise<{ error: Error | null; stdout: string; stderr: string }> {
+    const proc = spawnManaged(command, [], {
+      cwd: workdir,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return new Promise((resolveCommand) => {
+      let stdout = "";
+      let stderr = "";
+      let completed = false;
+      proc.stdout?.on("data", (data) => (stdout += data.toString()));
+      proc.stderr?.on("data", (data) => (stderr += data.toString()));
+      proc.once("error", (error) => {
+        completed = true;
+        resolveCommand({ error, stdout, stderr });
+      });
+      proc.once("close", (code) => {
+        if (completed) return;
+        completed = true;
+        const error = code === 0 ? null : new Error(`Command exited with code ${code}`);
+        resolveCommand({ error, stdout, stderr });
+      });
+    });
+  }
+
+  function signalProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+    if (!proc.pid) return;
+
+    if (process.platform === "win32") {
+      const args = ["/pid", String(proc.pid), "/t"];
+      if (signal === "SIGKILL") args.push("/f");
+      spawn("taskkill", args, { stdio: "ignore" }).unref();
+      return;
+    }
+
+    try {
+      process.kill(-proc.pid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ERR_OUT_OF_RANGE") {
+        spawn("kill", [`-${signal}`, "--", `-${proc.pid}`], { stdio: "ignore" }).unref();
+        return;
+      }
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        logError(`Failed to stop process group ${proc.pid}: ${(error as Error).message}`);
+      }
+    }
+  }
+
+  function killProcessTreeSync(proc: ChildProcess): void {
+    if (!proc.pid) return;
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/pid", String(proc.pid), "/t", "/f"], { stdio: "ignore" });
+      return;
+    }
+    try {
+      process.kill(-proc.pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ERR_OUT_OF_RANGE") {
+        spawnSync("kill", ["-SIGKILL", "--", `-${proc.pid}`], { stdio: "ignore" });
+        return;
+      }
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        logError(`Failed to kill process group ${proc.pid}: ${(error as Error).message}`);
+      }
+    }
+  }
+
+  function processTreeIsRunning(proc: ChildProcess): boolean {
+    if (!proc.pid) return false;
+    if (process.platform === "win32") {
+      return proc.exitCode === null && proc.signalCode === null;
+    }
+    try {
+      process.kill(-proc.pid, 0);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ERR_OUT_OF_RANGE") {
+        return spawnSync("kill", ["-0", "--", `-${proc.pid}`], { stdio: "ignore" }).status === 0;
+      }
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
+  function runTaskkill(proc: ChildProcess, force: boolean): Promise<void> {
+    if (!proc.pid) return Promise.resolve();
+    return new Promise((resolveTaskkill) => {
+      const args = ["/pid", String(proc.pid), "/t"];
+      if (force) args.push("/f");
+      const taskkill = spawn("taskkill", args, { stdio: "ignore" });
+      const timeout = setTimeout(() => {
+        taskkill.kill("SIGKILL");
+        resolveTaskkill();
+      }, 3000);
+      const finish = () => {
+        clearTimeout(timeout);
+        resolveTaskkill();
+      };
+      taskkill.once("error", finish);
+      taskkill.once("close", finish);
+    });
+  }
+
+  async function terminateProcessTree(proc: ChildProcess): Promise<void> {
+    if (!proc.pid) return;
+    if (process.platform === "win32") {
+      await runTaskkill(proc, false);
+      if (processTreeIsRunning(proc)) await runTaskkill(proc, true);
+      return;
+    }
+
+    await new Promise<void>((resolveTermination) => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearInterval(exitPoll);
+        clearTimeout(forceKillTimer);
+        clearTimeout(giveUpTimer);
+        resolveTermination();
+      };
+      const exitPoll = setInterval(() => {
+        if (!processTreeIsRunning(proc)) finish();
+      }, 25);
+      const forceKillTimer = setTimeout(() => signalProcessTree(proc, "SIGKILL"), 2000);
+      const giveUpTimer = setTimeout(finish, 3000);
+      signalProcessTree(proc, "SIGTERM");
+      if (!processTreeIsRunning(proc)) finish();
+    });
+  }
+
   /** Start the tygor devtools server */
   async function startDevServer(port: number): Promise<DevServerState> {
+    if (disposed) return { process: null, port, ready: false };
+
     const tygorCmd = getTygorCommand(opts.tygorCommand);
     const rpcDir = resolve(process.cwd(), opts.rpcDir!);
     const args = [...tygorCmd.slice(1), "devtools", "--rpc-dir", rpcDir, "--port", String(port)];
@@ -159,7 +387,7 @@ export function tygor(options: TygorDevOptions): Plugin {
     log(`Starting tygor devtools on port ${port}: ${command} ${args.join(" ")}`);
 
     return new Promise((resolve) => {
-      const proc = spawn(command, args, {
+      const proc = spawnManaged(command, args, {
         cwd: workdir,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -198,11 +426,11 @@ export function tygor(options: TygorDevOptions): Plugin {
       });
 
       // Timeout after 30 seconds
-      setTimeout(() => {
+      schedule(() => {
         if (!resolved) {
           resolved = true;
           logError("tygor devtools startup timed out");
-          proc.kill();
+          signalProcessTree(proc, "SIGTERM");
           resolve({ process: null, port, ready: false });
         }
       }, 30000);
@@ -211,7 +439,7 @@ export function tygor(options: TygorDevOptions): Plugin {
 
   /** Send status update to tygor devtools */
   async function updateDevServerStatus(status: "running" | "building" | "error" | "starting", error?: string, phase?: string) {
-    if (!devServer.ready) return;
+    if (disposed || !devServer.ready) return;
 
     try {
       const client = createClient(devserverRegistry, {
@@ -232,6 +460,7 @@ export function tygor(options: TygorDevOptions): Plugin {
 
   /** Run tygor gen to generate TypeScript types */
   async function runGen(): Promise<boolean> {
+    if (disposed) return false;
     if (!opts.gen) return true;
 
     const tygorCmd = getTygorCommand(opts.tygorCommand);
@@ -243,7 +472,7 @@ export function tygor(options: TygorDevOptions): Plugin {
     log(`Running: ${fullCmd}`);
 
     return new Promise((resolve) => {
-      const proc = spawn(command, args, {
+      const proc = spawnManaged(command, args, {
         cwd: workdir,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -260,17 +489,25 @@ export function tygor(options: TygorDevOptions): Plugin {
       });
 
       proc.on("error", (err) => {
+        if (disposed) {
+          resolve(false);
+          return;
+        }
         buildError = err.message;
-        errorPhase = "prebuild";
+        errorPhase = "gen";
         errorCommand = fullCmd;
         logError(`tygor gen failed: ${err.message}`);
         resolve(false);
       });
 
       proc.on("exit", (code) => {
+        if (disposed) {
+          resolve(false);
+          return;
+        }
         if (code !== 0) {
           buildError = stderr || `tygor gen exited with code ${code}`;
-          errorPhase = "prebuild";
+          errorPhase = "gen";
           errorCommand = fullCmd;
           logError(`tygor gen failed:\n${buildError}`);
           resolve(false);
@@ -283,50 +520,25 @@ export function tygor(options: TygorDevOptions): Plugin {
   }
 
   async function runPregen(): Promise<boolean> {
+    if (disposed) return false;
     if (!opts.pregen) return true;
 
     const cmd = Array.isArray(opts.pregen) ? opts.pregen.join(" && ") : opts.pregen;
     log(`Running pregen: ${cmd}`);
-
-    return new Promise((resolve) => {
-      exec(cmd, { cwd: workdir }, (error, stdout, stderr) => {
-        if (error) {
-          buildError = stderr || error.message;
-          errorPhase = "prebuild";
-          errorCommand = cmd;
-          logError(`Pregen failed:\n${buildError}`);
-          resolve(false);
-        } else {
-          if (stdout.trim()) console.log(stdout);
-          resolve(true);
-        }
-      });
-    });
+    return runShellStep(cmd, "Pregen", "prebuild");
   }
 
   async function runPrebuild(): Promise<boolean> {
+    if (disposed) return false;
     if (!opts.prebuild) return true;
 
     const cmd = Array.isArray(opts.prebuild) ? opts.prebuild.join(" && ") : opts.prebuild;
     log(`Running prebuild: ${cmd}`);
-
-    return new Promise((resolve) => {
-      exec(cmd, { cwd: workdir }, (error, stdout, stderr) => {
-        if (error) {
-          buildError = stderr || error.message;
-          errorPhase = "prebuild";
-          errorCommand = cmd;
-          logError(`Prebuild failed:\n${buildError}`);
-          resolve(false);
-        } else {
-          if (stdout.trim()) console.log(stdout);
-          resolve(true);
-        }
-      });
-    });
+    return runShellStep(cmd, "Prebuild", "prebuild");
   }
 
   async function runBuild(): Promise<boolean> {
+    if (disposed) return false;
     if (!opts.build) {
       log("No build command configured, skipping build step");
       return true;
@@ -341,21 +553,48 @@ export function tygor(options: TygorDevOptions): Plugin {
 
     const cmd = Array.isArray(opts.build) ? opts.build.join(" && ") : opts.build;
     log(`Building: ${cmd}`);
+    return runShellStep(cmd, "Build", "build");
+  }
 
-    return new Promise((resolve) => {
-      exec(cmd, { cwd: workdir }, (error, stdout, stderr) => {
-        if (error) {
-          buildError = stderr || error.message;
-          errorPhase = "build";
-          errorCommand = cmd;
-          logError(`Build failed:\n${buildError}`);
-          resolve(false);
-        } else {
-          if (stdout.trim()) console.log(stdout);
-          resolve(true);
+  async function runShellStep(cmd: string, label: string, phase: "prebuild" | "build"): Promise<boolean> {
+    const { error, stdout, stderr } = await execManaged(cmd);
+    if (disposed) return false;
+    if (error) {
+      buildError = stderr || error.message;
+      errorPhase = phase;
+      errorCommand = cmd;
+      logError(`${label} failed:\n${buildError}`);
+      return false;
+    }
+    if (stdout.trim()) console.log(stdout);
+    return true;
+  }
+
+  async function runBuildPipeline(): Promise<boolean> {
+    const steps = [
+      ["pregen", runPregen, "Pregen failed"],
+      ["gen", runGen, "tygor gen failed"],
+      ["prebuild", runPrebuild, "Prebuild failed"],
+      ["build", runBuild, "Build failed"],
+    ] as const;
+
+    ignoreFileChanges = true;
+    try {
+      for (const [phase, run, fallbackError] of steps) {
+        await updateDevServerStatus("building", undefined, phase);
+        if (disposed) return false;
+        const ok = await run();
+        if (phase === "gen") ignoreFileChanges = false;
+        if (disposed) return false;
+        if (!ok) {
+          await updateDevServerStatus("error", buildError ?? fallbackError, phase);
+          return false;
         }
-      });
-    });
+      }
+      return true;
+    } finally {
+      ignoreFileChanges = false;
+    }
   }
 
   async function checkHealth(port: number): Promise<boolean> {
@@ -380,6 +619,8 @@ export function tygor(options: TygorDevOptions): Plugin {
   }
 
   function startServer(port: number, retries = 3): Promise<ServerState> {
+    if (disposed) return Promise.resolve({ process: null, port, ready: false });
+
     return new Promise((resolve) => {
       const config = opts.start(port);
       const cmdArray = Array.isArray(config.cmd) ? config.cmd : config.cmd.split(" ");
@@ -392,7 +633,7 @@ export function tygor(options: TygorDevOptions): Plugin {
 
       let proc;
       try {
-        proc = spawn(command, args, {
+        proc = spawnManaged(command, args, {
           cwd: spawnCwd,
           env,
           stdio: ["ignore", "pipe", "pipe"],
@@ -402,9 +643,13 @@ export function tygor(options: TygorDevOptions): Plugin {
         // ETXTBSY = binary still being written, retry after delay
         if (error.code === "ETXTBSY" && retries > 0) {
           log(`Binary busy, retrying in 200ms (${retries} retries left)`);
-          setTimeout(() => {
+          void lifecycleDelay(200).then((shouldRetry) => {
+            if (!shouldRetry || disposed) {
+              resolve({ process: null, port, ready: false });
+              return;
+            }
             startServer(port, retries - 1).then(resolve);
-          }, 200);
+          });
           return;
         }
         logError(`Failed to spawn: ${error.message}`);
@@ -427,6 +672,10 @@ export function tygor(options: TygorDevOptions): Plugin {
       proc.on("error", (err) => {
         if (!resolved) {
           resolved = true;
+          if (disposed) {
+            resolve({ process: null, port, ready: false });
+            return;
+          }
           buildError = err.message;
           errorPhase = "runtime";
           errorCommand = cmdArray.join(" ");
@@ -436,13 +685,15 @@ export function tygor(options: TygorDevOptions): Plugin {
       });
 
       proc.on("exit", (code) => {
-        if (!resolved && code !== 0 && code !== null) {
+        if (!resolved) {
           resolved = true;
-          buildError = stderr || `Process exited with code ${code}`;
-          errorPhase = "runtime";
-          errorCommand = cmdArray.join(" ");
-          errorExitCode = code;
-          logError(`Server exited with code ${code}`);
+          if (!disposed && code !== 0) {
+            buildError = stderr || `Process exited with code ${code}`;
+            errorPhase = "runtime";
+            errorCommand = cmdArray.join(" ");
+            errorExitCode = code;
+            logError(`Server exited with code ${code}`);
+          }
           resolve({ process: null, port, ready: false });
         }
       });
@@ -454,9 +705,22 @@ export function tygor(options: TygorDevOptions): Plugin {
 
       const pollHealth = async () => {
         attempts++;
-        if (resolved) return;
+        if (resolved || disposed) {
+          if (!resolved) {
+            resolved = true;
+            resolve({ process: null, port, ready: false });
+          }
+          return;
+        }
 
         const healthy = await checkHealth(port);
+        if (disposed) {
+          if (!resolved) {
+            resolved = true;
+            resolve({ process: null, port, ready: false });
+          }
+          return;
+        }
         if (healthy) {
           consecutiveSuccess++;
           if (consecutiveSuccess >= 2) {
@@ -480,7 +744,7 @@ export function tygor(options: TygorDevOptions): Plugin {
             resolve({ process: null, port, ready: false });
           }
         } else if (attempts < maxAttempts) {
-          setTimeout(pollHealth, 100);
+          schedule(pollHealth, 100);
         } else {
           resolved = true;
           logError(`Health check timed out after ${attempts * 100}ms`);
@@ -489,14 +753,14 @@ export function tygor(options: TygorDevOptions): Plugin {
       };
 
       // Give the process a moment to start
-      setTimeout(pollHealth, 200);
+      schedule(pollHealth, 200);
     });
   }
 
-  function killServer(server: ServerState) {
-    if (server.process && server.process.exitCode === null) {
+  function killServer(server: ServerState): void {
+    if (server.process) {
       log(`Stopping server on port ${server.port}`);
-      server.process.kill("SIGTERM");
+      signalProcessTree(server.process, "SIGTERM");
     }
   }
 
@@ -506,9 +770,12 @@ export function tygor(options: TygorDevOptions): Plugin {
     let port = opts.port;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (disposed) return { process: null, port, ready: false };
       port = await findPort(port);
+      if (disposed) return { process: null, port, ready: false };
       if (skipPort && port === skipPort) {
         port = await findPort(port + 1);
+        if (disposed) return { process: null, port, ready: false };
       }
       const server = await startServer(port);
       if (server.ready) return server;
@@ -523,99 +790,70 @@ export function tygor(options: TygorDevOptions): Plugin {
   }
 
   async function reload() {
-    if (isReloading) return;
+    if (disposed || isReloading) return;
     isReloading = true;
 
-    log("Detected changes, reloading...");
-    await updateDevServerStatus("building", undefined, "pregen");
+    try {
+      log("Detected changes, reloading...");
+      if (!(await runBuildPipeline())) return;
 
-    // Ignore file changes during pregen/gen to prevent loops from generated files
-    ignoreFileChanges = true;
+      // Reload proxy paths in case new services were added
+      proxyPaths = loadProxyPaths();
+      serviceNames = getServiceNames();
 
-    // Run pregen (e.g., sqlc generate)
-    const pregenOk = await runPregen();
-    if (!pregenOk) {
-      await updateDevServerStatus("error", buildError ?? "Pregen failed", "pregen");
+      // Start new server on a different port (skip current server's port)
+      await updateDevServerStatus("starting", undefined, "runtime");
+      if (disposed) return;
+      const candidateServer = await startServerWithRetry(currentServer.port);
+      if (disposed) {
+        killServer(candidateServer);
+        return;
+      }
+      nextServer = candidateServer;
+
+      if (nextServer.ready) {
+        // Swap servers - update currentServer first so proxy routes to new server
+        const oldServer = currentServer;
+        log(`Swapping: ${oldServer.port} -> ${nextServer.port}`);
+        currentServer = nextServer;
+        nextServer = null;
+        buildError = null;
+
+        log(pc.green(`Switched to port ${currentServer.port}`));
+        await updateDevServerStatus("running");
+        if (disposed) return;
+
+        // Close any active SSE connections to the old server so clients reconnect to new one
+        closeConnectionsForPort(oldServer.port);
+
+        // Give the proxy time to route to new server before killing old one
+        schedule(() => {
+          log(`Killing old server on port ${oldServer.port}`);
+          killServer(oldServer);
+        }, 500);
+      } else {
+        // Keep old server, clean up failed new one
+        await updateDevServerStatus("error", buildError ?? "Server start failed", "runtime");
+        if (nextServer.process) {
+          killServer(nextServer);
+        }
+        nextServer = null;
+      }
+    } finally {
       ignoreFileChanges = false;
       isReloading = false;
-      return;
     }
-
-    // Run tygor gen
-    await updateDevServerStatus("building", undefined, "gen");
-    const genOk = await runGen();
-
-    // Re-enable file watching after codegen completes
-    ignoreFileChanges = false;
-
-    if (!genOk) {
-      await updateDevServerStatus("error", buildError ?? "tygor gen failed", "gen");
-      isReloading = false;
-      return;
-    }
-
-    // Run prebuild
-    const prebuildOk = await runPrebuild();
-    if (!prebuildOk) {
-      await updateDevServerStatus("error", buildError ?? "Prebuild failed", "prebuild");
-      isReloading = false;
-      return;
-    }
-
-    // Reload proxy paths in case new services were added
-    proxyPaths = loadProxyPaths();
-    serviceNames = getServiceNames();
-
-    // Run build (separate from start so we can distinguish build vs runtime errors)
-    await updateDevServerStatus("building", undefined, "build");
-    const buildOk = await runBuild();
-    if (!buildOk) {
-      await updateDevServerStatus("error", buildError ?? "Build failed", "build");
-      isReloading = false;
-      return;
-    }
-
-    // Start new server on a different port (skip current server's port)
-    await updateDevServerStatus("starting", undefined, "runtime");
-    nextServer = await startServerWithRetry(currentServer.port);
-
-    if (nextServer.ready) {
-      // Swap servers - update currentServer first so proxy routes to new server
-      const oldServer = currentServer;
-      log(`Swapping: ${oldServer.port} -> ${nextServer.port}`);
-      currentServer = nextServer;
-      nextServer = null;
-      buildError = null;
-
-      log(pc.green(`Switched to port ${currentServer.port}`));
-      await updateDevServerStatus("running");
-
-      // Close any active SSE connections to the old server so clients reconnect to new one
-      closeConnectionsForPort(oldServer.port);
-
-      // Give the proxy time to route to new server before killing old one
-      setTimeout(() => {
-        log(`Killing old server on port ${oldServer.port}`);
-        killServer(oldServer);
-      }, 500);
-    } else {
-      // Keep old server, clean up failed new one
-      await updateDevServerStatus("error", buildError ?? "Server start failed", "runtime");
-      if (nextServer.process) {
-        killServer(nextServer);
-      }
-      nextServer = null;
-    }
-
-    isReloading = false;
   }
 
   // Debounce reload
   let reloadTimeout: ReturnType<typeof setTimeout> | null = null;
   function scheduleReload() {
-    if (ignoreFileChanges) return; // Ignore changes from pregen/gen output
-    if (reloadTimeout) clearTimeout(reloadTimeout);
-    reloadTimeout = setTimeout(reload, 300);
+    if (disposed || ignoreFileChanges) return; // Ignore changes from pregen/gen output
+    if (reloadTimeout) {
+      clearTimeout(reloadTimeout);
+      lifecycleTimers.delete(reloadTimeout);
+    }
+    reloadTimeout = schedule(() => void reload(), 300);
   }
 
   // Normalize proxyPrefix: ensure leading slash, no trailing slash
@@ -846,7 +1084,6 @@ export function tygor(options: TygorDevOptions): Plugin {
   const VIRTUAL_HMR = "virtual:tygor-hmr";
   const RESOLVED_VIRTUAL_HMR = "\0" + VIRTUAL_HMR;
 
-  let isDev = false;
   let warnedAboutProxyPrefix = false;
 
   return {
@@ -886,6 +1123,12 @@ if (import.meta.hot) {
     },
 
     async configureServer(server: ViteDevServer) {
+      // Vite initializes the replacement plugin before closing the previous
+      // server. Dispose the prior lifecycle explicitly to prevent overlap.
+      const previousLifecycle = activeLifecycles.get(lifecycleKey);
+      if (previousLifecycle) await previousLifecycle.dispose();
+      if (disposed) return;
+
       // Resolve rpcDir path for discovery endpoint
       const rpcDir = resolve(process.cwd(), opts.rpcDir!);
       const discoveryPath = resolve(rpcDir, "discovery.json");
@@ -1005,16 +1248,18 @@ if (import.meta.hot) {
 
       // Start watcher
       log(`Watching ${opts.watch!.join(", ")} in ${workdir}`);
+      let clientWatcher: ReturnType<typeof watch> | null = null;
       if (devtoolsBundlePath) {
         log(`Devtools hot reload enabled`);
         // Watch devtools source files for auto-reload
         const clientSrcDir = resolve(dirname(devtoolsBundlePath), "../client");
         log(`Watching devtools sources in ${clientSrcDir}`);
-        const clientWatcher = watch(["**/*.tsx", "**/*.ts", "**/*.css"], {
+        clientWatcher = watch(["**/*.tsx", "**/*.ts", "**/*.css"], {
           cwd: clientSrcDir,
           ignoreInitial: true,
         });
         clientWatcher.on("change", (file) => {
+          if (disposed) return;
           log(`Devtools changed: ${file}`);
           server.hot.send({ type: "custom", event: "tygor:devtools-update" });
         });
@@ -1040,65 +1285,89 @@ if (import.meta.hot) {
         scheduleReload();
       });
 
+      let watchdogInterval: ReturnType<typeof setInterval> | null = null;
+      let cleanupPromise: Promise<void> | null = null;
+      let unregisterLifecycle: () => void = () => undefined;
+      const onServerClose = () => void cleanup();
+      const cleanup = (): Promise<void> => {
+        if (cleanupPromise) return cleanupPromise;
+
+        disposed = true;
+        log("Shutting down...");
+        if (watchdogInterval) clearInterval(watchdogInterval);
+        for (const cancel of [...pendingCancellations]) cancel();
+        for (const timer of lifecycleTimers) clearTimeout(timer);
+        lifecycleTimers.clear();
+        reloadTimeout = null;
+        server.httpServer?.off("close", onServerClose);
+
+        for (const port of activeConnections.keys()) {
+          closeConnectionsForPort(port);
+        }
+
+        const processes = [...managedProcesses.values()];
+        cleanupPromise = Promise.all([
+          watcher.close(),
+          clientWatcher?.close() ?? Promise.resolve(),
+          ...processes.map(terminateProcessTree),
+        ]).then(() => {
+          unregisterLifecycle();
+        });
+        return cleanupPromise;
+      };
+      const cleanupSync = () => {
+        disposed = true;
+        if (watchdogInterval) clearInterval(watchdogInterval);
+        for (const timer of lifecycleTimers) clearTimeout(timer);
+        for (const proc of managedProcesses.values()) killProcessTreeSync(proc);
+        unregisterLifecycle();
+      };
+      dispose = cleanup;
+      unregisterLifecycle = registerLifecycle(lifecycleKey, { dispose: cleanup, disposeSync: cleanupSync });
+
+      // Register cleanup before the first await so config reloads during startup
+      // cannot escape lifecycle management.
+      server.httpServer?.once("close", onServerClose);
+
       // Start tygor devtools server first
       const devPort = await findPort(9000);
-      devServer = await startDevServer(devPort);
+      if (disposed) return;
+      const startedDevServer = await startDevServer(devPort);
+      if (disposed) {
+        if (startedDevServer.process) await terminateProcessTree(startedDevServer.process);
+        return;
+      }
+      devServer = startedDevServer;
       if (!devServer.ready) {
         logError("tygor devtools failed to start");
       }
 
-      // Initial pregen, gen, prebuild, build, and server start
-      await updateDevServerStatus("building", undefined, "pregen");
-
-      // Ignore file changes during pregen/gen to prevent loops
-      ignoreFileChanges = true;
-      const pregenOk = await runPregen();
-      if (!pregenOk) {
-        await updateDevServerStatus("error", buildError ?? "Pregen failed", "pregen");
-        logError("Pregen failed - fix errors and save to retry");
-        ignoreFileChanges = false;
-      } else {
-        await updateDevServerStatus("building", undefined, "gen");
-        const genOk = await runGen();
-        ignoreFileChanges = false;
-        if (!genOk) {
-          await updateDevServerStatus("error", buildError ?? "tygor gen failed", "gen");
-          logError("tygor gen failed - fix errors and save to retry");
+      if (await runBuildPipeline()) {
+        await updateDevServerStatus("starting", undefined, "runtime");
+        if (disposed) return;
+        const startedServer = await startServerWithRetry();
+        if (disposed) {
+          killServer(startedServer);
+          return;
+        }
+        currentServer = startedServer;
+        if (currentServer.ready) {
+          await updateDevServerStatus("running");
         } else {
-          await updateDevServerStatus("building", undefined, "prebuild");
-          const prebuildOk = await runPrebuild();
-          if (!prebuildOk) {
-            await updateDevServerStatus("error", buildError ?? "Prebuild failed", "prebuild");
-            logError("Prebuild failed - fix errors and save to retry");
-          } else {
-            await updateDevServerStatus("building", undefined, "build");
-            const buildOk = await runBuild();
-            if (buildOk) {
-              await updateDevServerStatus("starting", undefined, "runtime");
-              currentServer = await startServerWithRetry();
-              if (currentServer.ready) {
-                await updateDevServerStatus("running");
-              } else {
-                await updateDevServerStatus("error", buildError ?? "Server start failed", "runtime");
-                logError("Server start failed - fix errors and save to retry");
-              }
-            } else {
-              await updateDevServerStatus("error", buildError ?? "Build failed", "build");
-              logError("Build failed - fix errors and save to retry");
-            }
-          }
+          await updateDevServerStatus("error", buildError ?? "Server start failed", "runtime");
+          logError("Server start failed - fix errors and save to retry");
         }
       }
 
       // Watchdog: continuously ping server and restart if unresponsive
-      let watchdogInterval: ReturnType<typeof setInterval> | null = null;
       let consecutiveFailures = 0;
       const FAILURE_THRESHOLD = 3;
 
       const watchdog = async () => {
-        if (isReloading || !currentServer.ready) return;
+        if (disposed || isReloading || !currentServer.ready) return;
 
         const alive = await heartbeat();
+        if (disposed) return;
         if (alive) {
           consecutiveFailures = 0;
         } else {
@@ -1112,7 +1381,12 @@ if (import.meta.hot) {
             currentServer = { process: null, port: currentServer.port, ready: false };
 
             // Restart without rebuild (server crashed, not code change)
-            currentServer = await startServerWithRetry();
+            const restartedServer = await startServerWithRetry();
+            if (disposed) {
+              killServer(restartedServer);
+              return;
+            }
+            currentServer = restartedServer;
             if (currentServer.ready) {
               log(pc.green(`Server restarted on port ${currentServer.port}`));
             } else {
@@ -1122,29 +1396,12 @@ if (import.meta.hot) {
         }
       };
 
+      if (disposed) return;
       watchdogInterval = setInterval(watchdog, 2000);
+    },
 
-      // Cleanup function
-      let cleanedUp = false;
-      const cleanup = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        log("Shutting down...");
-        if (watchdogInterval) clearInterval(watchdogInterval);
-        watcher.close();
-        killServer(currentServer);
-        if (nextServer) killServer(nextServer);
-        // Kill tygor devtools
-        if (devServer.process && devServer.process.exitCode === null) {
-          devServer.process.kill("SIGTERM");
-        }
-      };
-
-      // Cleanup when Vite's server closes
-      server.httpServer?.on("close", cleanup);
-
-      // Also cleanup on process exit (handles SIGTERM, SIGINT, etc.)
-      process.on("exit", cleanup);
+    async closeBundle() {
+      await dispose?.();
     },
 
     transformIndexHtml(html) {
