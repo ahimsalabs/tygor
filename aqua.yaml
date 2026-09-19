@@ -7,7 +7,7 @@ registries:
     ref: v4.293.0
 
 packages:
-  - name: oven-sh/bun@bun-v1.1.42
+  - name: oven-sh/bun@bun-v1.4.2
   - name: jqlang/jq@jq-1.7.1
   - name: nektos/act@v0.2.70
   # staticcheck installed via go install (needs matching Go version)
