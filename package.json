@@ -6,6 +6,6 @@
     "build:client": "cd packages/client && bun run build"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.4"
+    "@types/bun": "^1.4.2"
   }
 }
