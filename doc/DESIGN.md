@@ -59,7 +59,7 @@ func(ctx context.Context, req Req) (Res, error)
 ```go
 app := tygor.NewApp()
 news := app.Service("News")
-news.Register("List", tygor.Query(ListNews))
+news.Query("List", ListNews)
 ```
 
 **Client usage:**
@@ -109,23 +109,26 @@ Type-safe API calls
 
 ### Go Server
 
-**Handler construction (fluent API):**
+**Handler registration (typed options):**
 ```go
-h := tygor.Query(ListNews).
-    CacheControl(tygor.CacheConfig{MaxAge: 5 * time.Minute}).
-    WithUnaryInterceptor(authInterceptor)
+news.Query("List", ListNews,
+    tygor.WithCacheControl(tygor.CacheConfig{MaxAge: 5 * time.Minute}),
+    tygor.WithUnaryInterceptors(authInterceptor),
+)
 ```
 
-**Sealed interface pattern:** `RPCMethod` interface uses internal package types to prevent external implementation. Only `Exec` and `Query` can produce valid handlers.
+Handlers are registered through the typed `Service.Exec`, `Service.Query`,
+`Service.Stream`, and `Service.LiveValue` methods. There is no public untyped
+registration interface.
 
 **Error transformation:**
 ```go
-app := tygor.NewApp().WithErrorTransformer(func(err error) *tygor.Error {
+app := tygor.NewApp(tygor.WithErrorTransformer(func(err error) *tygor.Error {
     if errors.Is(err, sql.ErrNoRows) {
         return tygor.NewError(tygor.CodeNotFound, "resource not found")
     }
     return tygor.DefaultErrorTransformer(err)
-})
+}))
 ```
 
 **Interceptor chain:** Global → Service → Handler. Signature:
@@ -183,10 +186,13 @@ try {
 ## Design Rationale
 
 **Why Go generics instead of codegen?**
-Type safety without build steps. Handler functions are type-checked at compile time. Generic `NewHandler` captures types without reflection overhead.
+Type safety without build steps. Handler functions are type-checked at compile
+time, and generic service methods capture request and response types without
+reflection overhead.
 
-**Why sealed `RPCMethod` interface?**
-Prevents users from implementing the interface incorrectly. Only library-constructed handlers are valid. Enforces handler construction through `Exec` and `Query`.
+**Why no public handler registration interface?**
+Typed service methods prevent invalid handler implementations and keep request
+and response inference at the registration call.
 
 **Why separate GET/POST?**
 RESTful conventions. GET requests are cacheable, appear in logs/browser history without sensitive data. POST for mutations matches HTTP semantics.
@@ -234,7 +240,7 @@ func ListNews(ctx context.Context, req *db.ListNewsParams) ([]*db.News, error) {
 func main() {
     app := tygor.NewApp()
     news := app.Service("News")
-    news.Register("List", tygor.Query(ListNews))
+    news.Query("List", ListNews)
     tygorgen.FromApp(app).ToDir("./client/src/rpc")
     http.ListenAndServe(":8080", app.Handler())
 }

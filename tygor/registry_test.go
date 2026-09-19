@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"tygor.dev/internal/tygortest"
 )
@@ -28,14 +30,14 @@ func TestApp_WithErrorTransformer(t *testing.T) {
 		return NewError(CodeInternal, "transformed")
 	}
 
-	reg := NewApp().WithErrorTransformer(transformer)
+	reg := NewApp(WithErrorTransformer(transformer))
 	if reg.errorTransformer == nil {
 		t.Error("expected error transformer to be set")
 	}
 }
 
 func TestApp_WithMaskInternalErrors(t *testing.T) {
-	reg := NewApp().WithMaskInternalErrors()
+	reg := NewApp(WithMaskInternalErrors())
 	if !reg.maskInternalErrors {
 		t.Error("expected maskInternalErrors to be true")
 	}
@@ -46,7 +48,7 @@ func TestApp_WithUnaryInterceptor(t *testing.T) {
 		return handler(ctx, req)
 	}
 
-	reg := NewApp().WithUnaryInterceptor(interceptor)
+	reg := NewApp(WithUnaryInterceptors(interceptor))
 	if len(reg.interceptors) != 1 {
 		t.Errorf("expected 1 interceptor, got %d", len(reg.interceptors))
 	}
@@ -59,7 +61,7 @@ func TestApp_WithMiddleware(t *testing.T) {
 		})
 	}
 
-	reg := NewApp().WithMiddleware(middleware)
+	reg := NewApp(WithHTTPMiddleware(middleware))
 	if len(reg.middlewares) != 1 {
 		t.Errorf("expected 1 middleware, got %d", len(reg.middlewares))
 	}
@@ -74,12 +76,12 @@ func TestApp_Handler(t *testing.T) {
 		})
 	}
 
-	reg := NewApp().WithMiddleware(middleware)
+	reg := NewApp(WithHTTPMiddleware(middleware))
 
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		return TestResponse{Message: "ok"}, nil
 	}
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	handler := reg.Handler()
 	if handler == nil {
@@ -98,6 +100,24 @@ func TestApp_Handler(t *testing.T) {
 	}
 	tygortest.AssertStatus(t, w, http.StatusOK)
 	tygortest.AssertJSONResponse(t, w, TestResponse{Message: "ok"})
+}
+
+func TestApp_MiddlewareConstructedOnce(t *testing.T) {
+	constructed := 0
+	middleware := func(next http.Handler) http.Handler {
+		constructed++
+		return next
+	}
+	app := NewApp(WithHTTPMiddleware(middleware))
+
+	if constructed != 1 {
+		t.Fatalf("middleware constructed %d times, want 1", constructed)
+	}
+	app.Handler()
+	app.Handler()
+	if constructed != 1 {
+		t.Fatalf("middleware reconstructed by Handler: got %d constructions", constructed)
+	}
 }
 
 func TestApp_Service(t *testing.T) {
@@ -122,7 +142,7 @@ func TestApp_Handler_Success(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name, ID: 123}, nil
 	}
 
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	reqBody := `{"name":"John","email":"john@example.com"}`
 	req := httptest.NewRequest("POST", "/Test/Method", strings.NewReader(reqBody))
@@ -179,7 +199,7 @@ func TestApp_Handler_MethodMismatch(t *testing.T) {
 		return TestResponse{}, nil
 	}
 
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	// Try GET when handler expects POST
 	req := httptest.NewRequest("GET", "/Test/Method", nil)
@@ -198,13 +218,13 @@ func TestApp_Handler_WithPanic(t *testing.T) {
 		Level: slog.LevelError,
 	}))
 
-	reg := NewApp().WithLogger(logger)
+	reg := NewApp(WithLogger(logger))
 
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		panic("test panic")
 	}
 
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	reqBody := `{"name":"John","email":"john@example.com"}`
 	req := httptest.NewRequest("POST", "/Test/Method", strings.NewReader(reqBody))
@@ -226,19 +246,19 @@ func TestApp_Handler_WithPanic(t *testing.T) {
 func TestApp_GlobalInterceptor(t *testing.T) {
 	interceptorCalled := false
 
-	reg := NewApp().WithUnaryInterceptor(func(ctx Context, req any, handler HandlerFunc) (any, error) {
+	reg := NewApp(WithUnaryInterceptors(func(ctx Context, req any, handler HandlerFunc) (any, error) {
 		interceptorCalled = true
 		if ctx.EndpointID() != "Test.Method" {
 			t.Errorf("unexpected endpoint: %s", ctx.EndpointID())
 		}
 		return handler(ctx, req)
-	})
+	}))
 
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	reqBody := `{"name":"John","email":"john@example.com"}`
 	req := httptest.NewRequest("POST", "/Test/Method", strings.NewReader(reqBody))
@@ -261,14 +281,14 @@ func TestService_WithUnaryInterceptor(t *testing.T) {
 		return handler(ctx, req)
 	}
 
-	service := reg.Service("Test").WithUnaryInterceptor(interceptor)
+	service := reg.Service("Test", WithUnaryInterceptors(interceptor))
 
 	if len(service.interceptors) != 1 {
 		t.Errorf("expected 1 service interceptor, got %d", len(service.interceptors))
 	}
 }
 
-func TestService_Register(t *testing.T) {
+func TestService_ExecRegistersHandler(t *testing.T) {
 	reg := NewApp()
 	service := reg.Service("Test")
 
@@ -276,14 +296,74 @@ func TestService_Register(t *testing.T) {
 		return TestResponse{}, nil
 	}
 
-	handler := Exec(fn)
-	service.Register("Method", handler)
+	service.Exec("Method", fn)
 
 	reg.mu.RLock()
 	defer reg.mu.RUnlock()
 
 	if _, ok := reg.routes["Test.Method"]; !ok {
 		t.Error("expected route to be registered")
+	}
+}
+
+func TestService_TypedRegistrationMethods(t *testing.T) {
+	type execRequest struct{ Value string }
+	type execResponse struct{ Value int }
+	type queryRequest struct{ Value int }
+	type queryResponse struct{ Value string }
+	type streamRequest struct{ Value bool }
+	type streamResponse struct{ Value float64 }
+
+	app := NewApp()
+	service := app.Service("Test")
+	service.Exec("Exec", func(context.Context, execRequest) (execResponse, error) {
+		return execResponse{}, nil
+	})
+	service.Query("Query", func(context.Context, queryRequest) (queryResponse, error) {
+		return queryResponse{}, nil
+	}, WithCacheControl(CacheConfig{MaxAge: time.Minute}))
+	service.Stream("Stream", func(context.Context, streamRequest, StreamWriter[streamResponse]) error {
+		return nil
+	})
+
+	app.mu.RLock()
+	queryHandler, ok := app.routes["Test.Query"].(*queryHandler[queryRequest, queryResponse])
+	app.mu.RUnlock()
+	if !ok {
+		t.Fatal("query route did not contain the typed query handler")
+	}
+	if queryHandler.cacheConfig == nil || queryHandler.cacheConfig.MaxAge != time.Minute {
+		t.Fatal("typed registration method did not apply endpoint options")
+	}
+
+	routes := app.Routes()
+	tests := []struct {
+		name      string
+		primitive string
+		request   any
+		response  any
+	}{
+		{name: "Test.Exec", primitive: "exec", request: execRequest{}, response: execResponse{}},
+		{name: "Test.Query", primitive: "query", request: queryRequest{}, response: queryResponse{}},
+		{name: "Test.Stream", primitive: "stream", request: streamRequest{}, response: streamResponse{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metadata, ok := routes[tt.name]
+			if !ok {
+				t.Fatalf("route %q was not registered", tt.name)
+			}
+			if metadata.Primitive != tt.primitive {
+				t.Errorf("primitive = %q, want %q", metadata.Primitive, tt.primitive)
+			}
+			if metadata.Request != reflect.TypeOf(tt.request) {
+				t.Errorf("request type = %v, want %T", metadata.Request, tt.request)
+			}
+			if metadata.Response != reflect.TypeOf(tt.response) {
+				t.Errorf("response type = %v, want %T", metadata.Response, tt.response)
+			}
+		})
 	}
 }
 
@@ -294,7 +374,7 @@ func TestApp_DuplicateRouteRegistration(t *testing.T) {
 		Level: slog.LevelWarn,
 	}))
 
-	reg := NewApp().WithLogger(logger)
+	reg := NewApp(WithLogger(logger))
 
 	fn1 := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		return TestResponse{Message: "first"}, nil
@@ -305,8 +385,8 @@ func TestApp_DuplicateRouteRegistration(t *testing.T) {
 	}
 
 	// Register the same route twice
-	reg.Service("Test").Register("Method", Exec(fn1))
-	reg.Service("Test").Register("Method", Exec(fn2))
+	reg.Service("Test").Exec("Method", fn1)
+	reg.Service("Test").Exec("Method", fn2)
 
 	// Verify warning was logged
 	logOutput := buf.String()
@@ -344,15 +424,15 @@ func TestService_InterceptorOrder(t *testing.T) {
 		return handler(ctx, req)
 	}
 
-	reg := NewApp().WithUnaryInterceptor(globalInterceptor)
+	reg := NewApp(WithUnaryInterceptors(globalInterceptor))
 
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		callOrder = append(callOrder, "fn")
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	handler := Exec(fn).WithUnaryInterceptor(handlerInterceptor)
-	reg.Service("Test").WithUnaryInterceptor(serviceInterceptor).Register("Method", handler)
+	reg.Service("Test", WithUnaryInterceptors(serviceInterceptor)).
+		Exec("Method", fn, WithUnaryInterceptors(handlerInterceptor))
 
 	reqBody := `{"name":"John","email":"john@example.com"}`
 	req := httptest.NewRequest("POST", "/Test/Method", strings.NewReader(reqBody))
@@ -397,7 +477,7 @@ func TestApp_ContextPropagation(t *testing.T) {
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	reqBody := `{"name":"John","email":"john@example.com"}`
 	req := httptest.NewRequest("POST", "/Test/Method", strings.NewReader(reqBody))
@@ -422,8 +502,8 @@ func TestApp_MultipleServices(t *testing.T) {
 		return TestResponse{Message: "service2"}, nil
 	}
 
-	reg.Service("Service1").Register("Method1", Exec(fn1))
-	reg.Service("Service2").Register("Method2", Exec(fn2))
+	reg.Service("Service1").Exec("Method1", fn1)
+	reg.Service("Service2").Exec("Method2", fn2)
 
 	tests := []struct {
 		path            string
@@ -467,14 +547,14 @@ func TestApp_MiddlewareOrder(t *testing.T) {
 		})
 	}
 
-	reg := NewApp().WithMiddleware(mw1).WithMiddleware(mw2)
+	reg := NewApp(WithHTTPMiddleware(mw1, mw2))
 
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		callOrder = append(callOrder, "handler")
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	reqBody := `{"name":"John","email":"john@example.com"}`
 	req := httptest.NewRequest("POST", "/Test/Method", strings.NewReader(reqBody))
@@ -496,32 +576,27 @@ func TestApp_MiddlewareOrder(t *testing.T) {
 	}
 }
 
-func TestServiceWrappedHandler_Metadata(t *testing.T) {
+func TestQueryHandler_Metadata(t *testing.T) {
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		return TestResponse{}, nil
 	}
 
-	handler := Query(fn)
+	handler := newQueryHandler(fn)
 
-	wrapped := &serviceWrappedHandler{
-		inner:        handler,
-		interceptors: []UnaryInterceptor{},
-	}
-
-	meta := wrapped.metadata()
+	meta := handler.metadata()
 	if meta.Primitive != "query" {
 		t.Errorf("expected Primitive query, got %s", meta.Primitive)
 	}
 }
 
 func TestApp_WithMaskInternalErrors_Integration(t *testing.T) {
-	reg := NewApp().WithMaskInternalErrors()
+	reg := NewApp(WithMaskInternalErrors())
 
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
 		return TestResponse{}, NewError(CodeInternal, "sensitive internal error")
 	}
 
-	reg.Service("Test").Register("Method", Exec(fn))
+	reg.Service("Test").Exec("Method", fn)
 
 	reqBody := `{"name":"John","email":"john@example.com"}`
 	req := httptest.NewRequest("POST", "/Test/Method", strings.NewReader(reqBody))

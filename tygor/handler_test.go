@@ -31,7 +31,7 @@ func TestExec(t *testing.T) {
 		return TestResponse{Message: "ok", ID: 1}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 	if handler == nil {
 		t.Fatal("expected non-nil handler")
 	}
@@ -45,7 +45,7 @@ func TestHandler_Method(t *testing.T) {
 		return TestResponse{}, nil
 	}
 
-	handler := Query(fn)
+	handler := newQueryHandler(fn)
 	if handler.metadata().Primitive != "query" {
 		t.Errorf("expected Primitive query, got %s", handler.metadata().Primitive)
 	}
@@ -57,7 +57,7 @@ func TestHandler_CacheControl(t *testing.T) {
 	}
 
 	ttl := 5 * time.Minute
-	handler := Query(fn).CacheControl(CacheConfig{MaxAge: ttl})
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{MaxAge: ttl}))
 	if handler.cacheConfig == nil {
 		t.Fatal("expected cacheConfig to be set")
 	}
@@ -75,7 +75,7 @@ func TestHandler_WithUnaryInterceptor(t *testing.T) {
 		return handler(ctx, req)
 	}
 
-	handler := Exec(fn).WithUnaryInterceptor(interceptor)
+	handler := newExecHandler(fn, WithUnaryInterceptors(interceptor))
 	if len(handler.interceptors) != 1 {
 		t.Errorf("expected 1 interceptor, got %d", len(handler.interceptors))
 	}
@@ -86,7 +86,7 @@ func TestHandler_Metadata(t *testing.T) {
 		return TestResponse{}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{MaxAge: 1 * time.Minute})
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{MaxAge: 1 * time.Minute}))
 	meta := handler.metadata()
 
 	if meta.Primitive != "query" {
@@ -108,7 +108,7 @@ func TestHandler_ServeHTTP_POST_Success(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name, ID: 123}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -124,7 +124,7 @@ func TestHandler_ServeHTTP_POST_ValidationError(t *testing.T) {
 		return TestResponse{}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	// Invalid email and name too short
 	w := NewTestRequest().
@@ -141,7 +141,7 @@ func TestHandler_ServeHTTP_POST_InvalidJSON(t *testing.T) {
 		return TestResponse{}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -162,7 +162,7 @@ func TestHandler_ServeHTTP_GET_WithQueryParams(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name}, nil
 	}
 
-	handler := Query(fn)
+	handler := newQueryHandler(fn)
 
 	w := NewTestRequest().
 		GET("/test").
@@ -180,7 +180,7 @@ func TestHandler_ServeHTTP_HandlerError(t *testing.T) {
 		return TestResponse{}, testErr
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -200,7 +200,7 @@ func TestHandler_ServeHTTP_WithCacheControl(t *testing.T) {
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{MaxAge: 60 * time.Second})
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{MaxAge: 60 * time.Second}))
 
 	w := NewTestRequest().
 		GET("/test").
@@ -224,7 +224,7 @@ func TestHandler_ServeHTTP_WithUnaryInterceptor(t *testing.T) {
 		return handler(ctx, req)
 	}
 
-	handler := Exec(fn).WithUnaryInterceptor(interceptor)
+	handler := newExecHandler(fn, WithUnaryInterceptors(interceptor))
 
 	NewTestRequest().
 		POST("/test").
@@ -241,7 +241,7 @@ func TestHandler_ServeHTTP_MaskInternalErrors(t *testing.T) {
 		return TestResponse{}, errors.New("internal database error")
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -266,7 +266,7 @@ func TestHandler_ServeHTTP_CustomErrorTransformer(t *testing.T) {
 		return TestResponse{}, customErr
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -294,7 +294,7 @@ func TestHandler_ServeHTTP_EmptyBody(t *testing.T) {
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	// Send empty JSON object instead of nil body
 	w := NewTestRequest().
@@ -314,7 +314,7 @@ func TestHandler_ServeHTTP_PointerRequest(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -337,7 +337,7 @@ func TestHandler_ServeHTTP_InterceptorModifiesRequest(t *testing.T) {
 		return handler(ctx, r)
 	}
 
-	handler := Exec(fn).WithUnaryInterceptor(interceptor)
+	handler := newExecHandler(fn, WithUnaryInterceptors(interceptor))
 
 	w := NewTestRequest().
 		POST("/test").
@@ -425,7 +425,7 @@ func TestHandler_ChainedInterceptors(t *testing.T) {
 		return res, err
 	}
 
-	handler := Exec(fn).WithUnaryInterceptor(interceptor1).WithUnaryInterceptor(interceptor2)
+	handler := newExecHandler(fn, WithUnaryInterceptors(interceptor1, interceptor2))
 
 	// Add config interceptor as well
 	configInterceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
@@ -476,7 +476,7 @@ func TestHandler_ServeHTTP_GET_PointerRequest(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name}, nil
 	}
 
-	handler := Query(fn)
+	handler := newQueryHandler(fn)
 
 	w := NewTestRequest().
 		GET("/test").
@@ -493,7 +493,7 @@ func TestHandler_WithSkipValidation(t *testing.T) {
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	handler := Exec(fn).WithSkipValidation()
+	handler := newExecHandler(fn, WithoutValidation())
 
 	// Send invalid request (name too short, invalid email)
 	w := NewTestRequest().
@@ -516,7 +516,7 @@ func TestHandler_ServeHTTP_GET_ArrayParams(t *testing.T) {
 		return TestResponse{Message: message}, nil
 	}
 
-	handler := Query(fn)
+	handler := newQueryHandler(fn)
 
 	req := httptest.NewRequest("GET", "/test?ids=1&ids=2&ids=3", nil)
 	w := httptest.NewRecorder()
@@ -541,7 +541,7 @@ func TestHandler_ServeHTTP_GET_IntArrayParams(t *testing.T) {
 		return TestResponse{ID: sum}, nil
 	}
 
-	handler := Query(fn)
+	handler := newQueryHandler(fn)
 
 	req := httptest.NewRequest("GET", "/test?num=10&num=20&num=30", nil)
 	w := httptest.NewRecorder()
@@ -562,7 +562,7 @@ func TestHandler_ServeHTTP_GET_SpecialCharacters(t *testing.T) {
 		return TestResponse{Message: req.Query}, nil
 	}
 
-	handler := Query(fn)
+	handler := newQueryHandler(fn)
 
 	tests := []struct {
 		name     string
@@ -595,7 +595,7 @@ func TestHandler_ServeHTTP_EmptyStructResponse(t *testing.T) {
 		return EmptyResponse{}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -612,7 +612,7 @@ func TestHandler_ServeHTTP_NilPointerResponse(t *testing.T) {
 		return nil, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	w := NewTestRequest().
 		POST("/test").
@@ -638,7 +638,7 @@ func TestHandler_ServeHTTP_ResponseEncodingError(t *testing.T) {
 		return ch, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	// Use a test logger to verify error logging
 	var buf bytes.Buffer
@@ -669,8 +669,7 @@ func TestHandler_ServeHTTP_GET_StrictQueryParams_RejectsUnknown(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name}, nil
 	}
 
-	handler := Query(fn)
-	handler.WithStrictQueryParams()
+	handler := newQueryHandler(fn, WithStrictQueryParams())
 
 	// Send a request with an unknown parameter "unknown"
 	w := NewTestRequest().
@@ -694,8 +693,7 @@ func TestHandler_ServeHTTP_GET_StrictQueryParams_AllowsKnown(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name}, nil
 	}
 
-	handler := Query(fn)
-	handler.WithStrictQueryParams()
+	handler := newQueryHandler(fn, WithStrictQueryParams())
 
 	// Send a request with only known parameters
 	w := NewTestRequest().
@@ -714,7 +712,7 @@ func TestHandler_ServeHTTP_MaxRequestBodySize_ExceedsLimit(t *testing.T) {
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	// Create a large request body (100 bytes) with limit of 50 bytes
 	largeReq := TestRequest{
@@ -739,7 +737,7 @@ func TestHandler_ServeHTTP_MaxRequestBodySize_WithinLimit(t *testing.T) {
 		return TestResponse{Message: "hello " + req.Name}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	// Small request that fits within limit
 	w := NewTestRequest().
@@ -759,7 +757,7 @@ func TestHandler_ServeHTTP_MaxRequestBodySize_HandlerOverride(t *testing.T) {
 	}
 
 	// Handler sets a very small limit (10 bytes)
-	handler := Exec(fn).WithMaxRequestBodySize(10)
+	handler := newExecHandler(fn, WithMaxRequestBodySize(10))
 
 	// Even a small request should fail with the handler override
 	w := NewTestRequest().
@@ -780,7 +778,7 @@ func TestHandler_ServeHTTP_MaxRequestBodySize_Unlimited(t *testing.T) {
 	}
 
 	// Handler sets unlimited (0 means no limit)
-	handler := Exec(fn).WithMaxRequestBodySize(0)
+	handler := newExecHandler(fn, WithMaxRequestBodySize(0))
 
 	// Large request should succeed with unlimited setting
 	largeReq := TestRequest{
@@ -804,7 +802,7 @@ func TestHandler_ServeHTTP_MaxRequestBodySize_DefaultLimit(t *testing.T) {
 		return TestResponse{Message: "ok"}, nil
 	}
 
-	handler := Exec(fn)
+	handler := newExecHandler(fn)
 
 	// Use a very small registry default
 	w := NewTestRequest().
@@ -838,7 +836,7 @@ func TestHandler_GET_TagBehavior(t *testing.T) {
 		w := NewTestRequest().
 			GET("/test").
 			WithQuery("my_value", "hello").
-			ServeHandler(Query(fn), testContextConfig{})
+			ServeHandler(newQueryHandler(fn), testContextConfig{})
 
 		tygortest.AssertStatus(t, w, http.StatusOK)
 		tygortest.AssertJSONResponse(t, w, TestResponse{Message: "hello"})
@@ -855,7 +853,7 @@ func TestHandler_GET_TagBehavior(t *testing.T) {
 		w := NewTestRequest().
 			GET("/test").
 			WithQuery("Value", "hello").
-			ServeHandler(Query(fn), testContextConfig{})
+			ServeHandler(newQueryHandler(fn), testContextConfig{})
 
 		tygortest.AssertStatus(t, w, http.StatusOK)
 		tygortest.AssertJSONResponse(t, w, TestResponse{Message: "hello"})
@@ -872,7 +870,7 @@ func TestHandler_GET_TagBehavior(t *testing.T) {
 		w := NewTestRequest().
 			GET("/test").
 			WithQuery("value", "hello").
-			ServeHandler(Query(fn), testContextConfig{})
+			ServeHandler(newQueryHandler(fn), testContextConfig{})
 
 		tygortest.AssertStatus(t, w, http.StatusOK)
 		tygortest.AssertJSONResponse(t, w, TestResponse{Message: "hello"})
@@ -889,7 +887,7 @@ func TestHandler_GET_TagBehavior(t *testing.T) {
 		w := NewTestRequest().
 			GET("/test").
 			WithQuery("Value", "hello").
-			ServeHandler(Query(fn), testContextConfig{})
+			ServeHandler(newQueryHandler(fn), testContextConfig{})
 
 		tygortest.AssertStatus(t, w, http.StatusOK)
 		// Value should be empty because "Value" doesn't match json tag "custom_name"

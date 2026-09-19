@@ -23,7 +23,7 @@ func TestGetHandler_CacheControl_Simple(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{MaxAge: 5 * time.Minute})
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{MaxAge: 5 * time.Minute}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "private, max-age=300"
@@ -50,10 +50,10 @@ func TestGetHandler_CacheControl_Public(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge: 5 * time.Minute,
 		Public: true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=300"
@@ -69,10 +69,10 @@ func TestGetHandler_CacheControl_Private(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge: 5 * time.Minute,
-		Public: false, // Explicit private
-	})
+		Public: false,
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "private, max-age=300"
@@ -88,11 +88,11 @@ func TestGetHandler_CacheControl_SMaxAge(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge:  1 * time.Minute,
 		SMaxAge: 10 * time.Minute,
 		Public:  true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=60, s-maxage=600"
@@ -110,11 +110,11 @@ func TestGetHandler_CacheControl_StaleWhileRevalidate(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge:               5 * time.Minute,
 		StaleWhileRevalidate: 1 * time.Minute,
 		Public:               true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=300, stale-while-revalidate=60"
@@ -131,11 +131,11 @@ func TestGetHandler_CacheControl_StaleIfError(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge:       5 * time.Minute,
 		StaleIfError: 24 * time.Hour,
 		Public:       true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=300, stale-if-error=86400"
@@ -152,11 +152,11 @@ func TestGetHandler_CacheControl_MustRevalidate(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge:         5 * time.Minute,
 		MustRevalidate: true,
 		Public:         true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=300, must-revalidate"
@@ -174,11 +174,11 @@ func TestGetHandler_CacheControl_Immutable(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
-		MaxAge:    365 * 24 * time.Hour, // 1 year
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
+		MaxAge:    365 * 24 * time.Hour,
 		Immutable: true,
 		Public:    true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=31536000, immutable"
@@ -194,7 +194,7 @@ func TestGetHandler_CacheControl_AllDirectives(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge:               5 * time.Minute,
 		SMaxAge:              10 * time.Minute,
 		StaleWhileRevalidate: 1 * time.Minute,
@@ -202,7 +202,7 @@ func TestGetHandler_CacheControl_AllDirectives(t *testing.T) {
 		Public:               true,
 		MustRevalidate:       true,
 		Immutable:            true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=300, s-maxage=600, stale-while-revalidate=60, stale-if-error=3600, must-revalidate, immutable"
@@ -217,7 +217,7 @@ func TestGetHandler_CacheControl_NoCache(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn) // No Cache() or CacheControl() called
+	handler := newQueryHandler(fn) // No Cache() or CacheControl() called
 
 	cacheHeader := handler.getCacheControlHeader()
 	if cacheHeader != "" {
@@ -242,7 +242,7 @@ func TestHandler_POST_NoCache(t *testing.T) {
 		return CacheTestResponse{Message: "created"}, nil
 	}
 
-	handler := Exec(fn) // POST handler
+	handler := newExecHandler(fn) // POST handler
 
 	// Verify no Cache-Control header in HTTP response
 	req := httptest.NewRequest("POST", "/test", nil)
@@ -263,12 +263,12 @@ func TestGetHandler_CacheControl_CDNPattern(t *testing.T) {
 		return CacheTestResponse{Message: "test"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
-		MaxAge:               1 * time.Minute, // Browser: 1 minute
-		SMaxAge:              1 * time.Hour,   // CDN: 1 hour
-		StaleWhileRevalidate: 5 * time.Minute, // Background revalidation window
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
+		MaxAge:               1 * time.Minute,
+		SMaxAge:              1 * time.Hour,
+		StaleWhileRevalidate: 5 * time.Minute,
 		Public:               true,
-	})
+	}))
 
 	cacheHeader := handler.getCacheControlHeader()
 	expected := "public, max-age=60, s-maxage=3600, stale-while-revalidate=300"
@@ -284,7 +284,7 @@ func TestGetHandler_CacheControl_ReflectsCacheTTL(t *testing.T) {
 	}
 
 	ttl := 10 * time.Minute
-	handler := Query(fn).CacheControl(CacheConfig{MaxAge: ttl})
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{MaxAge: ttl}))
 
 	if handler.cacheConfig.MaxAge != ttl {
 		t.Errorf("expected cacheConfig.MaxAge = %v, got %v", ttl, handler.cacheConfig.MaxAge)
@@ -297,11 +297,11 @@ func TestGetHandler_CacheControl_EndToEnd(t *testing.T) {
 		return CacheTestResponse{Message: "cached response"}, nil
 	}
 
-	handler := Query(fn).CacheControl(CacheConfig{
+	handler := newQueryHandler(fn, WithCacheControl(CacheConfig{
 		MaxAge:               5 * time.Minute,
 		StaleWhileRevalidate: 1 * time.Minute,
 		Public:               true,
-	})
+	}))
 
 	req := httptest.NewRequest("GET", "/test?query=hello", nil)
 	w := httptest.NewRecorder()

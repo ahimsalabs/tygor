@@ -35,7 +35,7 @@ func TestStream_Metadata(t *testing.T) {
 		t.Fatal("expected non-nil handler")
 	}
 
-	meta := handler.Metadata()
+	meta := handler.metadata()
 	if meta.Primitive != "stream" {
 		t.Errorf("expected Primitive stream, got %s", meta.Primitive)
 	}
@@ -54,7 +54,7 @@ func TestStream_BasicEvents(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -97,7 +97,7 @@ func TestStream_ErrorMidStream(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -131,7 +131,7 @@ func TestStream_ValidationError(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	// Missing required "topic" field
 	body := `{}`
@@ -158,9 +158,9 @@ func TestStream_UnaryInterceptor_Reject(t *testing.T) {
 		return nil, NewError(CodeUnauthenticated, "not logged in")
 	}
 
-	app := NewApp().WithUnaryInterceptor(authInterceptor)
+	app := NewApp(WithUnaryInterceptors(authInterceptor))
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -207,7 +207,7 @@ func TestStream_StreamInterceptor(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn).WithStreamInterceptor(transformInterceptor))
+	svc.register("Subscribe", streamIter2(fn, WithStreamInterceptors(transformInterceptor)))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -239,7 +239,7 @@ func TestStream_ClientDisconnect(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -281,7 +281,7 @@ func TestStream_MethodNotAllowed(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	// Try GET instead of POST
 	req := httptest.NewRequest("GET", "/Feed/Subscribe?topic=news", nil)
@@ -303,7 +303,7 @@ func TestStream_WithSkipValidation(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn).WithSkipValidation())
+	svc.register("Subscribe", streamIter2(fn, WithoutValidation()))
 
 	// Missing required field, but validation is skipped
 	body := `{}`
@@ -364,7 +364,7 @@ func TestStreamEmit_BasicEvents(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -399,7 +399,7 @@ func TestStreamEmit_HandlerError(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -438,7 +438,7 @@ func TestStreamEmit_ErrStreamClosedNotSentToClient(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -477,7 +477,7 @@ func TestStreamEmit_ContextCancellation(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -528,7 +528,7 @@ func TestStreamEmit_SendChecksContext(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -581,10 +581,11 @@ func TestStreamEmit_WithOptions(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn).
-		WithUnaryInterceptor(authInterceptor).
-		WithWriteTimeout(10*time.Second).
-		WithSkipValidation())
+	svc.Stream("Subscribe", fn,
+		WithUnaryInterceptors(authInterceptor),
+		WithStreamWriteTimeout(10*time.Second),
+		WithoutValidation(),
+	)
 
 	// Missing required field, but validation is skipped
 	body := `{}`
@@ -609,7 +610,7 @@ func TestStreamEmit_LastEventID(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -641,7 +642,7 @@ func TestStreamEmit_SendWithID(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -700,7 +701,7 @@ func TestStreamEmit_WithMaxRequestBodySize(t *testing.T) {
 	app := NewApp()
 	svc := app.Service("Feed")
 	// Set a very small body size limit (10 bytes)
-	svc.Register("Subscribe", Stream(fn).WithMaxRequestBodySize(10))
+	svc.Stream("Subscribe", fn, WithMaxRequestBodySize(10))
 
 	// Send a body larger than the limit
 	body := `{"topic":"this is a very long topic that exceeds the limit"}`
@@ -736,7 +737,7 @@ func TestStreamEmit_WithHeartbeat(t *testing.T) {
 	app := NewApp()
 	svc := app.Service("Feed")
 	// Set heartbeat to 50ms for fast test
-	svc.Register("Subscribe", Stream(fn).WithHeartbeat(50*time.Millisecond))
+	svc.Stream("Subscribe", fn, WithStreamHeartbeat(50*time.Millisecond))
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -818,9 +819,7 @@ func TestStream_MultipleStreamInterceptors(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn).
-		WithStreamInterceptor(interceptorA).
-		WithStreamInterceptor(interceptorB))
+	svc.register("Subscribe", streamIter2(fn, WithStreamInterceptors(interceptorA, interceptorB)))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -892,7 +891,7 @@ func TestStreamEmit_SendWithID_EdgeCases(t *testing.T) {
 
 			app := NewApp()
 			svc := app.Service("Feed")
-			svc.Register("Subscribe", Stream(fn))
+			svc.Stream("Subscribe", fn)
 
 			body := `{"topic":"news"}`
 			req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -928,7 +927,7 @@ func TestStreamEmit_LastEventID_Missing(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -963,7 +962,7 @@ func TestStreamEmit_ErrorAfterEvents(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))

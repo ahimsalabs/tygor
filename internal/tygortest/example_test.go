@@ -39,7 +39,7 @@ func exampleHandler(ctx context.Context, req *ExampleRequest) (*ExampleResponse,
 // TestWithApp demonstrates testing handlers through the App
 func TestWithApp(t *testing.T) {
 	app := tygor.NewApp()
-	app.Service("Example").Register("Create", tygor.Exec(exampleHandler))
+	app.Service("Example").Exec("Create", exampleHandler)
 
 	req := httptest.NewRequest("POST", "/Example/Create", strings.NewReader(`{"name":"Alice","email":"alice@example.com"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -57,7 +57,7 @@ func TestWithApp(t *testing.T) {
 // TestWithApp_Validation demonstrates validation error handling
 func TestWithApp_Validation(t *testing.T) {
 	app := tygor.NewApp()
-	app.Service("Example").Register("Create", tygor.Exec(exampleHandler))
+	app.Service("Example").Exec("Create", exampleHandler)
 
 	req := httptest.NewRequest("POST", "/Example/Create", strings.NewReader(`{"name":"Alice","email":"invalid-email"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -84,7 +84,7 @@ func TestWithApp_GET(t *testing.T) {
 	}
 
 	app := tygor.NewApp()
-	app.Service("Search").Register("Query", tygor.Query(getHandler))
+	app.Service("Search").Query("Query", getHandler)
 
 	req := httptest.NewRequest("GET", "/Search/Query?query=golang&limit=10", nil)
 	w := httptest.NewRecorder()
@@ -113,7 +113,7 @@ func TestWithApp_CustomHeader(t *testing.T) {
 	}
 
 	app := tygor.NewApp()
-	app.Service("Auth").Register("Check", tygor.Exec(authHandler))
+	app.Service("Auth").Exec("Check", authHandler)
 
 	req := httptest.NewRequest("POST", "/Auth/Check", strings.NewReader(`{"name":"Alice","email":"alice@example.com"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -132,7 +132,9 @@ func TestWithApp_CacheControl(t *testing.T) {
 	}
 
 	app := tygor.NewApp()
-	app.Service("Cache").Register("Get", tygor.Query(getHandler).CacheControl(tygor.CacheConfig{MaxAge: 60 * time.Second}))
+	app.Service("Cache").Query("Get", getHandler,
+		tygor.WithCacheControl(tygor.CacheConfig{MaxAge: 60 * time.Second}),
+	)
 
 	req := httptest.NewRequest("GET", "/Cache/Get?query=test&limit=10", nil)
 	w := httptest.NewRecorder()

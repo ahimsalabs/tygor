@@ -180,9 +180,17 @@ func TestLiveValueHandler_Metadata(t *testing.T) {
 	}
 
 	lv := NewLiveValue(&Status{State: "idle"})
-	handler := lv.Handler()
+	app := NewApp()
+	app.Service("System").LiveValue("Status", lv)
 
-	meta := handler.Metadata()
+	app.mu.RLock()
+	handler, ok := app.routes["System.Status"].(*liveValueHandler[*Status])
+	app.mu.RUnlock()
+	if !ok {
+		t.Fatal("live value route did not contain the typed live value handler")
+	}
+
+	meta := handler.metadata()
 	if meta.Primitive != "livevalue" {
 		t.Errorf("expected primitive 'livevalue', got %q", meta.Primitive)
 	}
@@ -197,7 +205,7 @@ func TestLiveValueHandler_SSE(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("System")
-	svc.Register("Status", lv.Handler())
+	svc.LiveValue("Status", lv)
 
 	// Start request (livevalue uses POST)
 	req := httptest.NewRequest("POST", "/System/Status", strings.NewReader("{}"))
@@ -248,7 +256,7 @@ func TestLiveValueHandler_SSE_Updates(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("System")
-	svc.Register("Counter", lv.Handler())
+	svc.LiveValue("Counter", lv)
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -295,7 +303,7 @@ func TestLiveValueHandler_ClosedLiveValue(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("System")
-	svc.Register("Status", lv.Handler())
+	svc.LiveValue("Status", lv)
 
 	req := httptest.NewRequest("POST", "/System/Status", strings.NewReader("{}"))
 	req.Header.Set("Content-Type", "application/json")
@@ -330,10 +338,11 @@ func TestLiveValueHandler_WithOptions(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("System")
-	svc.Register("Status", lv.Handler().
-		WithUnaryInterceptor(authInterceptor).
-		WithWriteTimeout(10*time.Second).
-		WithHeartbeat(30*time.Second))
+	svc.LiveValue("Status", lv,
+		WithUnaryInterceptors(authInterceptor),
+		WithStreamWriteTimeout(10*time.Second),
+		WithStreamHeartbeat(30*time.Second),
+	)
 
 	req := httptest.NewRequest("POST", "/System/Status", strings.NewReader("{}"))
 	req.Header.Set("Content-Type", "application/json")

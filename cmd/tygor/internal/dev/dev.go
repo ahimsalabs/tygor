@@ -43,11 +43,11 @@ func (c *Cmd) Run() error {
 func NewApp(svc *Service) *tygor.App {
 	app := tygor.NewApp()
 	devtools := app.Service("Devtools")
-	devtools.Register("GetDiscovery", tygor.Query(svc.GetDiscovery))
-	devtools.Register("GetSource", tygor.Query(svc.GetSource))
-	devtools.Register("GetStatus", tygor.Stream(svc.GetStatus))
-	devtools.Register("UpdateStatus", tygor.Exec(svc.UpdateStatus))
-	devtools.Register("Reload", tygor.Exec(svc.Reload))
+	devtools.Query("GetDiscovery", svc.GetDiscovery)
+	devtools.Query("GetSource", svc.GetSource)
+	devtools.Stream("GetStatus", svc.GetStatus)
+	devtools.Exec("UpdateStatus", svc.UpdateStatus)
+	devtools.Exec("Reload", svc.Reload)
 	return app
 }
 

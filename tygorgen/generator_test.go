@@ -99,7 +99,7 @@ func TestGenerate_NoOutDir_ReturnsFilesInMemory(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{
 		Provider: "reflection",
@@ -171,7 +171,7 @@ func TestGenerate_WithHandlers(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return &testfixtures.User{Username: req.Username}, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -206,8 +206,8 @@ func TestGenerate_ManifestStructure(t *testing.T) {
 	listHandler := func(ctx context.Context, req *testfixtures.ListPostsParams) ([]*testfixtures.Post, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(createHandler))
-	reg.Service("Posts").Register("List", tygor.Query(listHandler))
+	reg.Service("Users").Exec("Create", createHandler)
+	reg.Service("Posts").Query("List", listHandler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -246,7 +246,7 @@ func TestGenerate_TypesFile(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -275,7 +275,7 @@ func TestGenerate_CustomConfig(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{
 		OutDir:           outDir,
@@ -319,7 +319,7 @@ func TestGenerate_GETParamsUseLowercaseNames(t *testing.T) {
 	listHandler := func(ctx context.Context, req *testfixtures.ListPostsParams) ([]*testfixtures.Post, error) {
 		return nil, nil
 	}
-	reg.Service("Posts").Register("List", tygor.Query(listHandler))
+	reg.Service("Posts").Query("List", listHandler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -534,8 +534,8 @@ func TestGenerate_PointerStripping(t *testing.T) {
 	listHandler := func(ctx context.Context, req *testfixtures.ListPostsParams) ([]*testfixtures.Post, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(createHandler))
-	reg.Service("Posts").Register("List", tygor.Query(listHandler))
+	reg.Service("Users").Exec("Create", createHandler)
+	reg.Service("Posts").Query("List", listHandler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -574,7 +574,7 @@ func TestGenerate_EmptyRequestType(t *testing.T) {
 	handler := func(ctx context.Context, req *struct{}) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("System").Register("Ping", tygor.Query(handler))
+	reg.Service("System").Query("Ping", handler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 

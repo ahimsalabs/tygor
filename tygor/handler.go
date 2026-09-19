@@ -36,83 +36,44 @@ func init() {
 	strictSchemaDecoder.IgnoreUnknownKeys(false)
 }
 
-// Endpoint is the interface for handlers that can be registered with [Service.Register].
-//
-// Implementations:
-//   - [*ExecHandler] - for POST requests (created with [Exec])
-//   - [*QueryHandler] - for GET requests (created with [Query])
-//   - [*StreamHandler] - for SSE streaming (created with [Stream])
-//   - [*LiveValueHandler] - for synchronized state (created with [LiveValue.Handler])
-type Endpoint interface {
-	// Metadata returns route metadata for code generation.
-	// The return type is internal; this method is for use by tygorgen only.
-	Metadata() *internal.MethodMetadata
-}
-
 // endpointHandler is the internal interface used by the framework to serve requests.
 type endpointHandler interface {
-	Endpoint
 	serveHTTP(ctx *rpcContext)
 	metadata() *internal.MethodMetadata
 }
 
-// handlerBase contains common configuration shared by ExecHandler and QueryHandler.
+// handlerBase contains common configuration shared by exec and query handlers.
 type handlerBase[Req any, Res any] struct {
 	fn             func(context.Context, Req) (Res, error)
 	interceptors   []UnaryInterceptor
 	skipValidation bool
 }
 
-// ExecHandler implements Endpoint for POST requests (state-changing operations).
-//
-// Request Type Guidelines:
-//   - Use struct or pointer types
-//   - Request is decoded from JSON body
-//
-// Example:
-//
-//	func CreateUser(ctx context.Context, req *CreateUserRequest) (*User, error) { ... }
-//	Exec(CreateUser)
-//
-//	func UpdatePost(ctx context.Context, req *UpdatePostRequest) (*Post, error) { ... }
-//	Exec(UpdatePost).WithUnaryInterceptor(requireAuth)
-type ExecHandler[Req any, Res any] struct {
+type execHandler[Req any, Res any] struct {
 	handlerBase[Req, Res]
 	maxRequestBodySize *uint64 // nil means use registry default
 }
 
-// Exec creates a new POST handler from a generic function for non-streaming API calls.
-//
-// The handler function signature is func(context.Context, Req) (Res, error).
-// Requests are decoded from JSON body.
-//
-// For GET requests (cacheable reads), use Query instead.
-func Exec[Req any, Res any](fn func(context.Context, Req) (Res, error)) *ExecHandler[Req, Res] {
-	return &ExecHandler[Req, Res]{
+func newExecHandler[Req any, Res any](fn func(context.Context, Req) (Res, error), options ...ExecOption) *execHandler[Req, Res] {
+	config := execConfig{}
+	for _, option := range options {
+		option.applyExec(&config)
+	}
+	return makeExecHandler(fn, config)
+}
+
+func makeExecHandler[Req any, Res any](fn func(context.Context, Req) (Res, error), config execConfig) *execHandler[Req, Res] {
+	return &execHandler[Req, Res]{
 		handlerBase: handlerBase[Req, Res]{
-			fn: fn,
+			fn:             fn,
+			interceptors:   config.interceptors,
+			skipValidation: config.skipValidation,
 		},
+		maxRequestBodySize: config.maxRequestBodySize,
 	}
 }
 
-// QueryHandler implements Endpoint for GET requests (cacheable read operations).
-//
-// Request Type Guidelines:
-//   - Use struct types for simple cases, pointer types when you need optional fields
-//   - Request parameters are decoded from URL query string
-//
-// Struct vs Pointer Types:
-//   - Struct types (e.g., ListParams): Query parameters are decoded directly into the struct
-//   - Pointer types (e.g., *ListParams): A new instance is created and query parameters are decoded into it
-//
-// Example:
-//
-//	func ListPosts(ctx context.Context, req ListPostsParams) ([]*Post, error) { ... }
-//	Query(ListPosts).CacheControl(tygor.CacheConfig{
-//	    MaxAge: 5 * time.Minute,
-//	    Public: true,
-//	})
-type QueryHandler[Req any, Res any] struct {
+type queryHandler[Req any, Res any] struct {
 	handlerBase[Req, Res]
 	cacheConfig       *CacheConfig
 	strictQueryParams bool
@@ -159,110 +120,28 @@ type CacheConfig struct {
 	Immutable bool
 }
 
-// Query creates a new GET handler from a generic function for cacheable read operations.
-//
-// The handler function signature is func(context.Context, Req) (Res, error).
-// Requests are decoded from URL query parameters.
-//
-// Use CacheControl() to configure HTTP caching behavior.
-func Query[Req any, Res any](fn func(context.Context, Req) (Res, error)) *QueryHandler[Req, Res] {
-	return &QueryHandler[Req, Res]{
+func newQueryHandler[Req any, Res any](fn func(context.Context, Req) (Res, error), options ...QueryOption) *queryHandler[Req, Res] {
+	config := queryConfig{}
+	for _, option := range options {
+		option.applyQuery(&config)
+	}
+	return makeQueryHandler(fn, config)
+}
+
+func makeQueryHandler[Req any, Res any](fn func(context.Context, Req) (Res, error), config queryConfig) *queryHandler[Req, Res] {
+	return &queryHandler[Req, Res]{
 		handlerBase: handlerBase[Req, Res]{
-			fn: fn,
+			fn:             fn,
+			interceptors:   config.interceptors,
+			skipValidation: config.skipValidation,
 		},
-	}
-}
-
-// CacheControl sets detailed HTTP cache directives for the handler.
-// See CacheConfig documentation and RFC 9111 for directive semantics.
-//
-// Example:
-//
-//	Query(ListPosts).CacheControl(tygor.CacheConfig{
-//	    MaxAge:               5 * time.Minute,
-//	    StaleWhileRevalidate: 1 * time.Minute,
-//	    Public:               true,
-//	})
-//	// Sets: Cache-Control: public, max-age=300, stale-while-revalidate=60
-func (h *QueryHandler[Req, Res]) CacheControl(cfg CacheConfig) *QueryHandler[Req, Res] {
-	h.cacheConfig = &cfg
-	return h
-}
-
-// WithStrictQueryParams enables strict query parameter validation for GET requests.
-// By default, unknown query parameters are ignored (lenient mode).
-// When enabled, requests with unknown query parameters will return an error.
-// This helps catch typos and enforces exact parameter expectations.
-func (h *QueryHandler[Req, Res]) WithStrictQueryParams() *QueryHandler[Req, Res] {
-	h.strictQueryParams = true
-	return h
-}
-
-// WithMaxRequestBodySize sets the maximum request body size for this handler.
-// This overrides the registry-level default. A value of 0 means no limit.
-func (h *ExecHandler[Req, Res]) WithMaxRequestBodySize(size uint64) *ExecHandler[Req, Res] {
-	h.maxRequestBodySize = &size
-	return h
-}
-
-// WithUnaryInterceptor adds an interceptor to this handler.
-// Handler interceptors execute after global and service interceptors.
-// See App.WithUnaryInterceptor for the complete execution order.
-func (h *ExecHandler[Req, Res]) WithUnaryInterceptor(i UnaryInterceptor) *ExecHandler[Req, Res] {
-	h.interceptors = append(h.interceptors, i)
-	return h
-}
-
-// WithUnaryInterceptor adds an interceptor to this handler.
-// Handler interceptors execute after global and service interceptors.
-// See App.WithUnaryInterceptor for the complete execution order.
-func (h *QueryHandler[Req, Res]) WithUnaryInterceptor(i UnaryInterceptor) *QueryHandler[Req, Res] {
-	h.interceptors = append(h.interceptors, i)
-	return h
-}
-
-// WithSkipValidation disables validation for this handler.
-// By default, all handlers validate requests using the validator package.
-// Use this when you need to handle validation manually or when the request
-// type has no validation tags.
-func (h *ExecHandler[Req, Res]) WithSkipValidation() *ExecHandler[Req, Res] {
-	h.skipValidation = true
-	return h
-}
-
-// WithSkipValidation disables validation for this handler.
-// By default, all handlers validate requests using the validator package.
-// Use this when you need to handle validation manually or when the request
-// type has no validation tags.
-func (h *QueryHandler[Req, Res]) WithSkipValidation() *QueryHandler[Req, Res] {
-	h.skipValidation = true
-	return h
-}
-
-// Metadata implements [Endpoint].
-func (h *ExecHandler[Req, Res]) Metadata() *internal.MethodMetadata {
-	var req Req
-	var res Res
-	return &internal.MethodMetadata{
-		Primitive: "exec",
-		Request:   reflect.TypeOf(req),
-		Response:  reflect.TypeOf(res),
-	}
-}
-
-// Metadata implements [Endpoint].
-func (h *QueryHandler[Req, Res]) Metadata() *internal.MethodMetadata {
-	var req Req
-	var res Res
-	return &internal.MethodMetadata{
-		Primitive: "query",
-		Request:   reflect.TypeOf(req),
-		Response:  reflect.TypeOf(res),
+		cacheConfig:       config.cacheConfig,
+		strictQueryParams: config.strictQueryParams,
 	}
 }
 
 // metadata returns the runtime metadata for the exec handler.
-func (h *ExecHandler[Req, Res]) metadata() *internal.MethodMetadata {
+func (h *execHandler[Req, Res]) metadata() *internal.MethodMetadata {
 	var req Req
 	var res Res
 	return &internal.MethodMetadata{
@@ -273,7 +152,7 @@ func (h *ExecHandler[Req, Res]) metadata() *internal.MethodMetadata {
 }
 
 // metadata returns the runtime metadata for the query handler.
-func (h *QueryHandler[Req, Res]) metadata() *internal.MethodMetadata {
+func (h *queryHandler[Req, Res]) metadata() *internal.MethodMetadata {
 	var req Req
 	var res Res
 	return &internal.MethodMetadata{
@@ -285,7 +164,7 @@ func (h *QueryHandler[Req, Res]) metadata() *internal.MethodMetadata {
 
 // getCacheControlHeader builds the Cache-Control header value from the cache config.
 // Returns empty string if no cache config is set.
-func (h *QueryHandler[Req, Res]) getCacheControlHeader() string {
+func (h *queryHandler[Req, Res]) getCacheControlHeader() string {
 	if h.cacheConfig == nil {
 		return ""
 	}
@@ -343,7 +222,7 @@ func (h *QueryHandler[Req, Res]) getCacheControlHeader() string {
 }
 
 // serveHTTP implements the API handler for GET requests with caching support.
-func (h *QueryHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
+func (h *queryHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 	decoder := func() (Req, error) {
 		var req Req
 		// Select decoder based on strictness setting
@@ -374,7 +253,7 @@ func (h *QueryHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 }
 
 // serveHTTP implements the API handler for POST requests.
-func (h *ExecHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
+func (h *execHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 	decoder := func() (Req, error) {
 		var req Req
 		if ctx.request.Body != nil {
@@ -402,11 +281,11 @@ func (h *ExecHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 	h.serve(ctx, "", decoder)
 }
 
-// serve implements the generic glue code for both ExecHandler and QueryHandler.
+// serve implements the generic glue code for both exec and query handlers.
 func (h *handlerBase[Req, Res]) serve(ctx *rpcContext, cacheControl string, decodeFunc func() (Req, error)) {
 	// 1. Combine Interceptors
-	// ctx.interceptors contains: Global + Service interceptors
-	// We append Handler-level interceptors
+	// The request context contains app interceptors; the immutable handler
+	// contains service and endpoint interceptors.
 	allInterceptors := make([]UnaryInterceptor, 0, len(ctx.interceptors)+len(h.interceptors))
 	allInterceptors = append(allInterceptors, ctx.interceptors...)
 	allInterceptors = append(allInterceptors, h.interceptors...)

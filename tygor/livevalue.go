@@ -33,7 +33,7 @@ import (
 //	status.Set(&Status{State: "running"})
 //
 //	// Register SSE endpoint with proper "livevalue" primitive
-//	svc.Register("Status", status.Handler())
+//	svc.LiveValue("Status", status)
 type LiveValue[T any] struct {
 	mu          sync.RWMutex
 	value       T
@@ -167,14 +167,13 @@ func (a *LiveValue[T]) Subscribe(ctx context.Context) iter.Seq[T] {
 	}
 }
 
-// Handler returns a LiveValueHandler for registering with a Service.
-// The handler uses the "livevalue" primitive for proper TypeScript codegen.
-//
-// Example:
-//
-//	svc.Register("Status", statusLiveValue.Handler())
-func (a *LiveValue[T]) Handler() *LiveValueHandler[T] {
-	return &LiveValueHandler[T]{liveValue: a}
+func makeLiveValueHandler[T any](a *LiveValue[T], config liveValueConfig) *liveValueHandler[T] {
+	return &liveValueHandler[T]{
+		liveValue:         a,
+		interceptors:      config.interceptors,
+		writeTimeout:      config.writeTimeout,
+		heartbeatInterval: config.heartbeatInterval,
+	}
 }
 
 // addSubscriber adds a channel to the subscriber list.
@@ -218,35 +217,15 @@ func (a *LiveValue[T]) Close() {
 	}
 }
 
-// LiveValueHandler implements [Endpoint] for LiveValue subscriptions.
-// It streams the current value immediately, then pushes updates via SSE.
-type LiveValueHandler[T any] struct {
+type liveValueHandler[T any] struct {
 	liveValue         *LiveValue[T]
 	interceptors      []UnaryInterceptor
-	writeTimeout      time.Duration
-	heartbeatInterval time.Duration
+	writeTimeout      *time.Duration
+	heartbeatInterval *time.Duration
 }
 
-// WithUnaryInterceptor adds an interceptor that runs during stream setup.
-func (h *LiveValueHandler[T]) WithUnaryInterceptor(i UnaryInterceptor) *LiveValueHandler[T] {
-	h.interceptors = append(h.interceptors, i)
-	return h
-}
-
-// WithWriteTimeout sets the timeout for writing each event to the client.
-func (h *LiveValueHandler[T]) WithWriteTimeout(d time.Duration) *LiveValueHandler[T] {
-	h.writeTimeout = d
-	return h
-}
-
-// WithHeartbeat sets the interval for sending SSE heartbeat comments.
-func (h *LiveValueHandler[T]) WithHeartbeat(d time.Duration) *LiveValueHandler[T] {
-	h.heartbeatInterval = d
-	return h
-}
-
-// Metadata implements [Endpoint].
-func (h *LiveValueHandler[T]) Metadata() *internal.MethodMetadata {
+// metadata returns the runtime metadata for the livevalue handler.
+func (h *liveValueHandler[T]) metadata() *internal.MethodMetadata {
 	var req Empty
 	var res T
 	return &internal.MethodMetadata{
@@ -256,13 +235,8 @@ func (h *LiveValueHandler[T]) Metadata() *internal.MethodMetadata {
 	}
 }
 
-// metadata returns the runtime metadata for the livevalue handler.
-func (h *LiveValueHandler[T]) metadata() *internal.MethodMetadata {
-	return h.Metadata()
-}
-
 // serveHTTP implements the SSE streaming for livevalue subscriptions.
-func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
+func (h *liveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 	// Run unary interceptors for setup (auth, etc.)
 	if len(h.interceptors) > 0 || len(ctx.interceptors) > 0 {
 		allInterceptors := make([]UnaryInterceptor, 0, len(ctx.interceptors)+len(h.interceptors))
@@ -310,12 +284,12 @@ func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 
 	// Determine effective timeouts
 	writeTimeout := ctx.streamWriteTimeout
-	if h.writeTimeout > 0 {
-		writeTimeout = h.writeTimeout
+	if h.writeTimeout != nil {
+		writeTimeout = *h.writeTimeout
 	}
 	heartbeatInterval := ctx.streamHeartbeat
-	if h.heartbeatInterval > 0 {
-		heartbeatInterval = h.heartbeatInterval
+	if h.heartbeatInterval != nil {
+		heartbeatInterval = *h.heartbeatInterval
 	}
 
 	var rc *http.ResponseController
@@ -398,7 +372,7 @@ func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 }
 
 // writeSSEEvent writes a pre-serialized value as an SSE event.
-func (h *LiveValueHandler[T]) writeSSEEvent(w http.ResponseWriter, data json.RawMessage) error {
+func (h *liveValueHandler[T]) writeSSEEvent(w http.ResponseWriter, data json.RawMessage) error {
 	// Wrap in response envelope: {"result": <data>}
 	// Since data is already JSON, we construct the envelope manually
 	_, err := fmt.Fprintf(w, "data: {\"result\":%s}\n\n", data)
