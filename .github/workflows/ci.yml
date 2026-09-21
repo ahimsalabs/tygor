@@ -7,16 +7,20 @@ on:
 jobs:
   precommit:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.25.3", "1.27.1"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go-version }}
 
       - name: Bootstrap tools
-        run: go run github.com/go-task/task/v3/cmd/task@latest setup --force
+        run: go run github.com/go-task/task/v3/cmd/task@v3.45.4 setup --force
         env:
           AQUA_ROOT_DIR: ${{ github.workspace }}/.tools/aqua-pkgs
 
@@ -28,4 +32,5 @@ jobs:
       - name: Run precommit checks
         run: task precommit
         env:
+          AQUA_CONFIG: ${{ github.workspace }}/aqua.yaml
           AQUA_ROOT_DIR: ${{ github.workspace }}/.tools/aqua-pkgs
