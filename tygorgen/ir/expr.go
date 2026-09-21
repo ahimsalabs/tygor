@@ -4,11 +4,11 @@ import "fmt"
 
 // ArrayDescriptor represents an ordered collection (slice or fixed-length array).
 //
-// Nullability: Go slices (Length == 0) can be nil, which serializes to JSON null.
+// Nullability: Go slices can be nil, which serializes to JSON null.
 // This is NOT represented with PtrDescriptor; instead, generators derive nullability
 // from context:
 // - If Optional=false: field: T[] | null (always present, can be null)
-// - If Optional=true: field?: T[] (optional, never null when present)
+// - If Optional=true: field?: T[] | null (optional and nullable are independent)
 // See §4.9 for the complete decision tree.
 //
 // Note: [N]byte fixed arrays serialize as JSON arrays of numbers, NOT base64.
@@ -19,13 +19,21 @@ type ArrayDescriptor struct {
 	// Element is the array element type.
 	Element TypeDescriptor
 
-	// Length is 0 for slices ([]T), or >0 for fixed-length arrays ([N]T).
+	// Length is 0 for slices and [0]T arrays, or positive for [N]T.
 	// Generators MAY emit tuples for fixed arrays in languages that support them.
 	Length int
+
+	// IsArray explicitly marks a fixed array, including [0]T. For compatibility,
+	// descriptors with Length > 0 are arrays even when this field is false.
+	IsArray bool
 }
 
 // Kind returns KindArray.
 func (d *ArrayDescriptor) Kind() DescriptorKind { return KindArray }
+
+// IsSlice reports whether the descriptor represents a slice. A missing marker
+// with Length 0 retains the historical slice interpretation.
+func (d *ArrayDescriptor) IsSlice() bool { return d.Length == 0 && !d.IsArray }
 
 // Slice returns an ArrayDescriptor for a slice type.
 // Panics if element is nil.
@@ -33,7 +41,7 @@ func Slice(element TypeDescriptor) *ArrayDescriptor {
 	if element == nil {
 		panic("ir.Slice: element cannot be nil")
 	}
-	return &ArrayDescriptor{Element: element, Length: 0}
+	return &ArrayDescriptor{Element: element}
 }
 
 // Array returns an ArrayDescriptor for a fixed-length array.
@@ -45,7 +53,7 @@ func Array(element TypeDescriptor, length int) *ArrayDescriptor {
 	if length < 0 {
 		panic("ir.Array: length cannot be negative")
 	}
-	return &ArrayDescriptor{Element: element, Length: length}
+	return &ArrayDescriptor{Element: element, Length: length, IsArray: true}
 }
 
 // MapDescriptor represents a key-value mapping.
@@ -54,7 +62,7 @@ func Array(element TypeDescriptor, length int) *ArrayDescriptor {
 // This is NOT represented with PtrDescriptor; instead, generators derive nullability
 // from context:
 // - If Optional=false: field: Record<K,V> | null (always present, can be null)
-// - If Optional=true: field?: Record<K,V> (optional, never null when present)
+// - If Optional=true: field?: Record<K,V> | null (optional and nullable are independent)
 // See §4.9 for the complete decision tree.
 type MapDescriptor struct {
 	exprBase
@@ -87,6 +95,11 @@ type ReferenceDescriptor struct {
 
 	// Target is the referenced type's identifier.
 	Target GoIdentifier
+
+	// TypeArguments contains the arguments for a generic application. Arguments
+	// may include type parameters declared by the containing type. It is empty
+	// only for references to non-generic declarations.
+	TypeArguments []TypeDescriptor
 }
 
 // Kind returns KindReference.
@@ -97,10 +110,24 @@ func Ref(name string, pkg string) *ReferenceDescriptor {
 	return &ReferenceDescriptor{Target: GoIdentifier{Name: name, Package: pkg}}
 }
 
+// RefWithArgs returns a ReferenceDescriptor for an applied generic type.
+// Panics if any type argument is nil.
+func RefWithArgs(name string, pkg string, args ...TypeDescriptor) *ReferenceDescriptor {
+	for i, arg := range args {
+		if arg == nil {
+			panic(fmt.Sprintf("ir.RefWithArgs: type argument at index %d is nil", i))
+		}
+	}
+	return &ReferenceDescriptor{
+		Target:        GoIdentifier{Name: name, Package: pkg},
+		TypeArguments: append([]TypeDescriptor(nil), args...),
+	}
+}
+
 // PtrDescriptor represents a Go pointer type (*T).
 // The TypeScript output depends on field context (see §4.9):
 // - If Optional=false: field: T | null (always present, can be null)
-// - If Optional=true: field?: T (optional, never null when present)
+// - If Optional=true: field?: T | null (optional and nullable are independent)
 type PtrDescriptor struct {
 	exprBase
 

@@ -1,6 +1,10 @@
 package ir
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestArrayDescriptor_Kind(t *testing.T) {
 	a := &ArrayDescriptor{}
@@ -30,6 +34,9 @@ func TestSliceConstructor(t *testing.T) {
 	if s.Length != 0 {
 		t.Errorf("Slice.Length = %d, want 0", s.Length)
 	}
+	if !s.IsSlice() {
+		t.Error("Slice.IsSlice() = false, want true")
+	}
 }
 
 func TestArrayConstructor(t *testing.T) {
@@ -39,6 +46,45 @@ func TestArrayConstructor(t *testing.T) {
 	}
 	if a.Length != 10 {
 		t.Errorf("Array.Length = %d, want 10", a.Length)
+	}
+	if a.IsSlice() {
+		t.Error("Array.IsSlice() = true, want false")
+	}
+	zero := Array(String(), 0)
+	if zero.IsSlice() || zero.Length != 0 {
+		t.Fatalf("Array(..., 0) = %#v, want zero-length fixed array", zero)
+	}
+	legacySlice := &ArrayDescriptor{Element: String()}
+	if !legacySlice.IsSlice() {
+		t.Fatal("legacy zero-length descriptor should remain a slice")
+	}
+	legacyArray := &ArrayDescriptor{Element: String(), Length: 3}
+	if legacyArray.IsSlice() {
+		t.Fatal("legacy positive-length descriptor should remain a fixed array")
+	}
+}
+
+func TestArrayDescriptor_JSONPreservesLegacyShape(t *testing.T) {
+	tests := []struct {
+		name       string
+		descriptor *ArrayDescriptor
+		wantMarker bool
+	}{
+		{name: "slice", descriptor: Slice(String())},
+		{name: "positive fixed array", descriptor: Array(String(), 2)},
+		{name: "zero fixed array", descriptor: Array(String(), 0), wantMarker: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded, err := json.Marshal(tt.descriptor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasMarker := strings.Contains(string(encoded), `"isArray":true`)
+			if hasMarker != tt.wantMarker {
+				t.Errorf("MarshalJSON() = %s, isArray marker = %v, want %v", encoded, hasMarker, tt.wantMarker)
+			}
+		})
 	}
 }
 
@@ -77,6 +123,30 @@ func TestReferenceDescriptor_ExprBase(t *testing.T) {
 	r := &ReferenceDescriptor{Target: GoIdentifier{Name: "Foo", Package: "pkg"}}
 	if !r.TypeName().IsZero() {
 		t.Error("ReferenceDescriptor.TypeName() should return zero value")
+	}
+}
+
+func TestRefWithArgsPreservesAndSerializesArguments(t *testing.T) {
+	args := []TypeDescriptor{String(), Ref("User", "example.com/users")}
+	ref := RefWithArgs("Page", "example.com/api", args...)
+	args[0] = Bool()
+
+	if len(ref.TypeArguments) != 2 || ref.TypeArguments[0].Kind() != KindPrimitive {
+		t.Fatalf("RefWithArgs did not preserve arguments: %#v", ref.TypeArguments)
+	}
+	primitive := ref.TypeArguments[0].(*PrimitiveDescriptor)
+	if primitive.PrimitiveKind != PrimitiveString {
+		t.Fatalf("RefWithArgs retained caller slice alias: got %v", primitive.PrimitiveKind)
+	}
+
+	data, err := json.Marshal(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"typeArguments"`, `"primitiveKind":"String"`, `"name":"User"`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("serialized reference missing %s: %s", want, data)
+		}
 	}
 }
 
