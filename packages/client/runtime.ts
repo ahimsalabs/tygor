@@ -22,10 +22,10 @@ export abstract class TygorError extends Error {
 export class ServerError extends TygorError {
   readonly kind = "server" as const;
   code: ErrorCode;
-  details?: Record<string, unknown>;
+  details?: Record<string, unknown> | null;
   httpStatus: number;
 
-  constructor(code: ErrorCode, message: string, httpStatus: number, details?: Record<string, unknown>) {
+  constructor(code: ErrorCode, message: string, httpStatus: number, details?: Record<string, unknown> | null) {
     super(message);
     this.name = "ServerError";
     this.code = code;
@@ -277,6 +277,18 @@ export interface Stream<T> extends AsyncIterable<T> {
  */
 export type SubscriptionStatus = "connecting" | "connected" | "reconnecting" | "completed" | "error" | "disconnected";
 
+const MAX_RECONNECT_ATTEMPTS = 3;
+
+function isRetryableStreamStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function sseFieldValue(line: string, field: string): string | undefined {
+  if (!line.startsWith(`${field}:`)) return undefined;
+  const value = line.slice(field.length + 1);
+  return value.startsWith(" ") ? value.slice(1) : value;
+}
+
 /**
  * SubscriptionResult is the combined state of a subscription (LiveValue or Stream).
  * Follows a similar pattern to TanStack Query's QueryObserverResult.
@@ -311,6 +323,10 @@ export interface SubscriptionResult<T> {
  *
  * The subscribe method follows the external store contract expected by
  * React's useSyncExternalStore and similar patterns in other frameworks.
+ * Terminal errors stop reconnecting while the LiveValue is observed. Removing
+ * its last subscriber ends that connection session and changes the status to
+ * disconnected; a later subscription starts a new session while retaining the
+ * last received data.
  *
  * @example
  * // Vanilla JS
@@ -553,19 +569,30 @@ function createSSEStream<T>(
   let currentError: Error | undefined = undefined;
   let statusUpdatedAt = Date.now();
   let dataUpdatedAt: number | undefined = undefined;
+  let currentSnapshot = makeSubscriptionResult<T>(
+    currentStatus,
+    currentData,
+    currentError,
+    statusUpdatedAt,
+    dataUpdatedAt,
+  );
 
   // Listeners get notified on any state change
   const listeners = new Set<(result: SubscriptionResult<T>) => void>();
   // Separate data listeners for AsyncIterator
   const dataListeners = new Set<(value: T) => void>();
 
-  const getSnapshot = (): SubscriptionResult<T> => {
-    return makeSubscriptionResult(currentStatus, currentData, currentError, statusUpdatedAt, dataUpdatedAt);
-  };
+  const getSnapshot = (): SubscriptionResult<T> => currentSnapshot;
 
   const notify = () => {
-    const result = getSnapshot();
-    listeners.forEach((listener) => listener(result));
+    currentSnapshot = makeSubscriptionResult(
+      currentStatus,
+      currentData,
+      currentError,
+      statusUpdatedAt,
+      dataUpdatedAt,
+    );
+    listeners.forEach((listener) => listener(currentSnapshot));
   };
 
   const setStatus = (status: SubscriptionStatus, error?: Error) => {
@@ -573,6 +600,7 @@ function createSSEStream<T>(
     currentError = error;
     statusUpdatedAt = Date.now();
     notify();
+    if (status === "completed" || status === "error") detachUserAbortListener();
   };
 
   const setData = (data: T) => {
@@ -588,14 +616,22 @@ function createSSEStream<T>(
   let connectionPromise: Promise<void> | null = null;
   let reconnectAttempt = 0;
   let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  let lastEventId = "";
   // Track if we were intentionally aborted (user-provided signal)
-  let userAborted = false;
+  let userAborted = options?.signal?.aborted ?? false;
+  let userAbortListenerAttached = false;
   // Track if we've ever successfully connected (for connecting vs reconnecting)
   let hasConnected = false;
+  const hasConsumers = () => listeners.size > 0 || dataListeners.size > 0;
 
-  const scheduleReconnect = () => {
+  const scheduleReconnect = (error: Error) => {
     // Don't reconnect if user aborted or no listeners
-    if (userAborted || (listeners.size === 0 && dataListeners.size === 0)) return;
+    if (userAborted || reconnectTimeout || !hasConsumers()) return;
+
+    if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+      setStatus("error", error);
+      return;
+    }
 
     reconnectAttempt++;
     // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, max 3000ms
@@ -603,89 +639,103 @@ function createSSEStream<T>(
 
     reconnectTimeout = setTimeout(() => {
       reconnectTimeout = null;
-      if (listeners.size > 0 || dataListeners.size > 0) {
+      if (hasConsumers()) {
         connect();
       }
     }, delay);
   };
 
   const connect = () => {
+    if (userAborted || currentStatus === "completed" || currentStatus === "error" || !hasConsumers()) {
+      return Promise.resolve();
+    }
     if (connectionPromise) {
       // If controller was aborted, wait for cleanup then create new connection
       if (controller?.signal.aborted) {
-        console.log(`[${opId}] connect() - existing promise is aborted, waiting for cleanup`);
         return connectionPromise.catch(() => {}).finally(() => connect());
       }
-      console.log(`[${opId}] connect() - reusing existing promise`);
       return connectionPromise;
     }
 
-    console.log(`[${opId}] connect() - creating new connection`);
     const myController = controller = new AbortController();
-    // Combine with options signal if provided
-    if (options?.signal) {
-      if (options.signal.aborted) {
-        userAborted = true;
-        setStatus("disconnected");
-        return Promise.resolve();
-      }
-      options.signal.addEventListener("abort", () => {
-        userAborted = true;
-        controller?.abort();
-      });
-    }
 
-    setStatus(hasConnected ? "reconnecting" : "connecting");
+    setStatus(hasConnected || reconnectAttempt > 0 ? "reconnecting" : "connecting");
     warnIfConnectionStalled(opId, () => currentStatus);
 
     const myPromise = connectionPromise = (async () => {
       // Request validation (before sending)
       if (validateRequest && schemas?.[opId]?.request) {
-        const schema = schemas[opId].request;
-        const result = await schema["~standard"].validate(req);
-        if (result.issues) {
-          const err = new ValidationError(opId, "request", result.issues);
+        try {
+          const schema = schemas[opId].request;
+          const result = await schema["~standard"].validate(req);
+          if (myController.signal.aborted) return;
+          if (result.issues) {
+            const err = new ValidationError(opId, "request", result.issues);
+            emitRpcError(service, method, "validation_error", err.message, emitErrors);
+            setStatus("error", err);
+            return;
+          }
+        } catch (e) {
+          if (myController.signal.aborted) return;
+          const err = e instanceof Error ? e : new Error("Request validation failed");
           emitRpcError(service, method, "validation_error", err.message, emitErrors);
           setStatus("error", err);
           return;
         }
       }
 
-      const headers = config.headers ? config.headers() : {};
-      const url = (config.baseUrl || "") + meta.path;
-      const fetchOptions: RequestInit = {
-        method: "POST",
-        headers: {
-          ...headers,
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        },
-        body: JSON.stringify(req),
-        signal: controller!.signal,
-      };
+      let url: string;
+      let fetchOptions: RequestInit;
+      try {
+        const headers = config.headers ? config.headers() : {};
+        url = (config.baseUrl || "") + meta.path;
+        fetchOptions = {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
+          },
+          body: JSON.stringify(req),
+          signal: myController.signal,
+        };
+      } catch (e) {
+        if (myController.signal.aborted) return;
+        const err = e instanceof Error ? e : new Error("Failed to prepare stream request");
+        setStatus("error", err);
+        return;
+      }
 
       let res: globalThis.Response;
       try {
         res = await fetchFn(url, fetchOptions);
       } catch (e) {
-        if ((e as Error).name === "AbortError") {
-          setStatus("disconnected");
-          return;
-        }
+        if (myController.signal.aborted) return;
         const msg = e instanceof Error ? e.message : "Network error";
         emitRpcError(service, method, "network_error", msg, emitErrors);
-        setStatus("error", new TransportError(msg, 0, e));
+        setStatus("reconnecting");
+        scheduleReconnect(new TransportError(msg, 0, e));
         return;
       }
+      if (myController.signal.aborted) return;
 
       const httpStatus = res.status;
 
       // Check for non-SSE error response
       const contentType = res.headers.get("Content-Type") || "";
       if (!contentType.includes("text/event-stream")) {
+        if (isRetryableStreamStatus(httpStatus)) {
+          const err = new TransportError(res.statusText || `HTTP ${httpStatus}`, httpStatus);
+          emitRpcError(service, method, "transport_error", err.message, emitErrors);
+          setStatus("reconnecting");
+          scheduleReconnect(err);
+          return;
+        }
         let rawBody = "";
         try {
           rawBody = await res.text();
+          if (myController.signal.aborted) return;
           const envelope = JSON.parse(rawBody);
           if (envelope.error) {
             const code = (envelope.error.code || "internal") as ErrorCode;
@@ -695,6 +745,7 @@ function createSSEStream<T>(
             return;
           }
         } catch (e) {
+          if (myController.signal.aborted) return;
           if (e instanceof ServerError) {
             setStatus("error", e);
             return;
@@ -723,6 +774,7 @@ function createSSEStream<T>(
       try {
         while (true) {
           const { value, done } = await reader.read();
+          if (myController.signal.aborted) return;
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -736,7 +788,12 @@ function createSSEStream<T>(
             // Parse SSE event
             const lines = eventText.split("\n");
             for (const line of lines) {
+              const id = sseFieldValue(line, "id");
+              if (id !== undefined && !id.includes("\0")) lastEventId = id;
+            }
+            for (const line of lines) {
               if (line.startsWith("data: ")) {
+                if (myController.signal.aborted) return;
                 const data = line.slice(6);
                 try {
                   const envelope = JSON.parse(data) as Response<T>;
@@ -753,6 +810,7 @@ function createSSEStream<T>(
                   if (validateResponse && schemas?.[opId]?.response) {
                     const schema = schemas[opId].response;
                     const result = await schema["~standard"].validate(envelope.result);
+                    if (myController.signal.aborted) return;
                     if (result.issues) {
                       const err = new ValidationError(opId, "response", result.issues);
                       emitRpcError(service, method, "validation_error", err.message, emitErrors);
@@ -762,8 +820,10 @@ function createSSEStream<T>(
                   }
 
                   // Update data (notifies both listeners and dataListeners)
+                  if (myController.signal.aborted) return;
                   setData(envelope.result as T);
                 } catch (e) {
+                  if (myController.signal.aborted) return;
                   if (e instanceof ServerError || e instanceof ValidationError) {
                     setStatus("error", e);
                     return;
@@ -789,16 +849,16 @@ function createSSEStream<T>(
       }
 
       // Stream ended cleanly - this is intentional completion, don't reconnect
+      if (myController.signal.aborted) return;
       setStatus("completed");
     })().catch((err) => {
       // Silently ignore AbortError from cleanup (intentional disconnect)
-      if (err.name === "AbortError") {
-        setStatus("disconnected");
-        return;
-      }
-      // Connection error - set error status and attempt reconnect
-      setStatus("error", err);
-      scheduleReconnect();
+      if (myController.signal.aborted) return;
+      // Network/body interruption - keep consumers active while reconnecting.
+      const msg = err instanceof Error ? err.message : "Stream connection interrupted";
+      emitRpcError(service, method, "network_error", msg, emitErrors);
+      setStatus("reconnecting");
+      scheduleReconnect(new TransportError(msg, 0, err));
     }).finally(() => {
       // Only clear if we're still the active connection (prevent race with new connections)
       if (connectionPromise === myPromise) {
@@ -812,8 +872,7 @@ function createSSEStream<T>(
     return connectionPromise;
   };
 
-  const disconnect = () => {
-    console.log(`[${opId}] disconnect() - controller=${!!controller}, signal.aborted=${controller?.signal.aborted}`);
+  function disconnect() {
     // Cancel any pending reconnect
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
@@ -821,24 +880,89 @@ function createSSEStream<T>(
     }
     reconnectAttempt = 0;
     if (controller) {
-      console.log(`[${opId}] disconnect() - calling controller.abort()`);
       controller.abort();
-      console.log(`[${opId}] disconnect() - after abort, signal.aborted=${controller.signal.aborted}`);
       // Don't set controller or connectionPromise to null here
       // Let the finally block handle cleanup after abort completes
     }
-  };
+    if (currentStatus !== "completed" && currentStatus !== "error" && currentStatus !== "disconnected") {
+      setStatus("disconnected");
+    }
+  }
+
+  function abortFromUser() {
+    userAborted = true;
+    detachUserAbortListener();
+    const notifyCancellation = currentStatus === "disconnected" && hasConsumers();
+    disconnect();
+    if (notifyCancellation) setStatus("disconnected");
+  }
+
+  function attachUserAbortListener() {
+    const signal = options?.signal;
+    if (!signal || userAborted || userAbortListenerAttached) return;
+    if (signal.aborted) {
+      userAborted = true;
+      return;
+    }
+    signal.addEventListener("abort", abortFromUser, { once: true });
+    userAbortListenerAttached = true;
+    // An abort between the check and listener registration does not dispatch
+    // the event to this newly registered listener.
+    if (signal.aborted) abortFromUser();
+  }
+
+  function detachUserAbortListener() {
+    if (!userAbortListenerAttached) return;
+    options!.signal!.removeEventListener("abort", abortFromUser);
+    userAbortListenerAttached = false;
+  }
 
   // Create async iterator for for-await usage
   const createAsyncIterator = (): AsyncIterator<T> => {
+    type Waiter = {
+      resolve: (result: IteratorResult<T>) => void;
+      reject: (error: Error) => void;
+    };
+    type IteratorState = "active" | "completed" | "cancelled" | "failed";
+
     const values: T[] = [];
-    let resolveNext: ((result: IteratorResult<T>) => void) | null = null;
-    let iteratorDone = false;
+    const waiters: Waiter[] = [];
+    let state: IteratorState = "active";
+    let terminalError: Error | undefined;
+    let listening = false;
+
+    const cleanup = () => {
+      if (!listening) return;
+      listening = false;
+      dataListeners.delete(onData);
+      listeners.delete(onStatus);
+      if (dataListeners.size === 0 && listeners.size === 0) {
+        disconnect();
+        detachUserAbortListener();
+      }
+    };
+
+    const finish = (nextState: Exclude<IteratorState, "active">, error?: Error) => {
+      if (state !== "active") return;
+      state = nextState;
+      terminalError = error;
+      if (nextState === "failed" || nextState === "cancelled") values.length = 0;
+      cleanup();
+
+      for (const waiter of waiters.splice(0)) {
+        if (nextState === "failed") {
+          waiter.reject(error!);
+        } else {
+          waiter.resolve({ done: true, value: undefined as any });
+        }
+      }
+    };
 
     const onData = (value: T) => {
-      if (resolveNext) {
-        resolveNext({ done: false, value });
-        resolveNext = null;
+      if (state !== "active") return;
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter.resolve({ done: false, value });
       } else {
         values.push(value);
       }
@@ -846,38 +970,60 @@ function createSSEStream<T>(
 
     // Also listen for errors/completion via status changes
     const onStatus = (result: SubscriptionResult<T>) => {
-      if (result.status === "error" || result.status === "disconnected") {
-        iteratorDone = true;
-        if (resolveNext) {
-          resolveNext({ done: true, value: undefined as any });
-          resolveNext = null;
-        }
+      if (result.status === "completed") {
+        finish("completed");
+      } else if (result.status === "error") {
+        finish("failed", result.error ?? new Error("Stream failed"));
+      } else if (result.status === "disconnected") {
+        finish("cancelled");
       }
     };
 
-    dataListeners.add(onData);
-    listeners.add(onStatus);
-    if (dataListeners.size === 1 && listeners.size === 1) {
+    if (currentStatus === "completed") {
+      state = "completed";
+    } else if (currentStatus === "error") {
+      state = "failed";
+      terminalError = currentError ?? new Error("Stream failed");
+    } else if (userAborted) {
+      state = "cancelled";
+    } else {
+      attachUserAbortListener();
+      if (userAborted) {
+        state = "cancelled";
+      } else {
+        const hadConsumers = listeners.size > 0 || dataListeners.size > 0;
+        dataListeners.add(onData);
+        listeners.add(onStatus);
+        listening = true;
+        if (!hadConsumers) connect();
+      }
+    }
+
+    if (listening && currentStatus === "disconnected") {
       connect();
     }
 
     return {
       async next(): Promise<IteratorResult<T>> {
+        if (state === "failed") {
+          throw terminalError;
+        }
         if (values.length > 0) {
           return { done: false, value: values.shift()! };
         }
-        if (iteratorDone) {
+        if (state !== "active") {
           return { done: true, value: undefined as any };
         }
-        return new Promise((resolve) => {
-          resolveNext = resolve;
+        return new Promise((resolve, reject) => {
+          waiters.push({ resolve, reject });
         });
       },
       async return(): Promise<IteratorResult<T>> {
-        dataListeners.delete(onData);
-        listeners.delete(onStatus);
-        if (dataListeners.size === 0 && listeners.size === 0) {
-          disconnect();
+        if (state === "completed") {
+          state = "cancelled";
+          values.length = 0;
+        } else {
+          finish("cancelled");
         }
         return { done: true, value: undefined as any };
       },
@@ -890,12 +1036,13 @@ function createSSEStream<T>(
     },
 
     subscribe(listener: (result: SubscriptionResult<T>) => void): () => void {
-      console.log(`[${opId}] subscribe - listeners will be ${listeners.size + 1}`);
+      if (currentStatus !== "completed" && currentStatus !== "error") {
+        attachUserAbortListener();
+      }
       listeners.add(listener);
 
       // Start connection if this is the first subscriber
       if (listeners.size === 1 && dataListeners.size === 0) {
-        console.log(`[${opId}] First subscriber - calling connect()`);
         connect();
       }
 
@@ -903,11 +1050,10 @@ function createSSEStream<T>(
       listener(getSnapshot());
 
       return () => {
-        console.log(`[${opId}] unsubscribe - listeners will be ${listeners.size - 1}`);
         listeners.delete(listener);
         if (listeners.size === 0 && dataListeners.size === 0) {
-          console.log(`[${opId}] Last subscriber - calling disconnect()`);
           disconnect();
+          detachUserAbortListener();
         }
       };
     },
@@ -967,17 +1113,28 @@ function createLiveValueClient<T>(
   let currentError: Error | undefined = undefined;
   let statusUpdatedAt = Date.now();
   let dataUpdatedAt: number | undefined = undefined;
+  let currentSnapshot = makeSubscriptionResult<T>(
+    currentStatus,
+    currentData,
+    currentError,
+    statusUpdatedAt,
+    dataUpdatedAt,
+  );
 
   // Listeners get notified on any state change
   const listeners = new Set<(result: SubscriptionResult<T>) => void>();
 
-  const getSnapshot = (): SubscriptionResult<T> => {
-    return makeSubscriptionResult(currentStatus, currentData, currentError, statusUpdatedAt, dataUpdatedAt);
-  };
+  const getSnapshot = (): SubscriptionResult<T> => currentSnapshot;
 
   const notify = () => {
-    const result = getSnapshot();
-    listeners.forEach((listener) => listener(result));
+    currentSnapshot = makeSubscriptionResult(
+      currentStatus,
+      currentData,
+      currentError,
+      statusUpdatedAt,
+      dataUpdatedAt,
+    );
+    listeners.forEach((listener) => listener(currentSnapshot));
   };
 
   const setStatus = (status: SubscriptionStatus, error?: Error) => {
@@ -998,12 +1155,19 @@ function createLiveValueClient<T>(
   let connectionPromise: Promise<void> | null = null;
   let reconnectAttempt = 0;
   let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  let lastEventId = "";
   // Track if we've ever successfully connected (for connecting vs reconnecting)
   let hasConnected = false;
+  const hasConsumers = () => listeners.size > 0;
 
-  const scheduleReconnect = () => {
+  const scheduleReconnect = (error: Error) => {
     // Only reconnect if we still have listeners
-    if (listeners.size === 0) return;
+    if (reconnectTimeout || !hasConsumers()) return;
+
+    if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+      setStatus("error", error);
+      return;
+    }
 
     reconnectAttempt++;
     // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, max 3000ms
@@ -1011,66 +1175,83 @@ function createLiveValueClient<T>(
 
     reconnectTimeout = setTimeout(() => {
       reconnectTimeout = null;
-      if (listeners.size > 0) {
+      if (hasConsumers()) {
         connect();
       }
     }, delay);
   };
 
   const connect = () => {
+    if (currentStatus === "error" || !hasConsumers()) {
+      return Promise.resolve();
+    }
     if (connectionPromise) {
       // If controller was aborted, wait for cleanup then create new connection
       if (controller?.signal.aborted) {
-        console.log(`[${opId}] connect() - existing promise is aborted, waiting for cleanup`);
         return connectionPromise.catch(() => {}).finally(() => connect());
       }
-      console.log(`[${opId}] connect() - reusing existing promise`);
       return connectionPromise;
     }
 
-    console.log(`[${opId}] connect() - creating new connection`);
     const myController = controller = new AbortController();
-    setStatus(hasConnected ? "reconnecting" : "connecting");
+    setStatus(hasConnected || reconnectAttempt > 0 ? "reconnecting" : "connecting");
     warnIfConnectionStalled(opId, () => currentStatus);
 
     const myPromise = connectionPromise = (async () => {
       const req = {};
 
-      const headers = config.headers ? config.headers() : {};
-      const url = (config.baseUrl || "") + meta.path;
-      const fetchOptions: RequestInit = {
-        method: "POST",
-        headers: {
-          ...headers,
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        },
-        body: JSON.stringify(req),
-        signal: controller!.signal,
-      };
+      let url: string;
+      let fetchOptions: RequestInit;
+      try {
+        const headers = config.headers ? config.headers() : {};
+        url = (config.baseUrl || "") + meta.path;
+        fetchOptions = {
+          method: "POST",
+          headers: {
+            ...headers,
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
+          },
+          body: JSON.stringify(req),
+          signal: myController.signal,
+        };
+      } catch (e) {
+        if (myController.signal.aborted) return;
+        const err = e instanceof Error ? e : new Error("Failed to prepare LiveValue request");
+        setStatus("error", err);
+        return;
+      }
 
       let res: globalThis.Response;
       try {
         res = await fetchFn(url, fetchOptions);
       } catch (e) {
-        if ((e as Error).name === "AbortError") {
-          setStatus("disconnected");
-          return;
-        }
+        if (myController.signal.aborted) return;
         const msg = e instanceof Error ? e.message : "Network error";
         emitRpcError(service, method, "network_error", msg, emitErrors);
-        setStatus("error", new TransportError(msg, 0, e));
+        setStatus("reconnecting");
+        scheduleReconnect(new TransportError(msg, 0, e));
         return;
       }
+      if (myController.signal.aborted) return;
 
       const httpStatus = res.status;
 
       // Check for non-SSE error response
       const contentType = res.headers.get("Content-Type") || "";
       if (!contentType.includes("text/event-stream")) {
+        if (isRetryableStreamStatus(httpStatus)) {
+          const err = new TransportError(res.statusText || `HTTP ${httpStatus}`, httpStatus);
+          emitRpcError(service, method, "transport_error", err.message, emitErrors);
+          setStatus("reconnecting");
+          scheduleReconnect(err);
+          return;
+        }
         let rawBody = "";
         try {
           rawBody = await res.text();
+          if (myController.signal.aborted) return;
           const envelope = JSON.parse(rawBody);
           if (envelope.error) {
             const code = (envelope.error.code || "internal") as ErrorCode;
@@ -1080,6 +1261,7 @@ function createLiveValueClient<T>(
             return;
           }
         } catch (e) {
+          if (myController.signal.aborted) return;
           if (e instanceof ServerError) {
             setStatus("error", e);
             return;
@@ -1108,6 +1290,7 @@ function createLiveValueClient<T>(
       try {
         while (true) {
           const { value, done } = await reader.read();
+          if (myController.signal.aborted) return;
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -1121,7 +1304,12 @@ function createLiveValueClient<T>(
             // Parse SSE event
             const lines = eventText.split("\n");
             for (const line of lines) {
+              const id = sseFieldValue(line, "id");
+              if (id !== undefined && !id.includes("\0")) lastEventId = id;
+            }
+            for (const line of lines) {
               if (line.startsWith("data: ")) {
+                if (myController.signal.aborted) return;
                 const data = line.slice(6);
                 try {
                   const envelope = JSON.parse(data) as Response<T>;
@@ -1138,6 +1326,7 @@ function createLiveValueClient<T>(
                   if (validateResponse && schemas?.[opId]?.response) {
                     const schema = schemas[opId].response;
                     const result = await schema["~standard"].validate(envelope.result);
+                    if (myController.signal.aborted) return;
                     if (result.issues) {
                       const err = new ValidationError(opId, "response", result.issues);
                       emitRpcError(service, method, "validation_error", err.message, emitErrors);
@@ -1147,8 +1336,10 @@ function createLiveValueClient<T>(
                   }
 
                   // Update data
+                  if (myController.signal.aborted) return;
                   setData(envelope.result as T);
                 } catch (e) {
+                  if (myController.signal.aborted) return;
                   if (e instanceof ServerError || e instanceof ValidationError) {
                     setStatus("error", e);
                     return;
@@ -1175,17 +1366,17 @@ function createLiveValueClient<T>(
 
       // LiveValue connection closed unexpectedly - reconnect
       // (LiveValues represent persistent server state, they shouldn't end cleanly)
+      if (myController.signal.aborted) return;
       setStatus("reconnecting");
-      scheduleReconnect();
+      scheduleReconnect(new TransportError("LiveValue connection ended", httpStatus));
     })().catch((err) => {
       // Silently ignore AbortError from cleanup (intentional disconnect)
-      if (err.name === "AbortError") {
-        setStatus("disconnected");
-        return;
-      }
-      // Connection error - set error status and attempt reconnect
-      setStatus("error", err);
-      scheduleReconnect();
+      if (myController.signal.aborted) return;
+      // Network/body interruption - keep the subscription active while reconnecting.
+      const msg = err instanceof Error ? err.message : "LiveValue connection interrupted";
+      emitRpcError(service, method, "network_error", msg, emitErrors);
+      setStatus("reconnecting");
+      scheduleReconnect(new TransportError(msg, 0, err));
     }).finally(() => {
       // Only clear if we're still the active connection (prevent race with new connections)
       if (connectionPromise === myPromise) {
@@ -1200,7 +1391,6 @@ function createLiveValueClient<T>(
   };
 
   const disconnect = () => {
-    console.log(`[${opId}] disconnect() - controller=${!!controller}, signal.aborted=${controller?.signal.aborted}`);
     // Cancel any pending reconnect
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
@@ -1208,12 +1398,11 @@ function createLiveValueClient<T>(
     }
     reconnectAttempt = 0;
     if (controller) {
-      console.log(`[${opId}] disconnect() - calling controller.abort()`);
       controller.abort();
-      console.log(`[${opId}] disconnect() - after abort, signal.aborted=${controller.signal.aborted}`);
       // Don't set controller or connectionPromise to null here
       // Let the finally block handle cleanup after abort completes
     }
+    if (currentStatus !== "disconnected") setStatus("disconnected");
   };
 
   return {
