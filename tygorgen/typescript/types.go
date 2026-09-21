@@ -123,8 +123,7 @@ type TypeScriptConfig struct {
 	// Useful for documentation and debugging precision concerns.
 	EmitTypeHints bool
 
-	// NullableSliceElements controls whether []*T generates T[] or (T | null)[].
-	// false (default): []*T → T[] - pointers are treated as implementation detail
-	// true:            []*T → (T | null)[] - pointers indicate nullable elements
+	// NullableSliceElements is retained for configuration compatibility.
+	// Pointer elements are always nullable because nil elements encode as JSON null.
 	NullableSliceElements bool
 }

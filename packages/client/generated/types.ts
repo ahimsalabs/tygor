@@ -7,7 +7,7 @@
 export interface Error {
   code: ErrorCode;
   message: string;
-  details?: Record<string, unknown>;
+  details?: Record<string, unknown> | null;
 }
 /**
  * ErrorCode represents a machine-readable error code.

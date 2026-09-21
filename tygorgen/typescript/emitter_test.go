@@ -368,7 +368,7 @@ func TestEmitter_EmitTypeExpr(t *testing.T) {
 			name:     "primitive bytes",
 			typ:      ir.Bytes(),
 			tsConfig: TypeScriptConfig{EmitTypeHints: true},
-			want:     "string /* base64 */",
+			want:     "(string /* base64 */ | null)",
 		},
 		{
 			name:     "primitive time",
@@ -404,13 +404,13 @@ func TestEmitter_EmitTypeExpr(t *testing.T) {
 			name:     "array of strings",
 			typ:      ir.Slice(ir.String()),
 			tsConfig: TypeScriptConfig{},
-			want:     "string[]",
+			want:     "(string[] | null)",
 		},
 		{
 			name:     "readonly array",
 			typ:      ir.Slice(ir.String()),
 			tsConfig: TypeScriptConfig{UseReadonlyArrays: true},
-			want:     "readonly string[]",
+			want:     "(readonly string[] | null)",
 		},
 		{
 			name:     "fixed array small (tuple)",
@@ -428,13 +428,13 @@ func TestEmitter_EmitTypeExpr(t *testing.T) {
 			name:     "map with string key",
 			typ:      ir.Map(ir.String(), ir.Int(0)),
 			tsConfig: TypeScriptConfig{EmitTypeHints: true},
-			want:     "Record<string, number /* int */>",
+			want:     "(Record<string, number /* int */> | null)",
 		},
 		{
 			name:     "map with named key type",
 			typ:      ir.Map(ir.Ref("UserID", "test"), ir.String()),
 			tsConfig: TypeScriptConfig{},
-			want:     "Record<UserID, string>",
+			want:     "(Record<string, string> | null)",
 		},
 		{
 			name:     "reference type",
@@ -827,6 +827,29 @@ func TestEmitter_LargeIntegerWarning(t *testing.T) {
 	}
 }
 
+func TestEmitter_StringEncodedNamedBoolUsesWireStrings(t *testing.T) {
+	pkg := "example.com/model"
+	flagID := ir.GoIdentifier{Name: "Flag", Package: pkg}
+	model := &ir.StructDescriptor{
+		Name: ir.GoIdentifier{Name: "Model", Package: pkg},
+		Fields: []ir.FieldDescriptor{{
+			Name: "Flag", JSONName: "flag", Type: ir.Ref(flagID.Name, flagID.Package), StringEncoded: true,
+		}},
+	}
+	emitter := &Emitter{
+		schema:    &ir.Schema{Types: []ir.TypeDescriptor{&ir.AliasDescriptor{Name: flagID, Underlying: ir.Bool()}, model}},
+		tsConfig:  TypeScriptConfig{EmitExport: true},
+		indentStr: "  ",
+	}
+	var buf bytes.Buffer
+	if _, err := emitter.EmitType(&buf, model); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `flag: "true" | "false";`) {
+		t.Fatalf("named bool did not use strict wire strings:\n%s", buf.String())
+	}
+}
+
 // TestEmitter_TypeMappings tests custom type mappings
 func TestEmitter_TypeMappings(t *testing.T) {
 	schema := &ir.Schema{
@@ -1058,28 +1081,28 @@ func TestEmitter_SliceElements(t *testing.T) {
 		want                  string
 	}{
 		{
-			name:                  "slice of pointers - unwrap by default",
+			name:                  "slice of pointers - nullable by default",
 			sliceType:             ir.Slice(ir.Ptr(ir.Ref("User", "test"))),
 			nullableSliceElements: false,
-			want:                  "User[]",
+			want:                  "((User | null)[] | null)",
 		},
 		{
 			name:                  "slice of pointers - preserve with config",
 			sliceType:             ir.Slice(ir.Ptr(ir.Ref("User", "test"))),
 			nullableSliceElements: true,
-			want:                  "(User | null)[]",
+			want:                  "((User | null)[] | null)",
 		},
 		{
-			name:                  "slice of double pointers - unwrap by default",
+			name:                  "slice of double pointers - nullable by default",
 			sliceType:             ir.Slice(ir.Ptr(ir.Ptr(ir.String()))),
 			nullableSliceElements: false,
-			want:                  "string[]",
+			want:                  "((string | null)[] | null)",
 		},
 		{
 			name:                  "slice of non-pointers - unaffected",
 			sliceType:             ir.Slice(ir.String()),
 			nullableSliceElements: false,
-			want:                  "string[]",
+			want:                  "(string[] | null)",
 		},
 	}
 

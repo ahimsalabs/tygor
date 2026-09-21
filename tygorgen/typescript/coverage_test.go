@@ -712,12 +712,7 @@ func TestTypeScriptGenerator_Generate_SliceOfPointers(t *testing.T) {
 	content := string(memSink.Get("types.ts"))
 	t.Logf("Generated:\n%s", content)
 
-	// Should be Task[] not (Task | null)[]
-	if strings.Contains(content, "(Task | null)[]") {
-		t.Error("slice of pointers should NOT generate (T | null)[] by default, got nullable elements")
-	}
-
-	want := "tasks: Task[] | null;"
+	want := "tasks: (Task | null)[] | null;"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}

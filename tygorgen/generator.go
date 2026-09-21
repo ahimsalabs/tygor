@@ -2,11 +2,13 @@ package tygorgen
 
 import (
 	"context"
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"tygor.dev/internal"
 	"tygor.dev/tygor"
@@ -72,9 +74,9 @@ type Config struct {
 	// Default: "union"
 	EnumStyle string
 
-	// OptionalType controls how optional fields (Go pointers) are typed in TypeScript.
-	// Supported values: "undefined" (T | undefined), "null" (T | null).
-	// Default: "undefined"
+	// OptionalType overrides the wire-correct distinction between omitted and null fields.
+	// Supported values: "default", "undefined", "null".
+	// Default: "default" (omitempty controls omission; nil-capable values permit null).
 	OptionalType string
 
 	// Frontmatter is content added to the top of each generated TypeScript file.
@@ -154,38 +156,13 @@ func GenerateTypes(types []any, cfg *Config) (*GenerateResult, error) {
 			continue
 		}
 		// Unwrap pointers
-		for rt.Kind() == reflect.Pointer {
+		for rt.Kind() == reflect.Pointer && rt.Name() == "" {
 			rt = rt.Elem()
 		}
 		reflectTypes = append(reflectTypes, rt)
 
-		pkg := rt.PkgPath()
-		name := rt.Name()
-		if name == "" {
-			continue
-		}
-
-		// Parse generic type arguments: Page[github.com/.../v1.User] -> extract v1.User
-		if idx := strings.Index(name, "["); idx >= 0 {
-			typeArgs := name[idx+1 : len(name)-1] // strip [ and ]
-			baseName := name[:idx]
-
-			// Add the base generic type
-			addRoot(pkg, baseName)
-
-			// Parse and add type arguments (handles multiple: K, V)
-			for _, arg := range strings.Split(typeArgs, ",") {
-				arg = strings.TrimSpace(arg)
-				// Format: github.com/pkg/path.TypeName
-				if lastDot := strings.LastIndex(arg, "."); lastDot >= 0 {
-					argPkg := arg[:lastDot]
-					argName := arg[lastDot+1:]
-					addRoot(argPkg, argName)
-				}
-			}
-		} else {
-			// Non-generic type
-			addRoot(pkg, name)
+		for _, id := range reflectedTypeReferences(reflectTypeToIRPreservePtr(rt, false)) {
+			addRoot(id.Package, id.Name)
 		}
 	}
 
@@ -319,13 +296,17 @@ func Generate(app *tygor.App, cfg *Config) (*GenerateResult, error) {
 
 	// 1. Build schema using configured provider
 	var schema *ir.Schema
+	var convertEndpointType endpointTypeConverter
 	var err error
 
 	switch cfg.Provider {
 	case "source":
-		schema, err = buildSchemaFromSource(ctx, routes, cfg.Packages)
+		schema, convertEndpointType, err = buildSchemaFromSource(ctx, routes, cfg.Packages)
 	case "reflection":
 		schema, err = buildSchemaFromReflection(ctx, routes)
+		convertEndpointType = func(t reflect.Type, preserveTopPointer bool) (ir.TypeDescriptor, error) {
+			return reflectTypeToIRRef(t, preserveTopPointer, true), nil
+		}
 	default:
 		return nil, fmt.Errorf("unknown provider: %q (expected \"source\" or \"reflection\")", cfg.Provider)
 	}
@@ -334,15 +315,19 @@ func Generate(app *tygor.App, cfg *Config) (*GenerateResult, error) {
 		return nil, fmt.Errorf("failed to build schema: %w", err)
 	}
 
-	// Collect warnings
+	// 2. Build service descriptors from routes
+	services, err := buildServiceDescriptors(routes, convertEndpointType)
+	if err != nil {
+		return nil, err
+	}
+	schema.Services = services
+
+	// Collect warnings after endpoint conversion because source-backed concrete
+	// generic arguments can discover custom marshalers while resolving services.
 	var warnings []Warning
 	for _, w := range schema.Warnings {
 		warnings = append(warnings, Warning{Code: w.Code, Message: w.Message})
 	}
-
-	// 2. Build service descriptors from routes
-	services := buildServiceDescriptors(routes)
-	schema.Services = services
 
 	// 3. Validate schema
 	if errs := schema.Validate(); len(errs) > 0 {
@@ -432,8 +417,10 @@ func Generate(app *tygor.App, cfg *Config) (*GenerateResult, error) {
 	return result, nil
 }
 
+type endpointTypeConverter func(t reflect.Type, preserveTopPointer bool) (ir.TypeDescriptor, error)
+
 // buildServiceDescriptors converts route metadata to IR service descriptors.
-func buildServiceDescriptors(routes internal.RouteMap) []ir.ServiceDescriptor {
+func buildServiceDescriptors(routes internal.RouteMap, convert endpointTypeConverter) ([]ir.ServiceDescriptor, error) {
 	// Group routes by service
 	serviceMap := make(map[string]*ir.ServiceDescriptor)
 
@@ -477,12 +464,20 @@ func buildServiceDescriptors(routes internal.RouteMap) []ir.ServiceDescriptor {
 		// Convert request type to descriptor
 		// Per spec §4.8: void requests use Request: nil
 		if route.Request != nil && !isEmptyStructType(route.Request) {
-			endpoint.Request = reflectTypeToIRRef(route.Request)
+			request, err := convert(route.Request, false)
+			if err != nil {
+				return nil, fmt.Errorf("convert request type for endpoint %s: %w", key, err)
+			}
+			endpoint.Request = request
 		}
 
 		// Convert response type to descriptor
 		if route.Response != nil {
-			endpoint.Response = reflectTypeToIRRef(route.Response)
+			response, err := convert(route.Response, true)
+			if err != nil {
+				return nil, fmt.Errorf("convert response type for endpoint %s: %w", key, err)
+			}
+			endpoint.Response = response
 		} else {
 			// No response type means void/empty
 			endpoint.Response = ir.Ptr(ir.Empty())
@@ -503,101 +498,190 @@ func buildServiceDescriptors(routes internal.RouteMap) []ir.ServiceDescriptor {
 		services = append(services, *serviceMap[name])
 	}
 
-	return services
+	return services, nil
 }
 
-// reflectTypeToIRRef converts a reflect.Type to an IR TypeDescriptor reference.
-// This handles the basic mapping from Go types to IR type expressions.
-//
-// For endpoint Request/Response types, pointers are stripped because they're
-// a Go idiom for efficiency, not an indication of nullability. Clients always
-// send valid request objects, and handlers return valid responses (or errors).
-//
-// For nested types (slice elements, map values), pointers ARE preserved because
-// they indicate nullability in the JSON output (e.g., []*User can have null elements).
-func reflectTypeToIRRef(t reflect.Type) ir.TypeDescriptor {
+// reflectTypeToIRRef converts a reflected endpoint type to its wire descriptor.
+// Response pointers are preserved because a typed nil response encodes as null.
+// The reflection provider emits monomorphized generic names; the source provider
+// emits generic definitions plus applied ReferenceDescriptor arguments.
+func reflectTypeToIRRef(t reflect.Type, preserveTopPointer, monomorphizeGenerics bool) ir.TypeDescriptor {
 	if t == nil {
 		return ir.Any()
 	}
 
-	// Strip top-level pointers - they're a Go idiom for endpoint types
-	for t.Kind() == reflect.Pointer {
+	isPointer := false
+	for t.Kind() == reflect.Pointer && t.Name() == "" {
+		isPointer = true
 		t = t.Elem()
+	}
+	base := reflectTypeToIR(t, monomorphizeGenerics)
+	if preserveTopPointer && isPointer {
+		return ir.Ptr(base)
+	}
+	return base
+}
+
+func sourceTypeToIRRef(t reflect.Type, preserveTopPointer bool, resolve provider.TypeExpressionResolver) (ir.TypeDescriptor, error) {
+	if t == nil {
+		return ir.Any(), nil
+	}
+
+	isPointer := false
+	for t.Kind() == reflect.Pointer && t.Name() == "" {
+		isPointer = true
+		t = t.Elem()
+	}
+	base, err := sourceTypeToIR(t, resolve)
+	if err != nil {
+		return nil, err
+	}
+	if preserveTopPointer && isPointer {
+		return ir.Ptr(base), nil
+	}
+	return base, nil
+}
+
+func sourceTypeToIR(t reflect.Type, resolve provider.TypeExpressionResolver) (ir.TypeDescriptor, error) {
+	if t == nil {
+		return ir.Any(), nil
 	}
 
 	switch {
-	// Handle slices/arrays - preserve pointer semantics for elements
+	case t == reflect.TypeFor[time.Time]():
+		return ir.Time(), nil
+	case t == reflect.TypeFor[time.Duration]():
+		return ir.Duration(), nil
+	case t == reflect.TypeFor[json.Number]():
+		return ir.Float(64), nil
+	case t == reflect.TypeFor[json.RawMessage]():
+		return ir.Any(), nil
+	case t.Name() != "" && t.PkgPath() != "":
+		if resolve == nil {
+			return nil, fmt.Errorf("source type resolver is unavailable for %s", t)
+		}
+		return resolve(t.PkgPath()+"."+t.Name(), t.PkgPath())
+	case isReflectedJSONByteSlice(t):
+		return ir.Bytes(), nil
 	case t.Kind() == reflect.Slice || t.Kind() == reflect.Array:
-		elem := reflectTypeToIRRefPreservePtr(t.Elem())
+		element, err := sourceTypeToIRPreservePtr(t.Elem(), resolve)
+		if err != nil {
+			return nil, err
+		}
+		if t.Kind() == reflect.Slice {
+			return ir.Slice(element), nil
+		}
+		return ir.Array(element, t.Len()), nil
+	case t.Kind() == reflect.Map:
+		var key ir.TypeDescriptor
+		var err error
+		if t.Key() == reflect.TypeFor[json.Number]() {
+			key = ir.String()
+		} else {
+			key, err = sourceTypeToIRPreservePtr(t.Key(), resolve)
+			if err != nil {
+				return nil, err
+			}
+		}
+		value, err := sourceTypeToIRPreservePtr(t.Elem(), resolve)
+		if err != nil {
+			return nil, err
+		}
+		return ir.Map(key, value), nil
+	case t.Kind() == reflect.Struct && t.NumField() == 0 && t.Name() == "":
+		return ir.Empty(), nil
+	case t.PkgPath() == "":
+		return reflectedPrimitive(t), nil
+	default:
+		return ir.Any(), nil
+	}
+}
+
+func sourceTypeToIRPreservePtr(t reflect.Type, resolve provider.TypeExpressionResolver) (ir.TypeDescriptor, error) {
+	isPointer := false
+	for t.Kind() == reflect.Pointer && t.Name() == "" {
+		isPointer = true
+		t = t.Elem()
+	}
+	base, err := sourceTypeToIR(t, resolve)
+	if err != nil {
+		return nil, err
+	}
+	if isPointer {
+		return ir.Ptr(base), nil
+	}
+	return base, nil
+}
+
+func reflectTypeToIR(t reflect.Type, monomorphizeGenerics bool) ir.TypeDescriptor {
+	if t == nil {
+		return ir.Any()
+	}
+
+	switch {
+	case t == reflect.TypeFor[time.Time]():
+		return ir.Time()
+	case t == reflect.TypeFor[time.Duration]():
+		return ir.Duration()
+	case t == reflect.TypeFor[json.Number]():
+		return ir.Float(64)
+	case t == reflect.TypeFor[json.RawMessage]():
+		return ir.Any()
+	case t.Name() != "" && t.PkgPath() != "":
+		if strings.Contains(t.Name(), "[") && !monomorphizeGenerics {
+			return parseReflectedTypeExpression(t.Name(), t.PkgPath())
+		}
+		return ir.Ref(sanitizeTypeName(t.Name()), t.PkgPath())
+	case isReflectedJSONByteSlice(t):
+		return ir.Bytes()
+	case t.Kind() == reflect.Slice || t.Kind() == reflect.Array:
+		elem := reflectTypeToIRPreservePtr(t.Elem(), monomorphizeGenerics)
 		if t.Kind() == reflect.Slice {
 			return ir.Slice(elem)
 		}
 		return ir.Array(elem, t.Len())
-
-	// Handle maps - preserve pointer semantics for values
 	case t.Kind() == reflect.Map:
-		key := reflectTypeToIRRefPreservePtr(t.Key())
-		value := reflectTypeToIRRefPreservePtr(t.Elem())
+		key := reflectMapKeyToIR(t.Key(), monomorphizeGenerics)
+		value := reflectTypeToIRPreservePtr(t.Elem(), monomorphizeGenerics)
 		return ir.Map(key, value)
-
-	// Handle empty struct (struct{})
-	case t.Kind() == reflect.Struct && t.NumField() == 0:
+	case t.Kind() == reflect.Struct && t.NumField() == 0 && t.Name() == "":
 		return ir.Empty()
-
-	// For named types (structs, aliases), create a reference
-	case t.Name() != "":
-		// Sanitize generic type names to match what the reflection provider generates
-		name := sanitizeTypeName(t.Name())
-		return ir.Ref(name, t.PkgPath())
-
-	// Fallback for primitives and unnamed types
+	case t.PkgPath() == "":
+		return reflectedPrimitive(t)
 	default:
 		return ir.Any()
 	}
 }
 
-// reflectTypeToIRRefPreservePtr converts a reflect.Type to an IR TypeDescriptor,
-// preserving pointer semantics. Used for nested types (slice elements, map values)
-// where pointers indicate nullability in JSON.
-func reflectTypeToIRRefPreservePtr(t reflect.Type) ir.TypeDescriptor {
+func isReflectedJSONByteSlice(t reflect.Type) bool {
+	if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8 {
+		return false
+	}
+	elemPointer := reflect.PointerTo(t.Elem())
+	return !elemPointer.Implements(reflect.TypeFor[json.Marshaler]()) &&
+		!elemPointer.Implements(reflect.TypeFor[encoding.TextMarshaler]())
+}
+
+func reflectMapKeyToIR(t reflect.Type, monomorphizeGenerics bool) ir.TypeDescriptor {
+	if t == reflect.TypeFor[json.Number]() {
+		return ir.String()
+	}
+	return reflectTypeToIRPreservePtr(t, monomorphizeGenerics)
+}
+
+func reflectTypeToIRPreservePtr(t reflect.Type, monomorphizeGenerics bool) ir.TypeDescriptor {
 	if t == nil {
 		return ir.Any()
 	}
 
 	// Track if we have pointer indirection (collapse multiple levels)
 	isPointer := false
-	for t.Kind() == reflect.Pointer {
+	for t.Kind() == reflect.Pointer && t.Name() == "" {
 		isPointer = true
 		t = t.Elem()
 	}
 
-	// Get the base type descriptor
-	var base ir.TypeDescriptor
-
-	switch {
-	case t.Kind() == reflect.Slice || t.Kind() == reflect.Array:
-		elem := reflectTypeToIRRefPreservePtr(t.Elem())
-		if t.Kind() == reflect.Slice {
-			base = ir.Slice(elem)
-		} else {
-			base = ir.Array(elem, t.Len())
-		}
-
-	case t.Kind() == reflect.Map:
-		key := reflectTypeToIRRefPreservePtr(t.Key())
-		value := reflectTypeToIRRefPreservePtr(t.Elem())
-		base = ir.Map(key, value)
-
-	case t.Kind() == reflect.Struct && t.NumField() == 0:
-		base = ir.Empty()
-
-	case t.Name() != "":
-		name := sanitizeTypeName(t.Name())
-		base = ir.Ref(name, t.PkgPath())
-
-	default:
-		base = ir.Any()
-	}
+	base := reflectTypeToIR(t, monomorphizeGenerics)
 
 	// Wrap in Ptr if the original type was a pointer
 	if isPointer {
@@ -606,14 +690,183 @@ func reflectTypeToIRRefPreservePtr(t reflect.Type) ir.TypeDescriptor {
 	return base
 }
 
-// isEmptyStructType checks if a reflect.Type is an empty struct (*struct{} or struct{}).
-// Used to detect void request types per spec §4.8.
+func reflectedPrimitive(t reflect.Type) ir.TypeDescriptor {
+	switch t.Kind() {
+	case reflect.Bool:
+		return ir.Bool()
+	case reflect.String:
+		return ir.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return ir.Int(t.Bits())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return ir.Uint(t.Bits())
+	case reflect.Float32, reflect.Float64:
+		return ir.Float(t.Bits())
+	case reflect.Interface:
+		return ir.Any()
+	default:
+		return ir.Any()
+	}
+}
+
+func parseReflectedTypeExpression(expr, currentPackage string) ir.TypeDescriptor {
+	expr = strings.TrimSpace(expr)
+	if expr == "[]byte" || expr == "[]uint8" {
+		return ir.Bytes()
+	}
+	if strings.HasPrefix(expr, "*") {
+		return ir.Ptr(parseReflectedTypeExpression(expr[1:], currentPackage))
+	}
+	if strings.HasPrefix(expr, "[]") {
+		return ir.Slice(parseReflectedTypeExpression(expr[2:], currentPackage))
+	}
+	if strings.HasPrefix(expr, "map[") {
+		if end := matchingBracket(expr, 3); end > 0 {
+			keyExpr := expr[4:end]
+			var key ir.TypeDescriptor
+			if keyExpr == "encoding/json.Number" {
+				key = ir.String()
+			} else {
+				key = parseReflectedTypeExpression(keyExpr, currentPackage)
+			}
+			return ir.Map(
+				key,
+				parseReflectedTypeExpression(expr[end+1:], currentPackage),
+			)
+		}
+	}
+	if strings.HasPrefix(expr, "[") {
+		if end := strings.IndexByte(expr, ']'); end > 1 {
+			var length int
+			if _, err := fmt.Sscanf(expr[1:end], "%d", &length); err == nil {
+				return ir.Array(parseReflectedTypeExpression(expr[end+1:], currentPackage), length)
+			}
+		}
+	}
+	if primitive := reflectedPrimitiveName(expr); primitive != nil {
+		return primitive
+	}
+
+	base, args := splitGenericExpression(expr)
+	pkg, name := splitQualifiedType(base, currentPackage)
+	if len(args) == 0 {
+		return ir.Ref(name, pkg)
+	}
+	typeArgs := make([]ir.TypeDescriptor, len(args))
+	for i, arg := range args {
+		typeArgs[i] = parseReflectedTypeExpression(arg, currentPackage)
+	}
+	return ir.RefWithArgs(name, pkg, typeArgs...)
+}
+
+func reflectedPrimitiveName(name string) ir.TypeDescriptor {
+	switch name {
+	case "bool":
+		return ir.Bool()
+	case "string":
+		return ir.String()
+	case "int":
+		return ir.Int(0)
+	case "int8":
+		return ir.Int(8)
+	case "int16":
+		return ir.Int(16)
+	case "int32", "rune":
+		return ir.Int(32)
+	case "int64":
+		return ir.Int(64)
+	case "uint":
+		return ir.Uint(0)
+	case "uint8", "byte":
+		return ir.Uint(8)
+	case "uint16":
+		return ir.Uint(16)
+	case "uint32":
+		return ir.Uint(32)
+	case "uint64":
+		return ir.Uint(64)
+	case "uintptr":
+		return ir.Uint(0)
+	case "float32":
+		return ir.Float(32)
+	case "float64":
+		return ir.Float(64)
+	case "time.Time":
+		return ir.Time()
+	case "time.Duration":
+		return ir.Duration()
+	case "encoding/json.Number":
+		return ir.Float(64)
+	case "any", "interface {}", "interface{}":
+		return ir.Any()
+	default:
+		return nil
+	}
+}
+
+func matchingBracket(value string, open int) int {
+	depth := 0
+	for i := open; i < len(value); i++ {
+		switch value[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func splitGenericExpression(value string) (string, []string) {
+	open := strings.IndexByte(value, '[')
+	if open < 0 || !strings.HasSuffix(value, "]") {
+		return value, nil
+	}
+	body := value[open+1 : len(value)-1]
+	var args []string
+	start, depth := 0, 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+		case ',':
+			if depth == 0 {
+				args = append(args, strings.TrimSpace(body[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	args = append(args, strings.TrimSpace(body[start:]))
+	return value[:open], args
+}
+
+func splitQualifiedType(value, currentPackage string) (string, string) {
+	if dot := strings.LastIndexByte(value, '.'); dot >= 0 {
+		return value[:dot], value[dot+1:]
+	}
+	return currentPackage, value
+}
+
+// isEmptyStructType reports whether t has an empty struct representation.
+// Named empty request types are still declarations, but are void requests per spec §4.8.
 func isEmptyStructType(t reflect.Type) bool {
 	// Unwrap pointers
-	for t.Kind() == reflect.Pointer {
+	for t.Kind() == reflect.Pointer && t.Name() == "" {
 		t = t.Elem()
 	}
 	return t.Kind() == reflect.Struct && t.NumField() == 0
+}
+
+func isUnnamedEmptyStructType(t reflect.Type) bool {
+	for t.Kind() == reflect.Pointer && t.Name() == "" {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Struct && t.NumField() == 0 && t.Name() == ""
 }
 
 // sanitizeTypeName applies the synthetic naming algorithm for generic instantiations.
@@ -661,14 +914,14 @@ func applyConfigDefaults(cfg *Config) *Config {
 		result.EnumStyle = "union"
 	}
 	if result.OptionalType == "" {
-		result.OptionalType = "undefined"
+		result.OptionalType = "default"
 	}
 
 	return &result
 }
 
 // buildSchemaFromSource uses the source provider to extract types.
-func buildSchemaFromSource(ctx context.Context, routes internal.RouteMap, extraPackages []string) (*ir.Schema, error) {
+func buildSchemaFromSource(ctx context.Context, routes internal.RouteMap, extraPackages []string) (*ir.Schema, endpointTypeConverter, error) {
 	// Infer packages from route types
 	packages := collectPackagesFromRoutes(routes)
 
@@ -676,7 +929,10 @@ func buildSchemaFromSource(ctx context.Context, routes internal.RouteMap, extraP
 	packages = append(packages, extraPackages...)
 
 	if len(packages) == 0 {
-		return nil, fmt.Errorf("no packages to analyze: register at least one handler or specify Packages in config")
+		convert := func(t reflect.Type, preserveTopPointer bool) (ir.TypeDescriptor, error) {
+			return sourceTypeToIRRef(t, preserveTopPointer, nil)
+		}
+		return &ir.Schema{Types: []ir.TypeDescriptor{}}, convert, nil
 	}
 
 	// Collect root types from routes
@@ -687,7 +943,14 @@ func buildSchemaFromSource(ctx context.Context, routes internal.RouteMap, extraP
 		Packages:  packages,
 		RootTypes: rootTypes,
 	}
-	return p.BuildSchema(ctx, opts)
+	schema, resolve, err := p.BuildSchemaWithResolver(ctx, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	convert := func(t reflect.Type, preserveTopPointer bool) (ir.TypeDescriptor, error) {
+		return sourceTypeToIRRef(t, preserveTopPointer, resolve)
+	}
+	return schema, convert, nil
 }
 
 // collectPackagesFromRoutes extracts unique package paths from route types.
@@ -696,36 +959,28 @@ func collectPackagesFromRoutes(routes internal.RouteMap) []string {
 	var pkgs []string
 
 	for _, route := range routes {
-		if route.Request != nil {
-			// Unwrap pointers - pointer types return empty PkgPath()
-			t := route.Request
-			for t.Kind() == reflect.Pointer {
-				t = t.Elem()
+		for _, typ := range []reflect.Type{route.Request, route.Response} {
+			if typ == nil {
+				continue
 			}
-			pkg := t.PkgPath()
-			// "main" is returned by reflect for types in package main,
-			// but packages.Load("main") looks in stdlib. Use "." instead.
-			if pkg == "main" {
-				pkg = "."
+			for _, id := range reflectedTypeReferences(reflectTypeToIRPreservePtr(typ, false)) {
+				pkg := id.Package
+				if pkg == "main" {
+					pkg = "."
+				}
+				if pkg != "" && !seen[pkg] {
+					seen[pkg] = true
+					pkgs = append(pkgs, pkg)
+				}
 			}
-			if pkg != "" && !seen[pkg] {
-				seen[pkg] = true
-				pkgs = append(pkgs, pkg)
-			}
-		}
-		if route.Response != nil {
-			// Unwrap pointers - pointer types return empty PkgPath()
-			t := route.Response
-			for t.Kind() == reflect.Pointer {
-				t = t.Elem()
-			}
-			pkg := t.PkgPath()
-			if pkg == "main" {
-				pkg = "."
-			}
-			if pkg != "" && !seen[pkg] {
-				seen[pkg] = true
-				pkgs = append(pkgs, pkg)
+			for _, pkg := range reflectedTypePackages(typ) {
+				if pkg == "main" {
+					pkg = "."
+				}
+				if pkg != "" && !seen[pkg] {
+					seen[pkg] = true
+					pkgs = append(pkgs, pkg)
+				}
 			}
 		}
 	}
@@ -734,15 +989,82 @@ func collectPackagesFromRoutes(routes internal.RouteMap) []string {
 	return pkgs
 }
 
+func reflectedTypePackages(t reflect.Type) []string {
+	seen := make(map[string]bool)
+	var packages []string
+	add := func(pkg string) {
+		if pkg != "" && !seen[pkg] {
+			seen[pkg] = true
+			packages = append(packages, pkg)
+		}
+	}
+	var collectExpression func(string, string)
+	collectExpression = func(expression, currentPackage string) {
+		expression = strings.TrimSpace(expression)
+		if strings.HasPrefix(expression, "*") {
+			collectExpression(expression[1:], currentPackage)
+			return
+		}
+		if strings.HasPrefix(expression, "[]") {
+			collectExpression(expression[2:], currentPackage)
+			return
+		}
+		if strings.HasPrefix(expression, "map[") {
+			if end := matchingBracket(expression, 3); end > 0 {
+				collectExpression(expression[4:end], currentPackage)
+				collectExpression(expression[end+1:], currentPackage)
+			}
+			return
+		}
+		if strings.HasPrefix(expression, "[") {
+			if end := strings.IndexByte(expression, ']'); end > 0 {
+				collectExpression(expression[end+1:], currentPackage)
+			}
+			return
+		}
+		base, arguments := splitGenericExpression(expression)
+		pkg, _ := splitQualifiedType(base, currentPackage)
+		add(pkg)
+		for _, argument := range arguments {
+			collectExpression(argument, currentPackage)
+		}
+	}
+	var collect func(reflect.Type)
+	collect = func(current reflect.Type) {
+		for current.Kind() == reflect.Pointer && current.Name() == "" {
+			current = current.Elem()
+		}
+		if current.Name() != "" && current.PkgPath() != "" {
+			if strings.Contains(current.Name(), "[") {
+				collectExpression(current.Name(), current.PkgPath())
+			}
+			return
+		}
+		switch current.Kind() {
+		case reflect.Slice, reflect.Array:
+			if isReflectedJSONByteSlice(current) {
+				return
+			}
+			collect(current.Elem())
+		case reflect.Map:
+			collect(current.Key())
+			collect(current.Elem())
+		}
+	}
+	collect(t)
+	sort.Strings(packages)
+	return packages
+}
+
 // buildSchemaFromReflection uses the reflection provider to extract types.
 func buildSchemaFromReflection(ctx context.Context, routes internal.RouteMap) (*ir.Schema, error) {
 	// Collect reflect.Types from routes
 	rootTypes := make([]reflect.Type, 0, len(routes)*2)
 	for _, route := range routes {
-		if route.Request != nil {
+		if route.Request != nil && !isUnnamedEmptyStructType(route.Request) {
 			rootTypes = append(rootTypes, route.Request)
 		}
-		if route.Response != nil {
+		if route.Response != nil && !isUnnamedEmptyStructType(route.Response) {
 			rootTypes = append(rootTypes, route.Response)
 		}
 	}
@@ -768,29 +1090,12 @@ func collectRootTypes(routes internal.RouteMap) []provider.RootType {
 	var roots []provider.RootType
 
 	addType := func(t reflect.Type) {
-		// Unwrap pointers
-		for t.Kind() == reflect.Pointer {
-			t = t.Elem()
-		}
-
-		pkg := t.PkgPath()
-		name := t.Name()
-		if name == "" {
-			return
-		}
-
-		// Strip generic type parameters
-		if idx := strings.Index(name, "["); idx >= 0 {
-			name = name[:idx]
-		}
-
-		key := pkg + "." + name
-		if !seen[key] {
-			seen[key] = true
-			roots = append(roots, provider.RootType{
-				Name:    name,
-				Package: pkg,
-			})
+		for _, id := range reflectedTypeReferences(reflectTypeToIRPreservePtr(t, false)) {
+			key := id.Package + "." + id.Name
+			if !seen[key] {
+				seen[key] = true
+				roots = append(roots, provider.RootType{Name: id.Name, Package: id.Package})
+			}
 		}
 	}
 
@@ -804,6 +1109,44 @@ func collectRootTypes(routes internal.RouteMap) []provider.RootType {
 	}
 
 	return roots
+}
+
+func reflectedTypeReferences(typ ir.TypeDescriptor) []ir.GoIdentifier {
+	seen := make(map[ir.GoIdentifier]bool)
+	var walk func(ir.TypeDescriptor)
+	walk = func(current ir.TypeDescriptor) {
+		switch t := current.(type) {
+		case *ir.ReferenceDescriptor:
+			seen[t.Target] = true
+			for _, arg := range t.TypeArguments {
+				walk(arg)
+			}
+		case *ir.ArrayDescriptor:
+			walk(t.Element)
+		case *ir.MapDescriptor:
+			walk(t.Key)
+			walk(t.Value)
+		case *ir.PtrDescriptor:
+			walk(t.Element)
+		case *ir.UnionDescriptor:
+			for _, member := range t.Types {
+				walk(member)
+			}
+		}
+	}
+	walk(typ)
+
+	refs := make([]ir.GoIdentifier, 0, len(seen))
+	for id := range seen {
+		refs = append(refs, id)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Package == refs[j].Package {
+			return refs[i].Name < refs[j].Name
+		}
+		return refs[i].Package < refs[j].Package
+	})
+	return refs
 }
 
 // flavorsToStrings converts []Flavor to []string for internal use.
