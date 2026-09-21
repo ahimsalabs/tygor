@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 )
 
 // interceptorTestContext implements Context for testing interceptors.
@@ -228,6 +229,54 @@ func TestChainInterceptors_ContextPropagation(t *testing.T) {
 	}
 	if res != "success" {
 		t.Errorf("expected 'success', got %v", res)
+	}
+}
+
+func TestChainInterceptors_PreservesDerivedContextAcrossHops(t *testing.T) {
+	type ctxKey string
+	key := ctxKey("principal")
+	deadline := time.Now().Add(time.Minute)
+
+	checkContext := func(t *testing.T, ctx context.Context) {
+		t.Helper()
+		if got := ctx.Value(key); got != "alice" {
+			t.Fatalf("context value = %v, want alice", got)
+		}
+		gotDeadline, ok := ctx.Deadline()
+		if !ok || !gotDeadline.Equal(deadline) {
+			t.Fatalf("deadline = %v, %v; want %v, true", gotDeadline, ok, deadline)
+		}
+		tc, ok := FromContext(ctx)
+		if !ok {
+			t.Fatal("FromContext did not preserve Tygor metadata")
+		}
+		if tc.EndpointID() != "Test.Method" {
+			t.Fatalf("EndpointID = %q, want Test.Method", tc.EndpointID())
+		}
+		if got := tc.Value(key); got != "alice" {
+			t.Fatalf("Tygor context value = %v, want alice", got)
+		}
+	}
+
+	outer := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		derived := context.WithValue(ctx, key, "alice")
+		derived, cancel := context.WithDeadline(derived, deadline)
+		defer cancel()
+		return handler(derived, req)
+	}
+	inner := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		checkContext(t, ctx)
+		return handler(ctx, req)
+	}
+
+	chain := chainInterceptors([]UnaryInterceptor{outer, inner})
+	ctx := newInterceptorTestContext(context.Background(), "Test", "Method")
+	_, err := chain(ctx, "request", func(ctx context.Context, req any) (any, error) {
+		checkContext(t, ctx)
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("chain() error = %v", err)
 	}
 }
 

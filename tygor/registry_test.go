@@ -4,14 +4,83 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"tygor.dev/internal"
 	"tygor.dev/internal/tygortest"
 )
+
+type panicJSONDetail struct{}
+
+func (panicJSONDetail) MarshalJSON() ([]byte, error) {
+	panic("private detail marshaler panic")
+}
+
+type panicErrorResponseWriter struct {
+	header      http.Header
+	writes      int
+	statusCalls int
+}
+
+func (w *panicErrorResponseWriter) Header() http.Header { return w.header }
+
+func (w *panicErrorResponseWriter) WriteHeader(int) { w.statusCalls++ }
+
+func (w *panicErrorResponseWriter) Write([]byte) (int, error) {
+	w.writes++
+	panic("transport panic")
+}
+
+type frameworkPanicWriter struct {
+	header      http.Header
+	panicAt     string
+	panicValue  any
+	headerCalls int
+	statusCalls int
+	writes      int
+}
+
+func (w *frameworkPanicWriter) Header() http.Header {
+	w.headerCalls++
+	if w.panicAt == "header" {
+		panic(w.panicValue)
+	}
+	return w.header
+}
+
+func (w *frameworkPanicWriter) WriteHeader(int) {
+	w.statusCalls++
+	if w.panicAt == "write header" {
+		panic(w.panicValue)
+	}
+}
+
+func (w *frameworkPanicWriter) Write(data []byte) (int, error) {
+	w.writes++
+	if w.panicAt == "write" {
+		panic(w.panicValue)
+	}
+	return len(data), nil
+}
+
+type metadataOnlyEndpoint struct{}
+
+func (metadataOnlyEndpoint) Metadata() *internal.MethodMetadata {
+	return &internal.MethodMetadata{Primitive: "exec"}
+}
+
+func serveAndRecover(handler http.Handler, writer http.ResponseWriter, req *http.Request) (recovered any) {
+	defer func() { recovered = recover() }()
+	handler.ServeHTTP(writer, req)
+	return nil
+}
 
 func TestNewApp(t *testing.T) {
 	app := NewApp()
@@ -149,6 +218,11 @@ func TestApp_Handler_NotFound(t *testing.T) {
 
 func TestApp_Handler_InvalidPath(t *testing.T) {
 	reg := NewApp()
+	called := false
+	reg.Service("Test").Register("Method", Exec(func(ctx context.Context, req Empty) (Empty, error) {
+		called = true
+		return nil, nil
+	}))
 
 	tests := []struct {
 		name string
@@ -156,6 +230,10 @@ func TestApp_Handler_InvalidPath(t *testing.T) {
 	}{
 		{"no slash", "/NoSlash"},
 		{"root", "/"},
+		{"missing service", "//Method"},
+		{"missing method", "/Test/"},
+		{"trailing slash", "/Test/Method/"},
+		{"extra component", "/Test/Method/extra"},
 	}
 
 	for _, tt := range tests {
@@ -167,6 +245,9 @@ func TestApp_Handler_InvalidPath(t *testing.T) {
 
 			if w.Code != http.StatusNotFound {
 				t.Errorf("expected status 404, got %d", w.Code)
+			}
+			if called {
+				t.Fatal("registered handler ran for an invalid path")
 			}
 		})
 	}
@@ -198,10 +279,17 @@ func TestApp_Handler_WithPanic(t *testing.T) {
 		Level: slog.LevelError,
 	}))
 
-	reg := NewApp().WithLogger(logger)
+	transformerCalled := false
+	reg := NewApp().
+		WithLogger(logger).
+		WithErrorTransformer(func(err error) *Error {
+			transformerCalled = true
+			return NewError(CodeInternal, "private transformed panic")
+		}).
+		WithMaskInternalErrors()
 
 	fn := func(ctx context.Context, req TestRequest) (TestResponse, error) {
-		panic("test panic")
+		panic("private test panic")
 	}
 
 	reg.Service("Test").Register("Method", Exec(fn))
@@ -214,12 +302,246 @@ func TestApp_Handler_WithPanic(t *testing.T) {
 	reg.Handler().ServeHTTP(w, req)
 
 	tygortest.AssertStatus(t, w, http.StatusInternalServerError)
-	tygortest.AssertJSONError(t, w, string(CodeInternal))
+	errResp := tygortest.AssertJSONError(t, w, string(CodeInternal))
+	if errResp.Message != "internal server error" {
+		t.Fatalf("panic message = %q, want masked internal error", errResp.Message)
+	}
+	if strings.Contains(w.Body.String(), "private test panic") {
+		t.Fatalf("panic value leaked to response: %s", w.Body.String())
+	}
+	if !transformerCalled {
+		t.Fatal("panic did not use the configured error transformer")
+	}
 
 	// Verify panic was logged
 	logOutput := buf.String()
 	if !strings.Contains(logOutput, "PANIC recovered") {
 		t.Errorf("expected panic log, got: %s", logOutput)
+	}
+}
+
+func TestApp_ErrorPolicyPanicFallsBackOverHTTP(t *testing.T) {
+	const fallback = "{\"error\":{\"code\":\"internal\",\"message\":\"internal server error\"}}\n"
+	tests := []struct {
+		name        string
+		handler     func(context.Context, TestRequest) (TestResponse, error)
+		transformer func(*atomic.Int32) ErrorTransformer
+	}{
+		{
+			name: "returned error with panicking transformer",
+			handler: func(context.Context, TestRequest) (TestResponse, error) {
+				return TestResponse{}, NewError(CodeUnavailable, "private returned error")
+			},
+			transformer: func(calls *atomic.Int32) ErrorTransformer {
+				return func(error) *Error {
+					calls.Add(1)
+					panic("private transformer panic")
+				}
+			},
+		},
+		{
+			name: "handler panic with panicking transformer",
+			handler: func(context.Context, TestRequest) (TestResponse, error) {
+				panic("private handler panic")
+			},
+			transformer: func(calls *atomic.Int32) ErrorTransformer {
+				return func(error) *Error {
+					calls.Add(1)
+					panic("private transformer panic")
+				}
+			},
+		},
+		{
+			name: "error envelope serialization panic",
+			handler: func(context.Context, TestRequest) (TestResponse, error) {
+				return TestResponse{}, NewError(CodeUnavailable, "private returned error")
+			},
+			transformer: func(calls *atomic.Int32) ErrorTransformer {
+				return func(error) *Error {
+					calls.Add(1)
+					return NewError(CodeUnavailable, "private transformed error").WithDetail("value", panicJSONDetail{})
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			app := NewApp().WithErrorTransformer(tt.transformer(&calls))
+			app.Service("Test").Register("Method", Exec(tt.handler))
+			server := httptest.NewServer(app.Handler())
+			t.Cleanup(server.Close)
+
+			client := &http.Client{Timeout: 2 * time.Second}
+			resp, err := client.Post(server.URL+"/Test/Method", "application/json", strings.NewReader(`{"name":"John","email":"john@example.com"}`))
+			if err != nil {
+				t.Fatalf("POST error = %v, want sanitized HTTP response", err)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if resp.StatusCode != http.StatusInternalServerError || resp.Header.Get("Content-Type") != "application/json" {
+				t.Fatalf("response = %d %q, want 500 application/json", resp.StatusCode, resp.Header.Get("Content-Type"))
+			}
+			if string(body) != fallback {
+				t.Fatalf("body = %q, want constant fallback %q", body, fallback)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("transformer calls = %d, want exactly 1", got)
+			}
+		})
+	}
+}
+
+func TestApp_ErrorTransportPanicDoesNotReenterPolicy(t *testing.T) {
+	var calls atomic.Int32
+	app := NewApp().WithErrorTransformer(func(error) *Error {
+		calls.Add(1)
+		return NewError(CodeUnavailable, "safe transformed error")
+	})
+	app.Service("Test").Register("Method", Exec(func(context.Context, TestRequest) (TestResponse, error) {
+		return TestResponse{}, NewError(CodeUnavailable, "private returned error")
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/Test/Method", strings.NewReader(`{"name":"John","email":"john@example.com"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := &panicErrorResponseWriter{header: make(http.Header)}
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if recovered != "transport panic" {
+		t.Fatalf("recovered = %v, want original transport panic", recovered)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("transformer calls = %d, want exactly 1", got)
+	}
+	if w.statusCalls != 1 || w.writes != 1 {
+		t.Fatalf("transport attempts = status:%d write:%d, want 1/1", w.statusCalls, w.writes)
+	}
+}
+
+func TestApp_RouteErrorTransportPanicDoesNotRetry(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		panicAt    string
+		wantHeader int
+		wantStatus int
+		wantWrites int
+		configure  func(*App)
+	}{
+		{name: "invalid path header", method: http.MethodPost, path: "/invalid", panicAt: "header", wantHeader: 1},
+		{name: "missing route write header", method: http.MethodPost, path: "/missing/route", panicAt: "write header", wantHeader: 1, wantStatus: 1},
+		{
+			name:       "invalid handler write",
+			method:     http.MethodPost,
+			path:       "/Test/Invalid",
+			panicAt:    "write",
+			wantHeader: 1,
+			wantStatus: 1,
+			wantWrites: 1,
+			configure: func(app *App) {
+				app.routes["Test.Invalid"] = metadataOnlyEndpoint{}
+			},
+		},
+		{
+			name:       "wrong method write",
+			method:     http.MethodGet,
+			path:       "/Test/Method",
+			panicAt:    "write",
+			wantHeader: 1,
+			wantStatus: 1,
+			wantWrites: 1,
+			configure: func(app *App) {
+				app.Service("Test").Register("Method", Exec(func(context.Context, Empty) (Empty, error) {
+					return nil, nil
+				}))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			panicValue := &struct{}{}
+			var transformerCalls atomic.Int32
+			app := NewApp().WithErrorTransformer(func(error) *Error {
+				transformerCalls.Add(1)
+				return NewError(CodeInternal, "transformed")
+			})
+			if tt.configure != nil {
+				tt.configure(app)
+			}
+			writer := &frameworkPanicWriter{
+				header:     make(http.Header),
+				panicAt:    tt.panicAt,
+				panicValue: panicValue,
+			}
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+
+			recovered := serveAndRecover(app.Handler(), writer, req)
+
+			if recovered != panicValue {
+				t.Fatalf("recovered = %v, want original transport panic", recovered)
+			}
+			if got := transformerCalls.Load(); got != 0 {
+				t.Fatalf("transformer calls = %d, want 0", got)
+			}
+			if writer.headerCalls != tt.wantHeader || writer.statusCalls != tt.wantStatus || writer.writes != tt.wantWrites {
+				t.Fatalf("transport attempts = header:%d status:%d write:%d, want %d/%d/%d", writer.headerCalls, writer.statusCalls, writer.writes, tt.wantHeader, tt.wantStatus, tt.wantWrites)
+			}
+		})
+	}
+}
+
+func TestApp_SuccessTransportPanicDoesNotRetry(t *testing.T) {
+	tests := []struct {
+		name       string
+		panicAt    string
+		wantHeader int
+		wantWrites int
+	}{
+		{name: "header", panicAt: "header", wantHeader: 1},
+		{name: "write", panicAt: "write", wantHeader: 1, wantWrites: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			panicValue := &struct{}{}
+			var transformerCalls atomic.Int32
+			app := NewApp().WithErrorTransformer(func(error) *Error {
+				transformerCalls.Add(1)
+				return NewError(CodeInternal, "transformed")
+			})
+			app.Service("Test").Register("Method", Exec(func(context.Context, Empty) (TestResponse, error) {
+				return TestResponse{Message: "ok"}, nil
+			}))
+			writer := &frameworkPanicWriter{
+				header:     make(http.Header),
+				panicAt:    tt.panicAt,
+				panicValue: panicValue,
+			}
+			req := httptest.NewRequest(http.MethodPost, "/Test/Method", strings.NewReader(`{}`))
+			req.Header.Set("Content-Type", "application/json")
+
+			recovered := serveAndRecover(app.Handler(), writer, req)
+
+			if recovered != panicValue {
+				t.Fatalf("recovered = %v, want original transport panic", recovered)
+			}
+			if got := transformerCalls.Load(); got != 0 {
+				t.Fatalf("transformer calls = %d, want 0", got)
+			}
+			if writer.headerCalls != tt.wantHeader || writer.statusCalls != 0 || writer.writes != tt.wantWrites {
+				t.Fatalf("transport attempts = header:%d status:%d write:%d, want %d/0/%d", writer.headerCalls, writer.statusCalls, writer.writes, tt.wantHeader, tt.wantWrites)
+			}
+		})
 	}
 }
 

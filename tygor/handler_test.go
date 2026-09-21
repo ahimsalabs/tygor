@@ -1,15 +1,14 @@
 package tygor
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -152,6 +151,105 @@ func TestHandler_ServeHTTP_POST_InvalidJSON(t *testing.T) {
 	tygortest.AssertJSONError(t, w, string(CodeInvalidArgument))
 }
 
+func TestHandler_ServeHTTP_POST_RejectsTrailingJSON(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{name: "whitespace", body: "{\"name\":\"John\",\"email\":\"john@example.com\"} \n\t", wantStatus: http.StatusOK},
+		{name: "second object", body: "{\"name\":\"John\",\"email\":\"john@example.com\"}{}", wantStatus: http.StatusBadRequest},
+		{name: "second null", body: "{\"name\":\"John\",\"email\":\"john@example.com\"} null", wantStatus: http.StatusBadRequest},
+		{name: "garbage", body: "{\"name\":\"John\",\"email\":\"john@example.com\"} garbage", wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			handler := Exec(func(ctx context.Context, req TestRequest) (TestResponse, error) {
+				called = true
+				return TestResponse{Message: "ok"}, nil
+			})
+
+			w := NewTestRequest().
+				POST("/test").
+				WithBody(tt.body).
+				ServeHandler(handler, testContextConfig{})
+
+			tygortest.AssertStatus(t, w, tt.wantStatus)
+			if called != (tt.wantStatus == http.StatusOK) {
+				t.Fatalf("handler called = %v, want %v", called, tt.wantStatus == http.StatusOK)
+			}
+		})
+	}
+}
+
+func TestHandler_ServeHTTP_POST_NilPointerRequest(t *testing.T) {
+	type request struct {
+		Value string `json:"value"`
+	}
+
+	for _, body := range []string{"", " \n\t", "null"} {
+		t.Run(fmt.Sprintf("body_%q", body), func(t *testing.T) {
+			called := false
+			handler := Exec(func(ctx context.Context, req *request) (TestResponse, error) {
+				called = true
+				return TestResponse{}, nil
+			})
+
+			w := NewTestRequest().POST("/test").WithBody(body).ServeHandler(handler, testContextConfig{})
+			tygortest.AssertStatus(t, w, http.StatusBadRequest)
+			tygortest.AssertJSONError(t, w, string(CodeInvalidArgument))
+			if called {
+				t.Fatal("handler ran for a nil pointer request")
+			}
+		})
+	}
+
+	t.Run("object allocates pointer", func(t *testing.T) {
+		var got *request
+		handler := Exec(func(ctx context.Context, req *request) (TestResponse, error) {
+			got = req
+			return TestResponse{}, nil
+		})
+		w := NewTestRequest().POST("/test").WithBody(`{}`).ServeHandler(handler, testContextConfig{})
+		tygortest.AssertStatus(t, w, http.StatusOK)
+		if got == nil {
+			t.Fatal("handler received a nil pointer for an object body")
+		}
+	})
+
+	t.Run("skip validation preserves nil", func(t *testing.T) {
+		calledWithNil := false
+		handler := Exec(func(ctx context.Context, req *request) (TestResponse, error) {
+			calledWithNil = req == nil
+			return TestResponse{}, nil
+		}).WithSkipValidation()
+		w := NewTestRequest().POST("/test").WithBody(`null`).ServeHandler(handler, testContextConfig{})
+		tygortest.AssertStatus(t, w, http.StatusOK)
+		if !calledWithNil {
+			t.Fatal("handler did not receive the decoded nil pointer")
+		}
+	})
+}
+
+func TestHandler_ServeHTTP_POST_EmptyRequest(t *testing.T) {
+	for _, body := range []string{"", "null", `{}`} {
+		t.Run(fmt.Sprintf("body_%q", body), func(t *testing.T) {
+			called := false
+			handler := Exec(func(ctx context.Context, req Empty) (TestResponse, error) {
+				called = true
+				return TestResponse{}, nil
+			})
+			w := NewTestRequest().POST("/test").WithBody(body).ServeHandler(handler, testContextConfig{})
+			tygortest.AssertStatus(t, w, http.StatusOK)
+			if !called {
+				t.Fatal("handler was not called")
+			}
+		})
+	}
+}
+
 func TestHandler_ServeHTTP_GET_WithQueryParams(t *testing.T) {
 	type GetRequest struct {
 		Name  string `json:"name"`
@@ -284,6 +382,45 @@ func TestHandler_ServeHTTP_CustomErrorTransformer(t *testing.T) {
 
 	if errResp.Message != "custom mapped error" {
 		t.Errorf("expected message 'custom mapped error', got %s", errResp.Message)
+	}
+}
+
+func TestHandler_MaskingDoesNotMutateSharedError(t *testing.T) {
+	shared := NewError(CodeInternal, "private shared failure").WithDetail("source", "database")
+	handler := Exec(func(ctx context.Context, req TestRequest) (TestResponse, error) {
+		return TestResponse{}, shared
+	})
+
+	const requests = 64
+	errs := make(chan error, requests)
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := NewTestRequest().
+				POST("/test").
+				WithJSON(TestRequest{Name: "John", Email: "john@example.com"}).
+				ServeHandler(handler, testContextConfig{maskInternalErrors: true})
+			if w.Code != http.StatusInternalServerError {
+				errs <- fmt.Errorf("status = %d, want 500", w.Code)
+				return
+			}
+			if strings.Contains(w.Body.String(), shared.Message) {
+				errs <- fmt.Errorf("response leaked shared message: %s", w.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if shared.Message != "private shared failure" {
+		t.Fatalf("shared error message was mutated to %q", shared.Message)
+	}
+	if shared.Details["source"] != "database" {
+		t.Fatalf("shared error details were mutated: %#v", shared.Details)
 	}
 }
 
@@ -631,8 +768,6 @@ func TestHandler_ServeHTTP_NilPointerResponse(t *testing.T) {
 }
 
 func TestHandler_ServeHTTP_ResponseEncodingError(t *testing.T) {
-	// This test simulates a response encoding error by returning a channel
-	// which cannot be JSON encoded
 	fn := func(ctx context.Context, req TestRequest) (chan int, error) {
 		ch := make(chan int)
 		return ch, nil
@@ -640,23 +775,17 @@ func TestHandler_ServeHTTP_ResponseEncodingError(t *testing.T) {
 
 	handler := Exec(fn)
 
-	// Use a test logger to verify error logging
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
-		Level: slog.LevelError,
-	}))
-
-	NewTestRequest().
+	w := NewTestRequest().
 		POST("/test").
 		WithJSON(TestRequest{Name: "John", Email: "john@example.com"}).
 		ServeHandler(handler, testContextConfig{
-			logger: logger,
+			maskInternalErrors: true,
 		})
 
-	// Verify error was logged
-	logOutput := buf.String()
-	if !strings.Contains(logOutput, "failed to encode response") {
-		t.Errorf("expected error log, got: %s", logOutput)
+	tygortest.AssertStatus(t, w, http.StatusInternalServerError)
+	errResp := tygortest.AssertJSONError(t, w, string(CodeInternal))
+	if errResp.Message != "internal server error" {
+		t.Fatalf("message = %q, want masked internal error", errResp.Message)
 	}
 }
 

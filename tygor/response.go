@@ -28,17 +28,20 @@ type errorResponse struct {
 	Error *Error `json:"error"`
 }
 
-// encodeResponse writes a successful response to the ResponseWriter.
-func encodeResponse(w jsonWriter, result any) error {
-	return json.NewEncoder(w).Encode(response{Result: result})
+// marshalResponse serializes the complete success envelope before any response
+// headers or body bytes are committed.
+func marshalResponse(result any) ([]byte, error) {
+	data, err := json.Marshal(response{Result: result})
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
 }
 
-// encodeErrorResponse writes an error response to the ResponseWriter.
-func encodeErrorResponse(w jsonWriter, err *Error) error {
-	return json.NewEncoder(w).Encode(errorResponse{Error: err})
-}
-
-// jsonWriter is satisfied by http.ResponseWriter and allows testing.
-type jsonWriter interface {
-	Write([]byte) (int, error)
+func marshalErrorResponse(err *Error) ([]byte, error) {
+	data, marshalErr := json.Marshal(errorResponse{Error: err})
+	if marshalErr != nil {
+		return nil, marshalErr
+	}
+	return append(data, '\n'), nil
 }
