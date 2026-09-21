@@ -31,7 +31,8 @@ type FilesystemSink struct {
 	Mode os.FileMode
 
 	// Overwrite controls behavior for existing files.
-	// If false, returns an error when a file exists.
+	// If false, publication is create-only: an existing path always causes an
+	// error, even when its content is identical.
 	Overwrite bool
 }
 
@@ -44,9 +45,12 @@ func NewFilesystemSink(root string) *FilesystemSink {
 	}
 }
 
-// WriteFile writes content to path within the root directory.
-// It creates parent directories as needed and performs atomic writes via temp file + rename.
-// This method is safe for concurrent use.
+// WriteFile writes content to path within the root directory. It creates parent
+// directories as needed and publishes complete files atomically on filesystems
+// that provide atomic same-directory rename and hard-link operations. With
+// Overwrite=false, hard-link publication guarantees that concurrent writers
+// cannot replace the winner. WriteFile does not fsync file or directory data and
+// therefore does not promise durability across a system crash.
 func (s *FilesystemSink) WriteFile(ctx context.Context, path string, content []byte) error {
 	// Validate path
 	if err := ValidatePath(path); err != nil {
@@ -74,10 +78,13 @@ func (s *FilesystemSink) WriteFile(ctx context.Context, path string, content []b
 		return fmt.Errorf("path escapes root directory: %q", path)
 	}
 
-	// Skip write if file exists with identical content
-	if existing, err := os.ReadFile(fullPath); err == nil {
-		if bytes.Equal(existing, content) {
-			return nil // No change needed
+	// Identical content is a no-op only in overwrite mode. Create-only mode
+	// promises an error whenever the destination already exists.
+	if s.Overwrite {
+		if existing, err := os.ReadFile(fullPath); err == nil {
+			if bytes.Equal(existing, content) {
+				return nil
+			}
 		}
 	}
 
@@ -135,12 +142,19 @@ func (s *FilesystemSink) WriteFile(ctx context.Context, path string, content []b
 		return err
 	}
 
-	// Check if file exists when Overwrite is false
 	if !s.Overwrite {
-		if _, err := os.Stat(fullPath); err == nil {
+		// Linking a complete same-directory temp file is an atomic no-replace
+		// publication on supported filesystems. Unlike Stat followed by Rename,
+		// this remains create-only across sink instances and processes.
+		if err := os.Link(tempPath, fullPath); err != nil {
 			cleanupTempFile()
-			return fmt.Errorf("file already exists: %q", path)
+			if errors.Is(err, os.ErrExist) {
+				return fmt.Errorf("file already exists: %q", path)
+			}
+			return fmt.Errorf("failed to publish file without overwrite: %w", err)
 		}
+		cleanupTempFile()
+		return nil
 	}
 
 	// Rename temp file to final destination

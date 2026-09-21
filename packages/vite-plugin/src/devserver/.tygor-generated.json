@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "files": [
+    "manifest.ts",
+    "types.ts",
+    "types_tygor_dev_cmd_tygor_internal_dev.ts"
+  ]
+}

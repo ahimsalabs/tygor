@@ -1,9 +1,11 @@
 package discover
 
 import (
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -213,9 +215,9 @@ func TestFindConfigFunc(t *testing.T) {
 	t.Setenv("GOWORK", "off")
 
 	tests := []struct {
-		name           string
-		files          map[string]string
-		wantConfigFunc string // empty if none expected
+		name            string
+		files           map[string]string
+		wantConfigFuncs []string
 	}{
 		{
 			name: "config in same file as export",
@@ -238,7 +240,7 @@ func Configure(g *tygorgen.Generator) *tygorgen.Generator {
 func main() {}
 `,
 			},
-			wantConfigFunc: "Configure",
+			wantConfigFuncs: []string{"Configure"},
 		},
 		{
 			name: "config in separate file",
@@ -262,7 +264,7 @@ func MyConfig(g *tygorgen.Generator) *tygorgen.Generator {
 }
 `,
 			},
-			wantConfigFunc: "MyConfig",
+			wantConfigFuncs: []string{"MyConfig"},
 		},
 		{
 			name: "no config function",
@@ -278,7 +280,6 @@ func SetupApp() *tygor.App {
 func main() {}
 `,
 			},
-			wantConfigFunc: "",
 		},
 		{
 			name: "method is not config function",
@@ -303,7 +304,24 @@ func (c *Configurer) Configure(g *tygorgen.Generator) *tygorgen.Generator {
 func main() {}
 `,
 			},
-			wantConfigFunc: "",
+		},
+		{
+			name: "collects multiple config functions",
+			files: map[string]string{
+				"main.go": `package main
+
+import (
+	"tygor.dev/tygor"
+	"tygor.dev/tygorgen"
+)
+
+func SetupApp() *tygor.App { return tygor.NewApp() }
+func Alpha(g *tygorgen.Generator) *tygorgen.Generator { return g }
+func Zulu(g *tygorgen.Generator) *tygorgen.Generator { return g }
+func main() {}
+`,
+			},
+			wantConfigFuncs: []string{"Alpha", "Zulu"},
 		},
 	}
 
@@ -346,18 +364,127 @@ replace tygor.dev => ` + tygorRoot + `
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if tt.wantConfigFunc == "" {
-				if result.ConfigFunc != nil {
-					t.Errorf("got config func %s, want none", result.ConfigFunc.Name)
-				}
-			} else {
-				if result.ConfigFunc == nil {
-					t.Errorf("got no config func, want %s", tt.wantConfigFunc)
-				} else if result.ConfigFunc.Name != tt.wantConfigFunc {
-					t.Errorf("got config func %s, want %s", result.ConfigFunc.Name, tt.wantConfigFunc)
+			if len(result.ConfigFuncs) != len(tt.wantConfigFuncs) {
+				t.Fatalf("config funcs = %v, want %v", result.ConfigFuncs, tt.wantConfigFuncs)
+			}
+			for i, want := range tt.wantConfigFuncs {
+				if result.ConfigFuncs[i].Name != want {
+					t.Errorf("config func %d = %s, want %s", i, result.ConfigFuncs[i].Name, want)
 				}
 			}
 		})
+	}
+}
+
+func TestSelectConfig(t *testing.T) {
+	t.Run("none", func(t *testing.T) {
+		config, err := SelectConfig(nil)
+		if err != nil || config != nil {
+			t.Fatalf("SelectConfig(nil) = %#v, %v", config, err)
+		}
+	})
+
+	t.Run("one", func(t *testing.T) {
+		configs := []ConfigFunc{{Name: "Configure"}}
+		config, err := SelectConfig(configs)
+		if err != nil || config == nil || config.Name != "Configure" {
+			t.Fatalf("SelectConfig(one) = %#v, %v", config, err)
+		}
+	})
+
+	t.Run("ambiguous", func(t *testing.T) {
+		configs := []ConfigFunc{
+			{Name: "Alpha", Pos: token.Position{Filename: "a.go", Line: 3}},
+			{Name: "Zulu", Pos: token.Position{Filename: "z.go", Line: 7}},
+		}
+		_, err := SelectConfig(configs)
+		if err == nil || !strings.Contains(err.Error(), "multiple config functions") ||
+			!strings.Contains(err.Error(), "Alpha") || !strings.Contains(err.Error(), "Zulu") {
+			t.Fatalf("SelectConfig(ambiguous) error = %v", err)
+		}
+	})
+}
+
+func TestFindUsesActiveCompiledGoFiles(t *testing.T) {
+	t.Setenv("GOWORK", "off")
+	dir := t.TempDir()
+	tygorRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goMod := "module testactive\n\ngo 1.21\n\nrequire tygor.dev v0.7.4\n\nreplace tygor.dev => " + tygorRoot + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatal(err)
+	}
+	active := `package main
+
+import "tygor.dev/tygor"
+
+func Setup() *tygor.App { return tygor.NewApp() }
+`
+	inactive := `//go:build windows
+
+package main
+
+func WindowsOnly() {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "active.go"), []byte(active), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "inactive_windows.go"), []byte(inactive), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "mod", "tidy")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go mod tidy: %v\n%s", err, out)
+	}
+
+	result, err := FindDir(".", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PackageName != "main" {
+		t.Errorf("PackageName = %q, want main", result.PackageName)
+	}
+	if len(result.CompiledGoFiles) != 1 || filepath.Base(result.CompiledGoFiles[0]) != "active.go" {
+		t.Errorf("CompiledGoFiles = %v, want only active.go", result.CompiledGoFiles)
+	}
+}
+
+func TestFindUsesSourceDirectoryForCgoPackage(t *testing.T) {
+	t.Setenv("GOWORK", "off")
+	dir := t.TempDir()
+	goMod := "module testcgo\n\ngo 1.25.3\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatal(err)
+	}
+	source := `package testcgo
+
+/* static int answer(void) { return 42; } */
+import "C"
+
+func Export() int { return int(C.answer()) }
+`
+	if err := os.WriteFile(filepath.Join(dir, "export.go"), []byte(source), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := FindDir(".", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := filepath.EvalSymlinks(result.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("Dir = %q, want source directory %q (compiled files: %v)", result.Dir, dir, result.CompiledGoFiles)
 	}
 }
 

@@ -52,12 +52,14 @@ type ConfigFunc struct {
 
 // Result contains discovered exports and package info.
 type Result struct {
-	Exports     []Export
-	ConfigFunc  *ConfigFunc // optional config function
-	PackagePath string
-	ModulePath  string
-	ModuleDir   string // directory containing go.mod
-	Dir         string // directory containing the package
+	Exports         []Export
+	ConfigFuncs     []ConfigFunc
+	PackageName     string
+	PackagePath     string
+	CompiledGoFiles []string
+	ModulePath      string
+	ModuleDir       string // directory containing go.mod
+	Dir             string // directory containing the package
 }
 
 // Find scans a Go package for export functions.
@@ -74,7 +76,8 @@ func Find(pattern string) (*Result, error) {
 func FindDir(pattern, dir string) (*Result, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles |
-			packages.NeedTypes | packages.NeedModule | packages.NeedSyntax,
+			packages.NeedCompiledGoFiles | packages.NeedTypes |
+			packages.NeedModule | packages.NeedSyntax,
 		Dir: dir,
 	}
 
@@ -99,7 +102,9 @@ func FindDir(pattern, dir string) (*Result, error) {
 	}
 
 	result := &Result{
-		PackagePath: pkg.PkgPath,
+		PackageName:     pkg.Name,
+		PackagePath:     pkg.PkgPath,
+		CompiledGoFiles: append([]string(nil), pkg.CompiledGoFiles...),
 	}
 
 	if pkg.Module != nil {
@@ -107,8 +112,12 @@ func FindDir(pattern, dir string) (*Result, error) {
 		result.ModuleDir = pkg.Module.Dir
 	}
 
+	// CompiledGoFiles may point into the Go build cache (notably for cgo
+	// packages). GoFiles always identifies the source package directory.
 	if len(pkg.GoFiles) > 0 {
 		result.Dir = filepath.Dir(pkg.GoFiles[0])
+	} else if len(pkg.CompiledGoFiles) > 0 {
+		result.Dir = filepath.Dir(pkg.CompiledGoFiles[0])
 	}
 
 	// Scan package scope for export and config functions
@@ -132,10 +141,10 @@ func FindDir(pattern, dir string) (*Result, error) {
 
 		// Check for config function: func(*tygorgen.Generator) *tygorgen.Generator
 		if isConfigFunc(sig) {
-			result.ConfigFunc = &ConfigFunc{
+			result.ConfigFuncs = append(result.ConfigFuncs, ConfigFunc{
 				Name: fn.Name(),
 				Pos:  pkg.Fset.Position(fn.Pos()),
-			}
+			})
 			continue
 		}
 
@@ -164,6 +173,24 @@ func FindDir(pattern, dir string) (*Result, error) {
 	}
 
 	return result, nil
+}
+
+// SelectConfig selects the only discovered generator config function. Config
+// selection is separate from discovery so commands that do not apply config
+// functions can ignore otherwise ambiguous candidates.
+func SelectConfig(configs []ConfigFunc) (*ConfigFunc, error) {
+	switch len(configs) {
+	case 0:
+		return nil, nil
+	case 1:
+		return &configs[0], nil
+	default:
+		msg := "multiple config functions found:\n"
+		for _, config := range configs {
+			msg += fmt.Sprintf("  - %s (%s)\n", config.Name, config.Pos)
+		}
+		return nil, fmt.Errorf("%s", strings.TrimSuffix(msg, "\n"))
+	}
 }
 
 // isConfigFunc checks if a signature matches func(*tygorgen.Generator) *tygorgen.Generator.
