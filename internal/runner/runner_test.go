@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -64,6 +65,12 @@ func main() {
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(mainGo), 0644); err != nil {
 		t.Fatal(err)
 	}
+	// This file is inactive on Linux and intentionally malformed. The runner
+	// must use go/packages' CompiledGoFiles rather than globbing and parsing it.
+	inactive := "//go:build windows\n\npackage main\n\nfunc broken(\n"
+	if err := os.WriteFile(filepath.Join(dir, "inactive_windows.go"), []byte(inactive), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Copy go.sum from tygor root to get transitive dependency checksums
 	goSum, err := os.ReadFile(filepath.Join(tygorRoot, "go.sum"))
@@ -93,8 +100,10 @@ func main() {
 			Name: "setupApp",
 			Type: discover.ExportTypeApp,
 		},
-		OutDir: outDir,
-		PkgDir: dir,
+		OutDir:          outDir,
+		PkgDir:          dir,
+		PackageName:     "main",
+		CompiledGoFiles: []string{filepath.Join(dir, "main.go")},
 	})
 	if err != nil {
 		t.Fatalf("Exec() error: %v\nOutput: %s", err, output)
@@ -226,6 +235,7 @@ replace tygor.dev => ` + tygorRoot + `
 import (
 	"context"
 	"tygor.dev/tygor"
+	"tygor.dev/tygorgen"
 )
 
 type HelloRequest struct {
@@ -243,6 +253,10 @@ func ExportApp() *tygor.App {
 		return HelloResponse{Message: "hello " + req.Name}, nil
 	}))
 	return app
+}
+
+func configure(g *tygorgen.Generator) *tygorgen.Generator {
+	return g.WithDiscovery()
 }
 `
 	if err := os.WriteFile(filepath.Join(pkgDir, "mylib.go"), []byte(libGo), 0644); err != nil {
@@ -277,11 +291,13 @@ func ExportApp() *tygor.App {
 			Name: "ExportApp",
 			Type: discover.ExportTypeApp,
 		},
-		OutDir:     outDir,
-		PkgDir:     pkgDir,
-		PkgPath:    "testmodule/internal/mylib",
-		ModulePath: "testmodule",
-		ModuleDir:  moduleDir,
+		OutDir:      outDir,
+		PkgDir:      pkgDir,
+		PkgPath:     "testmodule/internal/mylib",
+		PackageName: "mylib",
+		ModulePath:  "testmodule",
+		ModuleDir:   moduleDir,
+		ConfigFunc:  "configure",
 	})
 	if err != nil {
 		t.Fatalf("Exec() error: %v\nOutput: %s", err, output)
@@ -296,6 +312,9 @@ func ExportApp() *tygor.App {
 	manifestPath := filepath.Join(outDir, "manifest.ts")
 	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
 		t.Errorf("manifest.ts was not generated")
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "discovery.json")); os.IsNotExist(err) {
+		t.Errorf("private config function was not applied")
 	}
 
 	// Verify types file contains our types
@@ -397,11 +416,12 @@ func MyGenerator() *tygorgen.Generator {
 			Name: "MyGenerator",
 			Type: discover.ExportTypeGenerator,
 		},
-		OutDir:     outDir,
-		PkgDir:     pkgDir,
-		PkgPath:    "testgen/gen",
-		ModulePath: "testgen",
-		ModuleDir:  moduleDir,
+		OutDir:      outDir,
+		PkgDir:      pkgDir,
+		PkgPath:     "testgen/gen",
+		PackageName: "gen",
+		ModulePath:  "testgen",
+		ModuleDir:   moduleDir,
 	})
 	if err != nil {
 		t.Fatalf("Exec() error: %v\nOutput: %s", err, output)
@@ -492,12 +512,13 @@ func GetApp() *tygor.App {
 			Name: "GetApp",
 			Type: discover.ExportTypeApp,
 		},
-		OutDir:     outDir,
-		PkgDir:     pkgDir,
-		PkgPath:    "testflavor/api",
-		ModulePath: "testflavor",
-		ModuleDir:  moduleDir,
-		Flavor:     "zod",
+		OutDir:      outDir,
+		PkgDir:      pkgDir,
+		PkgPath:     "testflavor/api",
+		PackageName: "api",
+		ModulePath:  "testflavor",
+		ModuleDir:   moduleDir,
+		Flavor:      "zod",
 	})
 	if err != nil {
 		t.Fatalf("Exec() error: %v\nOutput: %s", err, output)
@@ -589,12 +610,13 @@ func CheckApp() *tygor.App {
 			Name: "CheckApp",
 			Type: discover.ExportTypeApp,
 		},
-		OutDir:     outDir,
-		PkgDir:     pkgDir,
-		PkgPath:    "testcheck/check",
-		ModulePath: "testcheck",
-		ModuleDir:  moduleDir,
-		CheckMode:  true,
+		OutDir:      outDir,
+		PkgDir:      pkgDir,
+		PkgPath:     "testcheck/check",
+		PackageName: "check",
+		ModulePath:  "testcheck",
+		ModuleDir:   moduleDir,
+		CheckMode:   true,
 	})
 	if err != nil {
 		t.Fatalf("Exec() error: %v\nOutput: %s", err, output)
@@ -702,11 +724,12 @@ func setupApp() *tygor.App {
 			Name: "setupApp", // lowercase = unexported
 			Type: discover.ExportTypeApp,
 		},
-		OutDir:     outDir,
-		PkgDir:     pkgDir,
-		PkgPath:    "testunexported/api",
-		ModulePath: "testunexported",
-		ModuleDir:  moduleDir,
+		OutDir:      outDir,
+		PkgDir:      pkgDir,
+		PkgPath:     "testunexported/api",
+		PackageName: "api",
+		ModulePath:  "testunexported",
+		ModuleDir:   moduleDir,
 	})
 	if err != nil {
 		t.Fatalf("Exec() error: %v\nOutput: %s", err, output)
@@ -747,9 +770,10 @@ func TestExecImport_MissingPkgPath(t *testing.T) {
 			Name: "SomeFunc",
 			Type: discover.ExportTypeApp,
 		},
-		OutDir:    filepath.Join(dir, "out"),
-		PkgDir:    dir,
-		ModuleDir: dir,
+		OutDir:      filepath.Join(dir, "out"),
+		PkgDir:      dir,
+		PackageName: "pkg",
+		ModuleDir:   dir,
 		// PkgPath intentionally omitted
 	})
 
@@ -770,9 +794,10 @@ func TestExecImport_MissingModuleDir(t *testing.T) {
 			Name: "SomeFunc",
 			Type: discover.ExportTypeApp,
 		},
-		OutDir:  filepath.Join(dir, "out"),
-		PkgDir:  dir,
-		PkgPath: "test/pkg",
+		OutDir:      filepath.Join(dir, "out"),
+		PkgDir:      dir,
+		PkgPath:     "test/pkg",
+		PackageName: "pkg",
 		// ModuleDir intentionally omitted
 	})
 
@@ -871,6 +896,63 @@ func TestGenerateImportRunner(t *testing.T) {
 
 			if !strings.Contains(srcStr, "func main()") {
 				t.Error("expected main function")
+			}
+		})
+	}
+}
+
+func TestGeneratedRunnerQuotesStringLiterals(t *testing.T) {
+	outDir := "C:\\work\\quoted\"dir\nnext"
+	flavor := "zod-mini"
+	src, err := generateRunner(Options{
+		Export: discover.Export{Name: "Setup", Type: discover.ExportTypeApp},
+		OutDir: outDir,
+		Flavor: flavor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOut := "g.ToDir(" + strconv.Quote(outDir) + ")"
+	wantFlavor := "tygorgen.Flavor(" + strconv.Quote(flavor) + ")"
+	if !strings.Contains(string(src), wantOut) || !strings.Contains(string(src), wantFlavor) {
+		t.Fatalf("generated runner did not preserve literals:\n%s", src)
+	}
+
+	pkgPath := "example.com/quoted\"pkg"
+	src, err = generateImportRunner(Options{
+		Export:  discover.Export{Name: "Setup", Type: discover.ExportTypeApp},
+		PkgPath: pkgPath,
+		OutDir:  outDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "pkg "+strconv.Quote(pkgPath)) || !strings.Contains(string(src), wantOut) {
+		t.Fatalf("generated import runner did not preserve literals:\n%s", src)
+	}
+}
+
+func TestValidateOptions(t *testing.T) {
+	base := Options{
+		Export:      discover.Export{Name: "Setup", Type: discover.ExportTypeApp},
+		PackageName: "api",
+	}
+	tests := []struct {
+		name string
+		edit func(*Options)
+	}{
+		{name: "invalid export", edit: func(opts *Options) { opts.Export.Name = "Setup()" }},
+		{name: "invalid config", edit: func(opts *Options) { opts.ConfigFunc = "configure()" }},
+		{name: "invalid package", edit: func(opts *Options) { opts.PackageName = "package main" }},
+		{name: "invalid flavor", edit: func(opts *Options) { opts.Flavor = "custom" }},
+		{name: "main missing active files", edit: func(opts *Options) { opts.PackageName = "main" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := base
+			tt.edit(&opts)
+			if err := validateOptions(opts); err == nil {
+				t.Fatal("validateOptions returned nil")
 			}
 		})
 	}

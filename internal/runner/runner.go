@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"text/template"
 
 	"tygor.dev/internal/discover"
@@ -51,6 +52,13 @@ type Options struct {
 	// Required for non-main packages.
 	PkgPath string
 
+	// PackageName is the package clause name reported by go/packages.
+	PackageName string
+
+	// CompiledGoFiles is the active file set selected by go/packages for the
+	// current GOOS, GOARCH, and build tags.
+	CompiledGoFiles []string
+
 	// ModulePath is the module path (e.g., "github.com/foo").
 	// Required for non-main packages.
 	ModulePath string
@@ -68,16 +76,35 @@ type Options struct {
 // For package main: uses overlay to replace main() with runner main().
 // For other packages: creates a temp module that imports the target package.
 func Exec(opts Options) (output []byte, err error) {
-	// Check if this is a main package by looking for func main()
-	isMainPkg, err := hasMainFunc(opts.PkgDir)
-	if err != nil {
-		return nil, fmt.Errorf("check main: %w", err)
+	if err := validateOptions(opts); err != nil {
+		return nil, err
 	}
-
-	if isMainPkg {
+	if opts.PackageName == "main" {
 		return execOverlay(opts)
 	}
 	return execImport(opts)
+}
+
+func validateOptions(opts Options) error {
+	if !token.IsIdentifier(opts.Export.Name) {
+		return fmt.Errorf("invalid export function name %q", opts.Export.Name)
+	}
+	if opts.ConfigFunc != "" && !token.IsIdentifier(opts.ConfigFunc) {
+		return fmt.Errorf("invalid config function name %q", opts.ConfigFunc)
+	}
+	if !token.IsIdentifier(opts.PackageName) {
+		return fmt.Errorf("invalid package name %q", opts.PackageName)
+	}
+	if opts.Flavor != "" && opts.Flavor != "zod" && opts.Flavor != "zod-mini" {
+		return fmt.Errorf("invalid flavor %q: expected zod or zod-mini", opts.Flavor)
+	}
+	if opts.Export.Type == discover.ExportTypeGenerator && opts.ConfigFunc != "" && !opts.NoConfig {
+		return fmt.Errorf("config function is only valid for *tygor.App exports")
+	}
+	if opts.PackageName == "main" && len(opts.CompiledGoFiles) == 0 {
+		return fmt.Errorf("CompiledGoFiles required for package main")
+	}
+	return nil
 }
 
 // execOverlay handles package main by using Go's overlay feature.
@@ -92,15 +119,9 @@ func execOverlay(opts Options) (output []byte, err error) {
 	// Find and process files with main()
 	overlay := make(map[string]string)
 
-	files, err := filepath.Glob(filepath.Join(opts.PkgDir, "*.go"))
-	if err != nil {
-		return nil, fmt.Errorf("glob: %w", err)
-	}
-
-	for _, file := range files {
-		// Skip test files
-		if filepath.Base(file) == "_test.go" || len(file) > 8 && file[len(file)-8:] == "_test.go" {
-			continue
+	for _, file := range opts.CompiledGoFiles {
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(opts.PkgDir, file)
 		}
 
 		hasMain, modified, err := removeMain(file)
@@ -190,12 +211,9 @@ func execImport(opts Options) (output []byte, err error) {
 
 	overlay := make(map[string]string)
 
-	// Check if export function is unexported
-	exportFunc := opts.Export.Name
-	isUnexported := len(exportFunc) > 0 && exportFunc[0] >= 'a' && exportFunc[0] <= 'z'
-
-	if isUnexported {
-		// Generate a shim file in the target package that exports the function
+	privateExport := !ast.IsExported(opts.Export.Name)
+	privateConfig := opts.Export.Type == discover.ExportTypeApp && opts.ConfigFunc != "" && !opts.NoConfig && !ast.IsExported(opts.ConfigFunc)
+	if privateExport || privateConfig {
 		shimSrc, err := generateShim(opts)
 		if err != nil {
 			return nil, fmt.Errorf("generate shim: %w", err)
@@ -209,8 +227,13 @@ func execImport(opts Options) (output []byte, err error) {
 		// Add shim to overlay in the target package
 		overlay[filepath.Join(opts.PkgDir, "tygor_shim_.go")] = shimFile
 
-		// Update export name to use the shim's exported wrapper
+	}
+
+	if privateExport {
 		opts.Export.Name = "TygorExport_"
+	}
+	if privateConfig {
+		opts.ConfigFunc = "TygorConfig_"
 	}
 
 	// Generate runner that imports the target package
@@ -269,36 +292,6 @@ func execImport(opts Options) (output []byte, err error) {
 	return output, nil
 }
 
-// hasMainFunc checks if any .go file in the directory has a main() function.
-func hasMainFunc(dir string) (bool, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "*.go"))
-	if err != nil {
-		return false, err
-	}
-
-	for _, file := range files {
-		// Skip test files
-		if filepath.Base(file) == "_test.go" || len(file) > 8 && file[len(file)-8:] == "_test.go" {
-			continue
-		}
-
-		fset := token.NewFileSet()
-		f, err := parser.ParseFile(fset, file, nil, 0)
-		if err != nil {
-			return false, err
-		}
-
-		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if ok && fn.Name.Name == "main" && fn.Recv == nil {
-				return true, nil
-			}
-		}
-	}
-
-	return false, nil
-}
-
 // removeMain parses a Go file and returns a version with func main() renamed.
 // We rename instead of removing so that imports used only by main() stay valid.
 // Returns (hasMain, modifiedSource, error).
@@ -334,6 +327,13 @@ func removeMain(filename string) (bool, []byte, error) {
 
 // generateRunner creates the runner main() source.
 func generateRunner(opts Options) ([]byte, error) {
+	if !token.IsIdentifier(opts.Export.Name) {
+		return nil, fmt.Errorf("invalid export function name %q", opts.Export.Name)
+	}
+	if opts.ConfigFunc != "" && !token.IsIdentifier(opts.ConfigFunc) {
+		return nil, fmt.Errorf("invalid config function name %q", opts.ConfigFunc)
+	}
+
 	var tmplStr string
 	if opts.CheckMode {
 		switch opts.Export.Type {
@@ -364,19 +364,23 @@ func generateRunner(opts Options) ([]byte, error) {
 	if opts.ConfigFunc != "" && !opts.NoConfig {
 		configFunc = opts.ConfigFunc
 	}
+	flavorLiteral := ""
+	if opts.Flavor != "" {
+		flavorLiteral = strconv.Quote(opts.Flavor)
+	}
 
 	data := struct {
-		ExportFunc string
-		OutDir     string
-		Flavor     string
-		Discovery  bool
-		ConfigFunc string
+		ExportFunc    string
+		OutDirLiteral string
+		FlavorLiteral string
+		Discovery     bool
+		ConfigFunc    string
 	}{
-		ExportFunc: opts.Export.Name,
-		OutDir:     opts.OutDir,
-		Flavor:     opts.Flavor,
-		Discovery:  opts.Discovery,
-		ConfigFunc: configFunc,
+		ExportFunc:    opts.Export.Name,
+		OutDirLiteral: strconv.Quote(opts.OutDir),
+		FlavorLiteral: flavorLiteral,
+		Discovery:     opts.Discovery,
+		ConfigFunc:    configFunc,
 	}
 
 	var buf bytes.Buffer
@@ -384,7 +388,11 @@ func generateRunner(opts Options) ([]byte, error) {
 		return nil, err
 	}
 
-	return buf.Bytes(), nil
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("format generated runner: %w", err)
+	}
+	return formatted, nil
 }
 
 const appRunnerTemplate = `package main
@@ -398,8 +406,8 @@ import (
 
 func main() {
 	g := tygorgen.FromApp({{.ExportFunc}}())
-{{if .Flavor}}
-	g = g.WithFlavor(tygorgen.Flavor("{{.Flavor}}"))
+{{if .FlavorLiteral}}
+	g = g.WithFlavor(tygorgen.Flavor({{.FlavorLiteral}}))
 {{end}}
 {{if .Discovery}}
 	g = g.WithDiscovery()
@@ -407,7 +415,7 @@ func main() {
 {{if .ConfigFunc}}
 	g = {{.ConfigFunc}}(g)
 {{end}}
-	result, err := g.ToDir("{{.OutDir}}")
+	result, err := g.ToDir({{.OutDirLiteral}})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tygor gen: %v\n", err)
 		os.Exit(1)
@@ -427,7 +435,7 @@ import (
 
 func main() {
 	g := {{.ExportFunc}}()
-	result, err := g.ToDir("{{.OutDir}}")
+	result, err := g.ToDir({{.OutDirLiteral}})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tygor gen: %v\n", err)
 		os.Exit(1)
@@ -503,6 +511,13 @@ func main() {
 
 // generateImportRunner creates runner source that imports a non-main package.
 func generateImportRunner(opts Options) ([]byte, error) {
+	if !token.IsIdentifier(opts.Export.Name) {
+		return nil, fmt.Errorf("invalid export function name %q", opts.Export.Name)
+	}
+	if opts.ConfigFunc != "" && !token.IsIdentifier(opts.ConfigFunc) {
+		return nil, fmt.Errorf("invalid config function name %q", opts.ConfigFunc)
+	}
+
 	var tmplStr string
 	if opts.CheckMode {
 		switch opts.Export.Type {
@@ -533,21 +548,25 @@ func generateImportRunner(opts Options) ([]byte, error) {
 	if opts.ConfigFunc != "" && !opts.NoConfig {
 		configFunc = opts.ConfigFunc
 	}
+	flavorLiteral := ""
+	if opts.Flavor != "" {
+		flavorLiteral = strconv.Quote(opts.Flavor)
+	}
 
 	data := struct {
-		PkgPath    string
-		ExportFunc string
-		OutDir     string
-		Flavor     string
-		Discovery  bool
-		ConfigFunc string
+		PkgPathLiteral string
+		ExportFunc     string
+		OutDirLiteral  string
+		FlavorLiteral  string
+		Discovery      bool
+		ConfigFunc     string
 	}{
-		PkgPath:    opts.PkgPath,
-		ExportFunc: opts.Export.Name,
-		OutDir:     opts.OutDir,
-		Flavor:     opts.Flavor,
-		Discovery:  opts.Discovery,
-		ConfigFunc: configFunc,
+		PkgPathLiteral: strconv.Quote(opts.PkgPath),
+		ExportFunc:     opts.Export.Name,
+		OutDirLiteral:  strconv.Quote(opts.OutDir),
+		FlavorLiteral:  flavorLiteral,
+		Discovery:      opts.Discovery,
+		ConfigFunc:     configFunc,
 	}
 
 	var buf bytes.Buffer
@@ -555,7 +574,11 @@ func generateImportRunner(opts Options) ([]byte, error) {
 		return nil, err
 	}
 
-	return buf.Bytes(), nil
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("format generated import runner: %w", err)
+	}
+	return formatted, nil
 }
 
 const importAppRunnerTemplate = `package main
@@ -565,13 +588,13 @@ import (
 	"os"
 
 	"tygor.dev/tygorgen"
-	pkg "{{.PkgPath}}"
+	pkg {{.PkgPathLiteral}}
 )
 
 func main() {
 	g := tygorgen.FromApp(pkg.{{.ExportFunc}}())
-{{if .Flavor}}
-	g = g.WithFlavor(tygorgen.Flavor("{{.Flavor}}"))
+{{if .FlavorLiteral}}
+	g = g.WithFlavor(tygorgen.Flavor({{.FlavorLiteral}}))
 {{end}}
 {{if .Discovery}}
 	g = g.WithDiscovery()
@@ -579,7 +602,7 @@ func main() {
 {{if .ConfigFunc}}
 	g = pkg.{{.ConfigFunc}}(g)
 {{end}}
-	result, err := g.ToDir("{{.OutDir}}")
+	result, err := g.ToDir({{.OutDirLiteral}})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tygor gen: %v\n", err)
 		os.Exit(1)
@@ -596,12 +619,12 @@ import (
 	"fmt"
 	"os"
 
-	pkg "{{.PkgPath}}"
+	pkg {{.PkgPathLiteral}}
 )
 
 func main() {
 	g := pkg.{{.ExportFunc}}()
-	result, err := g.ToDir("{{.OutDir}}")
+	result, err := g.ToDir({{.OutDirLiteral}})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tygor gen: %v\n", err)
 		os.Exit(1)
@@ -619,7 +642,7 @@ import (
 	"os"
 
 	"tygor.dev/tygorgen"
-	pkg "{{.PkgPath}}"
+	pkg {{.PkgPathLiteral}}
 )
 
 func main() {
@@ -653,7 +676,7 @@ import (
 	"fmt"
 	"os"
 
-	pkg "{{.PkgPath}}"
+	pkg {{.PkgPathLiteral}}
 )
 
 func main() {
@@ -678,36 +701,47 @@ func main() {
 }
 `
 
-// generateShim creates a file that exports an unexported function.
-// This is used when running tygor gen on a non-main package with an unexported export function.
+// generateShim exports private app/generator and config functions independently.
 func generateShim(opts Options) ([]byte, error) {
-	// Get the package name by parsing an existing file
-	pkgName, err := getPackageName(opts.PkgDir)
-	if err != nil {
-		return nil, fmt.Errorf("get package name: %w", err)
+	if !token.IsIdentifier(opts.PackageName) {
+		return nil, fmt.Errorf("invalid package name %q", opts.PackageName)
+	}
+	privateExport := !ast.IsExported(opts.Export.Name)
+	privateConfig := opts.Export.Type == discover.ExportTypeApp && opts.ConfigFunc != "" && !opts.NoConfig && !ast.IsExported(opts.ConfigFunc)
+	if privateExport && !token.IsIdentifier(opts.Export.Name) {
+		return nil, fmt.Errorf("invalid export function name %q", opts.Export.Name)
+	}
+	if privateConfig && !token.IsIdentifier(opts.ConfigFunc) {
+		return nil, fmt.Errorf("invalid config function name %q", opts.ConfigFunc)
 	}
 
-	var tmplStr string
-	switch opts.Export.Type {
-	case discover.ExportTypeApp:
-		tmplStr = shimAppTemplate
-	case discover.ExportTypeGenerator:
-		tmplStr = shimGeneratorTemplate
-	default:
-		return nil, fmt.Errorf("unknown export type: %v", opts.Export.Type)
-	}
-
-	tmpl, err := template.New("shim").Parse(tmplStr)
+	tmpl, err := template.New("shim").Parse(shimTemplate)
 	if err != nil {
 		return nil, err
 	}
 
 	data := struct {
-		PkgName    string
-		ExportFunc string
+		PkgName         string
+		AppExport       string
+		GeneratorExport string
+		ConfigFunc      string
+		NeedsTygor      bool
+		NeedsTygorgen   bool
 	}{
-		PkgName:    pkgName,
-		ExportFunc: opts.Export.Name,
+		PkgName:       opts.PackageName,
+		ConfigFunc:    opts.ConfigFunc,
+		NeedsTygor:    privateExport && opts.Export.Type == discover.ExportTypeApp,
+		NeedsTygorgen: privateConfig || privateExport && opts.Export.Type == discover.ExportTypeGenerator,
+	}
+	if privateExport && opts.Export.Type == discover.ExportTypeApp {
+		data.AppExport = opts.Export.Name
+	} else if privateExport && opts.Export.Type == discover.ExportTypeGenerator {
+		data.GeneratorExport = opts.Export.Name
+	} else if privateExport {
+		return nil, fmt.Errorf("unknown export type: %v", opts.Export.Type)
+	}
+	if !privateConfig {
+		data.ConfigFunc = ""
 	}
 
 	var buf bytes.Buffer
@@ -715,51 +749,36 @@ func generateShim(opts Options) ([]byte, error) {
 		return nil, err
 	}
 
-	return buf.Bytes(), nil
-}
-
-// getPackageName returns the package name from the first .go file in the directory.
-func getPackageName(dir string) (string, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	formatted, err := format.Source(buf.Bytes())
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("format generated shim: %w", err)
 	}
-
-	for _, file := range files {
-		// Skip test files
-		base := filepath.Base(file)
-		if base == "_test.go" || len(base) > 8 && base[len(base)-8:] == "_test.go" {
-			continue
-		}
-
-		fset := token.NewFileSet()
-		f, err := parser.ParseFile(fset, file, nil, parser.PackageClauseOnly)
-		if err != nil {
-			continue
-		}
-
-		return f.Name.Name, nil
-	}
-
-	return "", fmt.Errorf("no Go files found in %s", dir)
+	return formatted, nil
 }
 
-const shimAppTemplate = `package {{.PkgName}}
-
+const shimTemplate = `package {{.PkgName}}
+{{if .NeedsTygor}}
 import "tygor.dev/tygor"
-
+{{end}}
+{{if .NeedsTygorgen}}
+import "tygor.dev/tygorgen"
+{{end}}
+{{if .AppExport}}
 // TygorExport_ is a generated wrapper to export the unexported function.
 func TygorExport_() *tygor.App {
-	return {{.ExportFunc}}()
+	return {{.AppExport}}()
 }
-`
-
-const shimGeneratorTemplate = `package {{.PkgName}}
-
-import "tygor.dev/tygorgen"
-
+{{end}}
+{{if .GeneratorExport}}
 // TygorExport_ is a generated wrapper to export the unexported function.
 func TygorExport_() *tygorgen.Generator {
-	return {{.ExportFunc}}()
+	return {{.GeneratorExport}}()
 }
+{{end}}
+{{if .ConfigFunc}}
+// TygorConfig_ is a generated wrapper to export the unexported config function.
+func TygorConfig_(g *tygorgen.Generator) *tygorgen.Generator {
+	return {{.ConfigFunc}}(g)
+}
+{{end}}
 `

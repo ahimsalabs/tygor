@@ -268,6 +268,13 @@ tygor dev                    # Start devtools server (used by Vite plugin)
   --port           Server port (default: 9000)
 ```
 
+`tygor gen` records generated paths in `.tygor-generated.json`. Normal
+generation removes obsolete owned files but preserves files not listed in that
+manifest. `--check` recursively compares expected files and reports changed,
+missing, newly unowned, or obsolete owned output. For an existing generated
+directory without a manifest, run `tygor gen` once before `--check`; that first
+run adopts only legacy files carrying tygor's generated-file marker.
+
 ## Advanced: Programmatic Generation
 
 You can also generate types programmatically, useful for custom build scripts:
