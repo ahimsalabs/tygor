@@ -81,8 +81,9 @@ When you edit a `.go` file:
 | `rpcDir` | `string` | `'./src/rpc'` | Output directory for `tygor gen` and discovery.json |
 | `proxy` | `string[]` | - | Proxy paths (auto-derived from discovery.json if not set) |
 | `watch` | `string[]` | `['**/*.go']` | Glob patterns to watch |
-| `ignore` | `string[]` | `['node_modules', '.git', 'tmp', 'dist']` | Patterns to ignore |
+| `ignore` | `string[]` | `['node_modules', '.git', '.tygor', 'dist']` | Patterns to ignore, including generated watched files |
 | `health` | `string \| false` | `false` | Health check endpoint (false = TCP probe) |
+| `watchdog` | `boolean` | `true` | Restart unresponsive backends; disable while pausing the backend in a debugger |
 | `port` | `number` | `8080` | Starting port to search from |
 | `workdir` | `string` | `process.cwd()` | Working directory for Go commands and file watcher |
 
@@ -135,6 +136,8 @@ tygor({
   start: (port) => ({ cmd: `./tmp/server -port=${port}` }),
 })
 ```
+
+File changes are retained while any pipeline step is running, so a save during generation always triggers a trailing rebuild. If a generator writes files matched by `watch`, add those output paths to `ignore` to prevent generator output from retriggering the pipeline.
 
 ### prebuild: Post-gen processing
 
