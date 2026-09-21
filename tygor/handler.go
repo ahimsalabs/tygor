@@ -390,16 +390,47 @@ func (h *ExecHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 				ctx.request.Body = http.MaxBytesReader(ctx.writer, ctx.request.Body, int64(effectiveLimit))
 			}
 
-			if err := json.NewDecoder(ctx.request.Body).Decode(&req); err != nil {
-				// Empty body (EOF) is OK - treat as empty request ({})
-				if !errors.Is(err, io.EOF) {
-					return req, Errorf(CodeInvalidArgument, "failed to decode body: %v", err)
-				}
+			if err := decodeJSONBody(ctx.request.Body, &req); err != nil {
+				return req, Errorf(CodeInvalidArgument, "failed to decode body: %v", err)
 			}
 		}
 		return req, nil
 	}
 	h.serve(ctx, "", decoder)
+}
+
+// decodeJSONBody decodes at most one JSON value. An empty body leaves dst at
+// its zero value; after a value, only JSON whitespace is allowed.
+func decodeJSONBody(body io.Reader, dst any) error {
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	return errors.New("request body must contain exactly one JSON value")
+}
+
+func validateRequest(req any) error {
+	// tygor.Empty is a nil *struct{} by design.
+	if _, isEmptyType := req.(Empty); isEmptyType {
+		return nil
+	}
+
+	value := reflect.ValueOf(req)
+	if !value.IsValid() || value.Kind() == reflect.Pointer && value.IsNil() {
+		return NewError(CodeInvalidArgument, "request body must not be null")
+	}
+	return validate.Struct(req)
 }
 
 // serve implements the generic glue code for both ExecHandler and QueryHandler.
@@ -421,13 +452,8 @@ func (h *handlerBase[Req, Res]) serve(ctx *rpcContext, cacheControl string, deco
 		}
 
 		if !h.skipValidation {
-			// Skip validation for tygor.Empty (nil is its valid zero value).
-			// For other types, nil would be caught by validate.Struct anyway.
-			_, isEmptyType := any(req).(Empty)
-			if !isEmptyType {
-				if err := validate.Struct(req); err != nil {
-					return req, err
-				}
+			if err := validateRequest(req); err != nil {
+				return req, err
 			}
 		}
 		return req, nil
@@ -464,34 +490,45 @@ func (h *handlerBase[Req, Res]) serve(ctx *rpcContext, cacheControl string, deco
 		return
 	}
 
-	// 4. Write Response
-	ctx.writer.Header().Set("Content-Type", "application/json")
-	if cacheControl != "" {
-		ctx.writer.Header().Set("Cache-Control", cacheControl)
-	}
-
-	if err := encodeResponse(ctx.writer, res); err != nil {
-		// Response may be partially written, nothing we can do. Log for debugging.
+	// 4. Marshal the complete response before committing success.
+	data, marshalErr := marshalResponse(res)
+	if marshalErr != nil {
 		logger := ctx.logger
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.Error("failed to encode response",
+		logger.Error("failed to marshal response",
 			slog.String("endpoint", ctx.EndpointID()),
-			slog.Any("error", err))
+			slog.Any("error", marshalErr))
+		handleError(ctx, fmt.Errorf("marshal response: %w", marshalErr))
+		return
+	}
+
+	// 5. Write Response
+	var n int
+	var writeErr error
+	ctx.panicRecovery.own(func() {
+		ctx.writer.Header().Set("Content-Type", "application/json")
+		if cacheControl != "" {
+			ctx.writer.Header().Set("Cache-Control", cacheControl)
+		}
+		n, writeErr = ctx.writer.Write(data)
+	})
+	if writeErr != nil || n != len(data) {
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		logger := ctx.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Error("failed to write response",
+			slog.String("endpoint", ctx.EndpointID()),
+			slog.Any("error", writeErr))
 	}
 }
 
 func handleError(ctx *rpcContext, err error) {
-	var svcErr *Error
-	if ctx.errorTransformer != nil {
-		svcErr = ctx.errorTransformer(err)
-	}
-	if svcErr == nil {
-		svcErr = DefaultErrorTransformer(err)
-	}
-	if ctx.maskInternalErrors && svcErr.Code == CodeInternal {
-		svcErr.Message = "internal server error"
-	}
-	writeError(ctx.writer, svcErr, ctx.logger)
+	prepared := prepareErrorResponse(ctx.errorTransformer, ctx.maskInternalErrors, err)
+	writePreparedErrorOwned(ctx.panicRecovery, ctx.writer, prepared, ctx.logger)
 }

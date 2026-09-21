@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 
 	"github.com/go-playground/validator/v10"
@@ -96,6 +98,103 @@ func (e *Error) WithDetails(details map[string]any) *Error {
 // If it returns nil, the default transformer logic should be applied.
 type ErrorTransformer func(error) *Error
 
+const internalErrorResponseJSON = "{\"error\":{\"code\":\"internal\",\"message\":\"internal server error\"}}\n"
+
+type preparedErrorResponse struct {
+	status       int
+	code         ErrorCode
+	message      string
+	data         []byte
+	usedFallback bool
+	fallbackErr  error
+}
+
+func internalPreparedErrorResponse(cause error) preparedErrorResponse {
+	return preparedErrorResponse{
+		status:       http.StatusInternalServerError,
+		code:         CodeInternal,
+		message:      "internal server error",
+		data:         []byte(internalErrorResponseJSON),
+		usedFallback: true,
+		fallbackErr:  cause,
+	}
+}
+
+// prepareErrorResponse contains custom error policy and serialization in one
+// panic boundary. Its fallback is constant and does not invoke either again.
+func prepareErrorResponse(transformer ErrorTransformer, maskInternal bool, err error) (prepared preparedErrorResponse) {
+	prepared = internalPreparedErrorResponse(err)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			prepared = internalPreparedErrorResponse(fmt.Errorf("panic in error policy: %v", recovered))
+		}
+	}()
+
+	svcErr := transformError(transformer, maskInternal, err)
+	data, marshalErr := marshalErrorResponse(svcErr)
+	if marshalErr != nil {
+		prepared.fallbackErr = fmt.Errorf("marshal transformed error: %w", marshalErr)
+		return prepared
+	}
+	return preparedErrorResponse{
+		status:  svcErr.Code.HTTPStatus(),
+		code:    svcErr.Code,
+		message: svcErr.Message,
+		data:    data,
+	}
+}
+
+func prepareServiceErrorResponse(svcErr *Error) (prepared preparedErrorResponse) {
+	prepared = internalPreparedErrorResponse(nil)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			prepared = internalPreparedErrorResponse(fmt.Errorf("panic marshaling service error: %v", recovered))
+		}
+	}()
+
+	data, marshalErr := marshalErrorResponse(svcErr)
+	if marshalErr != nil {
+		prepared.fallbackErr = fmt.Errorf("marshal service error: %w", marshalErr)
+		return prepared
+	}
+	return preparedErrorResponse{
+		status:  svcErr.Code.HTTPStatus(),
+		code:    svcErr.Code,
+		message: svcErr.Message,
+		data:    data,
+	}
+}
+
+func transformError(transformer ErrorTransformer, maskInternal bool, err error) *Error {
+	var transformed *Error
+	if transformer != nil {
+		transformed = transformer(err)
+	}
+	if transformed == nil {
+		transformed = DefaultErrorTransformer(err)
+	}
+	if transformed == nil {
+		return NewError(CodeInternal, "internal server error")
+	}
+
+	copy := *transformed
+	if maskInternal && copy.Code == CodeInternal {
+		copy.Message = "internal server error"
+	}
+	return &copy
+}
+
+func logPanic(logger *slog.Logger, endpoint, location string, rec any) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Error("PANIC recovered",
+		slog.String("endpoint", endpoint),
+		slog.String("location", location),
+		slog.Any("panic", rec),
+		slog.String("stack", string(debug.Stack())))
+}
+
 // DefaultErrorTransformer maps standard Go errors to service errors.
 func DefaultErrorTransformer(err error) *Error {
 	if err == nil {
@@ -115,12 +214,12 @@ func DefaultErrorTransformer(err error) *Error {
 		return NewError(CodeCanceled, "context canceled")
 	}
 
-	if errors.Is(err, ErrStreamClosed) {
-		return NewError(CodeCanceled, "stream closed")
-	}
-
 	if errors.Is(err, ErrWriteTimeout) {
 		return NewError(CodeDeadlineExceeded, "write timeout")
+	}
+
+	if errors.Is(err, ErrStreamClosed) {
+		return NewError(CodeCanceled, "stream closed")
 	}
 
 	var valErrs validator.ValidationErrors
@@ -238,17 +337,33 @@ func formatValidationError(ve validator.FieldError) string {
 	}
 }
 
-func writeError(w http.ResponseWriter, svcErr *Error, logger *slog.Logger) {
+func writeError(recovery *panicRecoveryState, w http.ResponseWriter, svcErr *Error, logger *slog.Logger) {
+	writePreparedErrorOwned(recovery, w, prepareServiceErrorResponse(svcErr), logger)
+}
+
+func writePreparedErrorOwned(recovery *panicRecoveryState, w http.ResponseWriter, prepared preparedErrorResponse, logger *slog.Logger) {
+	recovery.own(func() {
+		writePreparedError(w, prepared, logger)
+	})
+}
+
+func writePreparedError(w http.ResponseWriter, prepared preparedErrorResponse, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if prepared.usedFallback {
+		logger.Error("error policy failed; using internal fallback", slog.Any("error", prepared.fallbackErr))
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(svcErr.Code.HTTPStatus())
-	if err := encodeErrorResponse(w, svcErr); err != nil {
-		// Headers already sent, nothing we can do. Log for debugging.
+	w.WriteHeader(prepared.status)
+	if n, writeErr := w.Write(prepared.data); writeErr != nil || n != len(prepared.data) {
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
 		logger.Error("failed to encode error response",
-			slog.String("code", string(svcErr.Code)),
-			slog.String("message", svcErr.Message),
-			slog.Any("error", err))
+			slog.String("code", string(prepared.code)),
+			slog.String("message", prepared.message),
+			slog.Any("error", writeErr))
 	}
 }
