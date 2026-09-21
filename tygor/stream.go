@@ -1,16 +1,17 @@
 package tygor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"iter"
 	"log/slog"
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"tygor.dev/internal"
@@ -23,6 +24,10 @@ var ErrStreamClosed = errors.New("stream closed")
 // ErrWriteTimeout is returned by StreamWriter.Send when a write to the client timed out.
 // This typically indicates a slow or unresponsive client.
 var ErrWriteTimeout = errors.New("write timeout")
+
+// ErrInvalidStreamEventID is returned by StreamWriter.SendWithID when an event
+// ID contains characters that can alter SSE framing.
+var ErrInvalidStreamEventID = errors.New("invalid stream event ID")
 
 // StreamWriter sends events to a streaming client.
 // It provides methods for sending events with optional SSE event IDs
@@ -37,14 +42,19 @@ var ErrWriteTimeout = errors.New("write timeout")
 //	func (m *mockStreamWriter[T]) SendWithID(id string, event T) error { return m.Send(event) }
 //	func (m *mockStreamWriter[T]) LastEventID() string { return "" }
 type StreamWriter[T any] interface {
-	// Send sends an event to the client.
-	// Returns an error if the client has disconnected or the context is canceled.
-	// All disconnect-related errors satisfy errors.Is(err, [ErrStreamClosed]).
+	// Send synchronously submits an event to the interceptor pipeline. For events
+	// forwarded synchronously, it waits for serialization, writing, and flushing.
+	// Interceptors may transform, filter, or buffer an event, so a nil error does
+	// not guarantee a corresponding frame reached the client.
+	//
+	// All stream-closure errors satisfy errors.Is(err, [ErrStreamClosed]).
 	Send(event T) error
 
 	// SendWithID sends an event with an SSE event ID.
 	// The ID is sent as the "id:" field in the SSE stream, allowing clients
 	// to resume from this point on reconnection via the Last-Event-ID header.
+	// IDs containing carriage return, line feed, or NUL are rejected with
+	// [ErrInvalidStreamEventID].
 	SendWithID(id string, event T) error
 
 	// LastEventID returns the client's Last-Event-ID header value.
@@ -57,7 +67,67 @@ type StreamWriter[T any] interface {
 type streamSender[T any] struct {
 	yieldAny    func(any, error) bool
 	ctx         context.Context
+	session     *streamSession
 	lastEventID string
+}
+
+type streamSessionKey struct{}
+
+type streamSession struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
+	mu    sync.Mutex
+	cause error
+}
+
+func newStreamSession(parent context.Context) *streamSession {
+	ctx, cancel := context.WithCancelCause(parent)
+	return &streamSession{ctx: ctx, cancel: cancel}
+}
+
+func (s *streamSession) fail(err error) error {
+	if err == nil {
+		err = ErrStreamClosed
+	}
+	if !errors.Is(err, ErrStreamClosed) {
+		err = fmt.Errorf("%w: %w", ErrStreamClosed, err)
+	}
+
+	shouldCancel := false
+	s.mu.Lock()
+	if s.cause == nil {
+		s.cause = err
+		shouldCancel = true
+	}
+	cause := s.cause
+	s.mu.Unlock()
+	if shouldCancel {
+		s.cancel(err)
+	}
+	return cause
+}
+
+func (s *streamSession) terminalCause() error {
+	s.mu.Lock()
+	cause := s.cause
+	s.mu.Unlock()
+	if cause != nil {
+		return cause
+	}
+	if cause = context.Cause(s.ctx); cause != nil && !errors.Is(cause, ErrStreamClosed) {
+		return fmt.Errorf("%w: %w", ErrStreamClosed, cause)
+	}
+	return cause
+}
+
+func withStreamSession(ctx context.Context, session *streamSession) context.Context {
+	return context.WithValue(ctx, streamSessionKey{}, session)
+}
+
+func streamSessionFromContext(ctx context.Context) *streamSession {
+	session, _ := ctx.Value(streamSessionKey{}).(*streamSession)
+	return session
 }
 
 // lastEventIDKey is the context key for passing Last-Event-ID to the Emitter.
@@ -84,27 +154,41 @@ type sseEvent struct {
 }
 
 func (s *streamSender[T]) Send(event T) error {
-	return s.sendWithOptionalID("", event)
+	return s.sendWithOptionalID("", false, event)
 }
 
 func (s *streamSender[T]) SendWithID(id string, event T) error {
-	return s.sendWithOptionalID(id, event)
+	if err := validateSSEEventID(id); err != nil {
+		return err
+	}
+	return s.sendWithOptionalID(id, true, event)
 }
 
-func (s *streamSender[T]) sendWithOptionalID(id string, event T) error {
+func (s *streamSender[T]) sendWithOptionalID(id string, hasID bool, event T) error {
+	if s.session != nil {
+		if cause := s.session.terminalCause(); cause != nil {
+			return cause
+		}
+	}
 	select {
 	case <-s.ctx.Done():
 		return fmt.Errorf("%w: %w", ErrStreamClosed, s.ctx.Err())
 	default:
 	}
 
-	// Wrap with ID if provided, otherwise send raw event
+	// Wrap when SendWithID was used, including an empty ID. An explicit empty
+	// SSE id field resets the client's last-event-ID state.
 	var toYield any = event
-	if id != "" {
+	if hasID {
 		toYield = sseEvent{id: id, event: event}
 	}
 
 	if !s.yieldAny(toYield, nil) {
+		if s.session != nil {
+			if cause := s.session.terminalCause(); cause != nil {
+				return cause
+			}
+		}
 		return ErrStreamClosed
 	}
 	return nil
@@ -116,24 +200,21 @@ func (s *streamSender[T]) LastEventID() string {
 
 // StreamHandler implements Endpoint for SSE streaming responses.
 //
-// Stream handlers return an iterator that yields events to the client.
-// The connection stays open until the iterator is exhausted, an error occurs,
-// or the client disconnects.
+// Stream handlers send events to the client with a StreamWriter. The connection
+// stays open until the handler returns, an error occurs, or the client disconnects.
 //
 // Example:
 //
-//	func SubscribeToFeed(ctx context.Context, req *SubscribeRequest) iter.Seq2[*FeedEvent, error] {
-//	    return func(yield func(*FeedEvent, error) bool) {
-//	        ticker := time.NewTicker(time.Second)
-//	        defer ticker.Stop()
-//	        for {
-//	            select {
-//	            case <-ctx.Done():
-//	                return
-//	            case <-ticker.C:
-//	                if !yield(&FeedEvent{Time: time.Now()}, nil) {
-//	                    return
-//	                }
+//	func SubscribeToFeed(ctx context.Context, req *SubscribeRequest, stream tygor.StreamWriter[*FeedEvent]) error {
+//	    ticker := time.NewTicker(time.Second)
+//	    defer ticker.Stop()
+//	    for {
+//	        select {
+//	        case <-ctx.Done():
+//	            return ctx.Err()
+//	        case <-ticker.C:
+//	            if err := stream.Send(&FeedEvent{Time: time.Now()}); err != nil {
+//	                return err
 //	            }
 //	        }
 //	    }
@@ -148,6 +229,7 @@ type StreamHandler[Req any, Res any] struct {
 	skipValidation     bool
 	maxRequestBodySize *uint64
 	writeTimeout       time.Duration
+	writeTimeoutIsSet  bool
 	heartbeatInterval  time.Duration
 }
 
@@ -166,7 +248,7 @@ func streamIter2[Req any, Res any](fn func(context.Context, Req) iter.Seq2[Res, 
 // StreamWriter.Send returns an error when the stream should stop:
 //   - Client disconnects
 //   - Context is canceled or times out
-//   - Write fails
+//   - A synchronously forwarded event fails serialization, writing, or flushing
 //
 // All disconnect-related errors satisfy errors.Is(err, [ErrStreamClosed]).
 // For finer distinction, you can also check errors.Is(err, context.Canceled)
@@ -208,13 +290,14 @@ func Stream[Req any, Res any](fn func(context.Context, Req, StreamWriter[Res]) e
 			s := &streamSender[Res]{
 				yieldAny:    yield,
 				ctx:         ctx,
+				session:     streamSessionFromContext(ctx),
 				lastEventID: getLastEventID(ctx),
 			}
 
 			err := fn(ctx, req, s)
 
 			// Don't send ErrStreamClosed as an error event - it's expected
-			if err != nil && !errors.Is(err, ErrStreamClosed) {
+			if err != nil && !errors.Is(err, ErrStreamClosed) && s.session.terminalCause() == nil {
 				yield(nil, err)
 			}
 		}
@@ -224,9 +307,10 @@ func Stream[Req any, Res any](fn func(context.Context, Req, StreamWriter[Res]) e
 	}
 }
 
-// WithUnaryInterceptor adds an interceptor that runs during stream setup.
-// Unary interceptors execute before the stream starts, useful for auth checks.
-// They do not see the stream response (it doesn't exist yet).
+// WithUnaryInterceptor adds an interceptor for stream setup. Interceptors may
+// inspect or reject the request, but their context deadlines and retry behavior
+// do not govern or replay the committed stream. Use
+// [StreamHandler.WithStreamInterceptor] to observe the stream lifetime.
 func (h *StreamHandler[Req, Res]) WithUnaryInterceptor(i UnaryInterceptor) *StreamHandler[Req, Res] {
 	h.unaryInterceptors = append(h.unaryInterceptors, i)
 	return h
@@ -253,11 +337,13 @@ func (h *StreamHandler[Req, Res]) WithMaxRequestBodySize(size uint64) *StreamHan
 
 // WithWriteTimeout sets the timeout for writing each event to the client.
 // If a write takes longer than this duration, the stream is closed and
-// emit returns [ErrWriteTimeout].
+// an affected [StreamWriter.Send] returns [ErrWriteTimeout].
 //
-// A zero duration means no timeout (the default).
+// A zero duration explicitly disables the timeout. Without this option, the
+// app-level timeout applies (30 seconds by default).
 func (h *StreamHandler[Req, Res]) WithWriteTimeout(d time.Duration) *StreamHandler[Req, Res] {
 	h.writeTimeout = d
+	h.writeTimeoutIsSet = true
 	return h
 }
 
@@ -291,52 +377,131 @@ func (h *StreamHandler[Req, Res]) metadata() *internal.MethodMetadata {
 
 // serveHTTP implements the SSE streaming handler.
 func (h *StreamHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
-	// 1. Decode request (same as ExecHandler)
+	state := &streamResponseState{}
+	defer h.recoverStreamPanic(ctx, state)
+
 	req, decodeErr := h.decodeRequest(ctx)
 	if decodeErr != nil {
-		handleError(ctx, decodeErr)
+		h.writeUnaryError(ctx, state, decodeErr)
+		return
+	}
+	var preflightErr error
+	ctx.panicRecovery.own(func() {
+		preflightErr = preflightSSE(ctx.writer, h.effectiveWriteTimeout(ctx))
+	})
+	if preflightErr != nil {
+		h.logStreamFailure(ctx, "stream preflight failed", preflightErr)
+		h.writeUnaryError(ctx, state, NewError(CodeInternal, "streaming response capabilities not supported"))
 		return
 	}
 
-	// 2. Run unary interceptors for setup (auth, logging, etc.)
-	// They don't see a response - just validate/reject the stream setup.
-	setupErr := h.runSetupInterceptors(ctx, req)
-	if setupErr != nil {
-		handleError(ctx, setupErr)
+	err := h.executeStream(ctx, req, state)
+	if state.handlerPanic != nil {
+		panic(state.handlerPanic)
+	}
+	if state.transportActive || state.transportFailed {
+		if err != nil {
+			h.logStreamFailure(ctx, "stream transport failed", err)
+		}
+		panic(http.ErrAbortHandler)
+	}
+	if state.serializationErr != nil {
+		h.logStreamFailure(ctx, "failed to marshal stream event", state.serializationErr)
+		err = state.serializationErr
+	} else if err == nil || errors.Is(err, ErrStreamClosed) {
 		return
 	}
 
-	// 3. Set SSE headers and flush
-	ctx.writer.Header().Set("Content-Type", "text/event-stream")
-	ctx.writer.Header().Set("Cache-Control", "no-cache")
-	ctx.writer.Header().Set("Connection", "keep-alive")
-	ctx.writer.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+	if !state.started {
+		h.writeUnaryError(ctx, state, err)
+		return
+	}
 
-	// 4. Add Last-Event-ID to context for Emitter to access
-	lastEventID := ctx.request.Header.Get("Last-Event-ID")
-	ctxWithID := withLastEventID(ctx, lastEventID)
+	if writeErr := h.writeTerminalSSEError(ctx, state, err); writeErr != nil {
+		h.logStreamFailure(ctx, "failed to write SSE error", writeErr)
+		panic(http.ErrAbortHandler)
+	}
+}
 
-	// 5. Get the base iterator from the handler
-	// Use fnAny if available (StreamEmit), otherwise wrap fn (Stream)
-	var anyIter iter.Seq2[any, error]
-	if h.fnAny != nil {
-		anyIter = h.fnAny(ctxWithID, req)
-	} else {
-		baseIter := h.fn(ctxWithID, req)
-		anyIter = func(yield func(any, error) bool) {
-			for v, err := range baseIter {
-				if !yield(v, err) {
-					return
-				}
-			}
+type streamResponseState struct {
+	started          bool
+	transportFailed  bool
+	transportActive  bool
+	terminalAttempt  bool
+	handlerPanic     any
+	serializationErr error
+}
+
+func (s *streamResponseState) writeFrame(ctx *rpcContext, timeout time.Duration, frame []byte) error {
+	if s.transportActive || s.transportFailed {
+		s.transportFailed = true
+		return ErrStreamClosed
+	}
+
+	s.transportActive = true
+	var err error
+	ctx.panicRecovery.own(func() {
+		err = writeSSEFrameWithCommit(ctx.writer, timeout, frame, func() {
+			s.started = true
+		})
+	})
+	s.transportActive = false
+	if err != nil && s.started {
+		s.transportFailed = true
+	}
+	return err
+}
+
+func (h *StreamHandler[Req, Res]) recoverStreamPanic(ctx *rpcContext, state *streamResponseState) {
+	rec := recover()
+	if rec == nil {
+		return
+	}
+	transportOwned := ctx.panicRecovery.isOwned()
+	ctx.panicRecovery.claim()
+	if transportOwned || state.transportActive || state.transportFailed || state.terminalAttempt {
+		panic(rec)
+	}
+
+	logPanic(ctx.logger, ctx.EndpointID(), "stream handler", rec)
+	panicErr := NewError(CodeInternal, "internal server error")
+	if !state.started {
+		h.writeUnaryError(ctx, state, panicErr)
+		return
+	}
+	if err := h.writeTerminalSSEError(ctx, state, panicErr); err != nil {
+		h.logStreamFailure(ctx, "failed to write SSE panic error", err)
+		panic(http.ErrAbortHandler)
+	}
+}
+
+func (h *StreamHandler[Req, Res]) writeUnaryError(ctx *rpcContext, state *streamResponseState, err error) {
+	state.terminalAttempt = true
+	handleError(ctx, err)
+}
+
+func (h *StreamHandler[Req, Res]) writeTerminalSSEError(ctx *rpcContext, state *streamResponseState, err error) error {
+	state.terminalAttempt = true
+	frame := marshalSSEErrorFrame(ctx, err)
+	return state.writeFrame(ctx, h.effectiveWriteTimeout(ctx), frame)
+}
+
+type streamTransportError struct{ err error }
+
+func (e *streamTransportError) Error() string { return e.err.Error() }
+func (e *streamTransportError) Unwrap() error { return e.err }
+
+func (h *StreamHandler[Req, Res]) executeStream(ctx *rpcContext, req Req, state *streamResponseState) error {
+	allInterceptors := make([]UnaryInterceptor, 0, len(ctx.interceptors)+len(h.unaryInterceptors))
+	allInterceptors = append(allInterceptors, ctx.interceptors...)
+	allInterceptors = append(allInterceptors, h.unaryInterceptors...)
+	chain := chainInterceptors(allInterceptors)
+	if chain != nil {
+		if _, err := chain(ctx, req, func(context.Context, any) (any, error) { return nil, nil }); err != nil {
+			return err
 		}
 	}
-
-	// 6. Wrap with stream interceptors
-	finalIter := h.wrapWithStreamInterceptors(ctx, req, anyIter)
-
-	// 7. Stream events
-	h.streamEvents(ctx, finalIter)
+	return h.runStream(ctx, ctx.request.Context(), req, state)
 }
 
 func (h *StreamHandler[Req, Res]) decodeRequest(ctx *rpcContext) (Req, error) {
@@ -349,123 +514,163 @@ func (h *StreamHandler[Req, Res]) decodeRequest(ctx *rpcContext) (Req, error) {
 		if effectiveLimit > 0 {
 			ctx.request.Body = http.MaxBytesReader(ctx.writer, ctx.request.Body, int64(effectiveLimit))
 		}
-		if err := json.NewDecoder(ctx.request.Body).Decode(&req); err != nil {
-			// Empty body (EOF) is OK - treat as empty request ({})
-			if !errors.Is(err, io.EOF) {
-				return req, Errorf(CodeInvalidArgument, "failed to decode body: %v", err)
-			}
+		if err := decodeJSONBody(ctx.request.Body, &req); err != nil {
+			return req, Errorf(CodeInvalidArgument, "failed to decode body: %v", err)
 		}
 	}
 
 	if !h.skipValidation {
-		_, isEmptyType := any(req).(Empty)
-		if !isEmptyType {
-			if err := validate.Struct(req); err != nil {
-				return req, err
-			}
+		if err := validateRequest(req); err != nil {
+			return req, err
 		}
 	}
 	return req, nil
 }
 
-func (h *StreamHandler[Req, Res]) runSetupInterceptors(ctx *rpcContext, req Req) error {
-	// Combine all unary interceptors: global + service + handler
-	allInterceptors := make([]UnaryInterceptor, 0, len(ctx.interceptors)+len(h.unaryInterceptors))
-	allInterceptors = append(allInterceptors, ctx.interceptors...)
-	allInterceptors = append(allInterceptors, h.unaryInterceptors...)
+func (h *StreamHandler[Req, Res]) effectiveWriteTimeout(ctx *rpcContext) time.Duration {
+	if h.writeTimeoutIsSet {
+		return h.writeTimeout
+	}
+	return ctx.streamWriteTimeout
+}
 
-	if len(allInterceptors) == 0 {
-		return nil
+func (h *StreamHandler[Req, Res]) effectiveHeartbeat(ctx *rpcContext) time.Duration {
+	if h.heartbeatInterval > 0 {
+		return h.heartbeatInterval
+	}
+	return ctx.streamHeartbeat
+}
+
+func (h *StreamHandler[Req, Res]) runStream(ctx *rpcContext, executionCtx context.Context, req Req, state *streamResponseState) error {
+	session := newStreamSession(executionCtx)
+	defer session.cancel(ErrStreamClosed)
+
+	baseHandler := func(sourceCtx context.Context, reqAny any) iter.Seq2[any, error] {
+		reqTyped, ok := reqAny.(Req)
+		if !ok {
+			return func(yield func(any, error) bool) {
+				yield(nil, Errorf(CodeInternal, "stream interceptor modified request type incorrectly"))
+			}
+		}
+
+		sourceCtx = withStreamSession(sourceCtx, session)
+		sourceCtx = withLastEventID(sourceCtx, ctx.request.Header.Get("Last-Event-ID"))
+		if h.fnAny != nil {
+			return h.fnAny(sourceCtx, reqTyped)
+		}
+
+		baseIter := h.fn(sourceCtx, reqTyped)
+		return func(yield func(any, error) bool) {
+			for event, err := range baseIter {
+				if !yield(event, err) {
+					return
+				}
+			}
+		}
 	}
 
-	// Chain interceptors with a no-op final handler
-	// We only care if they error out (reject the stream)
-	chain := chainInterceptors(allInterceptors)
-	noopHandler := func(ctx context.Context, req any) (any, error) {
-		return nil, nil // Stream setup complete
+	var events iter.Seq2[any, error]
+	baseHandler = latchStreamHandlerPanic(state, baseHandler)
+	streamChain := chainStreamInterceptors(h.streamInterceptors, state)
+	streamCtx := contextWithMetadata(withStreamSession(session.ctx, session), ctx)
+	if streamChain == nil {
+		events = baseHandler(streamCtx, req)
+	} else {
+		events = streamChain(streamCtx, req, baseHandler)
+	}
+	if events == nil {
+		return NewError(CodeInternal, "stream interceptor returned a nil iterator")
 	}
 
-	_, err := chain(ctx, req, noopHandler)
+	ctx.panicRecovery.own(func() {
+		ctx.writer.Header().Set("Content-Type", "text/event-stream")
+		ctx.writer.Header().Set("Cache-Control", "no-cache")
+		ctx.writer.Header().Set("Connection", "keep-alive")
+		ctx.writer.Header().Set("X-Accel-Buffering", "no")
+	})
+
+	writeTimeout := h.effectiveWriteTimeout(ctx)
+	if err := state.writeFrame(ctx, writeTimeout, nil); err != nil {
+		if !state.started {
+			return NewError(CodeInternal, "streaming write deadlines or flushing not supported")
+		}
+		state.transportFailed = true
+		return &streamTransportError{err: err}
+	}
+
+	err := h.streamEvents(ctx, executionCtx, session, state, events, writeTimeout)
+	var transportErr *streamTransportError
+	if errors.As(err, &transportErr) {
+		state.transportFailed = true
+	}
 	return err
 }
 
-func (h *StreamHandler[Req, Res]) wrapWithStreamInterceptors(ctx *rpcContext, req Req, anyIter iter.Seq2[any, error]) iter.Seq2[any, error] {
-	// Combine stream interceptors: global + service + handler
-	// For now, only handler-level stream interceptors are supported
-	// TODO: Add service/global stream interceptors if needed
-	allInterceptors := h.streamInterceptors
-
-	if len(allInterceptors) == 0 {
-		return anyIter
-	}
-
-	// Chain stream interceptors
-	chain := chainStreamInterceptors(allInterceptors)
-	finalHandler := func(ctx context.Context, req any) iter.Seq2[any, error] {
-		return anyIter
-	}
-
-	return chain(ctx, req, finalHandler)
-}
-
-func (h *StreamHandler[Req, Res]) streamEvents(ctx *rpcContext, events iter.Seq2[any, error]) {
-	flusher, ok := ctx.writer.(http.Flusher)
-	if !ok {
-		// Can't stream without flusher - send error and close
-		handleError(ctx, NewError(CodeInternal, "streaming not supported"))
-		return
-	}
-
-	// Flush headers immediately
-	flusher.Flush()
-
-	logger := ctx.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
-	// Determine effective write timeout: handler override > app default
-	writeTimeout := ctx.streamWriteTimeout
-	if h.writeTimeout > 0 {
-		writeTimeout = h.writeTimeout
-	}
-
-	// Determine effective heartbeat interval: handler override > app default
-	heartbeatInterval := ctx.streamHeartbeat
-	if h.heartbeatInterval > 0 {
-		heartbeatInterval = h.heartbeatInterval
-	}
-
-	// Check if underlying connection supports write deadlines
-	// http.ResponseController provides access to SetWriteDeadline in Go 1.20+
-	var rc *http.ResponseController
-	if writeTimeout > 0 {
-		rc = http.NewResponseController(ctx.writer)
-	}
-
-	// Channel to receive events from iterator goroutine
+func (h *StreamHandler[Req, Res]) streamEvents(ctx *rpcContext, executionCtx context.Context, session *streamSession, state *streamResponseState, events iter.Seq2[any, error], writeTimeout time.Duration) error {
 	type eventItem struct {
 		event any
-		err   error
+		ack   chan error
 	}
 	eventCh := make(chan eventItem)
-	done := make(chan struct{})
-	defer close(done)
+	producerDone := make(chan error, 1) // one-shot result; streamEvents owns cancellation and waits before returning
 
-	// Run iterator in goroutine so we can interleave heartbeats
 	go func() {
-		defer close(eventCh)
+		var result error
+		defer func() {
+			if rec := recover(); rec != nil {
+				state.handlerPanic = rec
+				result = NewError(CodeInternal, "internal server error")
+			}
+			producerDone <- result
+			close(eventCh)
+		}()
+
 		for event, err := range events {
+			if err != nil {
+				result = err
+				return
+			}
+			ack := make(chan error, 1)
 			select {
-			case eventCh <- eventItem{event, err}:
-			case <-done:
+			case eventCh <- eventItem{event: event, ack: ack}:
+			case <-session.ctx.Done():
+				result = session.terminalCause()
+				return
+			}
+
+			select {
+			case ackErr := <-ack:
+				if ackErr != nil {
+					result = ackErr
+					return
+				}
+			case <-session.ctx.Done():
+				result = session.terminalCause()
 				return
 			}
 		}
 	}()
 
-	// Set up heartbeat ticker if configured
+	var (
+		producerFinished bool
+		producerResult   error
+	)
+	waitForProducer := func() error {
+		if !producerFinished {
+			producerResult = <-producerDone
+			producerFinished = true
+		}
+		return producerResult
+	}
+	defer func() {
+		// Cancel the producer on every early return, including transport panics,
+		// and wait for its cleanup before releasing the request.
+		session.fail(ErrStreamClosed)
+		waitForProducer()
+	}()
+
 	var heartbeat <-chan time.Time
+	heartbeatInterval := h.effectiveHeartbeat(ctx)
 	if heartbeatInterval > 0 {
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
@@ -474,67 +679,40 @@ func (h *StreamHandler[Req, Res]) streamEvents(ctx *rpcContext, events iter.Seq2
 
 	for {
 		select {
-		case <-ctx.request.Context().Done():
-			return
+		case <-executionCtx.Done():
+			executionErr := executionCtx.Err()
+			session.fail(executionErr)
+			if ctx.request.Context().Err() != nil {
+				return session.terminalCause()
+			}
+			return executionErr
 
 		case <-heartbeat:
-			// Send SSE comment as heartbeat
-			if _, err := fmt.Fprint(ctx.writer, ": heartbeat\n\n"); err != nil {
-				if !isClientDisconnect(err) {
-					logger.Error("failed to write heartbeat",
-						slog.String("endpoint", ctx.EndpointID()),
-						slog.Any("error", err))
-				}
-				return
+			if err := state.writeFrame(ctx, writeTimeout, []byte(": heartbeat\n\n")); err != nil {
+				session.fail(err)
+				return &streamTransportError{err: err}
 			}
-			flusher.Flush()
 
 		case item, ok := <-eventCh:
 			if !ok {
-				// Iterator exhausted - stream completed normally
-				return
+				result := waitForProducer()
+				return result
 			}
 
-			if item.err != nil {
-				// Send error event and close stream
-				h.writeSSEError(ctx.writer, item.err, logger)
-				flusher.Flush()
-				return
+			frame, marshalErr := marshalSSEEventFrame(item.event)
+			if marshalErr != nil {
+				state.serializationErr = marshalErr
+				cause := session.fail(marshalErr)
+				item.ack <- cause
+				return marshalErr
 			}
 
-			// Set write deadline if configured
-			if rc != nil {
-				if deadlineErr := rc.SetWriteDeadline(time.Now().Add(writeTimeout)); deadlineErr != nil {
-					// SetWriteDeadline not supported - log once and continue without timeout
-					logger.Warn("write deadline not supported",
-						slog.String("endpoint", ctx.EndpointID()),
-						slog.Any("error", deadlineErr))
-					rc = nil // Don't try again
-				}
+			if writeErr := state.writeFrame(ctx, writeTimeout, frame); writeErr != nil {
+				cause := session.fail(writeErr)
+				item.ack <- cause
+				return &streamTransportError{err: writeErr}
 			}
-
-			// Write event
-			if writeErr := h.writeSSEEvent(ctx.writer, item.event); writeErr != nil {
-				// Distinguish client disconnect from actual errors
-				if isClientDisconnect(writeErr) {
-					logger.Debug("client disconnected during write",
-						slog.String("endpoint", ctx.EndpointID()))
-				} else {
-					logger.Error("failed to write SSE event",
-						slog.String("endpoint", ctx.EndpointID()),
-						slog.Any("error", writeErr))
-				}
-				return
-			}
-
-			// Clear write deadline after successful write to prevent spurious timeouts
-			if rc != nil {
-				rc.SetWriteDeadline(time.Time{})
-			}
-
-			// Flush sends data to client immediately
-			// Note: Flush() returns no error - failures surface on next Write()
-			flusher.Flush()
+			item.ack <- nil
 		}
 	}
 }
@@ -552,44 +730,73 @@ func isClientDisconnect(err error) bool {
 		strings.Contains(errStr, "client disconnected")
 }
 
-func (h *StreamHandler[Req, Res]) writeSSEEvent(w http.ResponseWriter, event any) error {
-	// Check if event is wrapped with an ID
-	var eventID string
-	if evt, ok := event.(sseEvent); ok {
-		eventID = evt.id
-		event = evt.event
+func validateSSEEventID(id string) error {
+	if strings.ContainsAny(id, "\r\n\x00") {
+		return fmt.Errorf("%w: ID contains CR, LF, or NUL", ErrInvalidStreamEventID)
 	}
-
-	// Wrap in response envelope for consistency with unary calls
-	envelope := response{Result: event}
-	data, err := json.Marshal(envelope)
-	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
-	}
-
-	// Write event ID if present (for reconnection support)
-	if eventID != "" {
-		if _, err := fmt.Fprintf(w, "id: %s\n", eventID); err != nil {
-			return err
-		}
-	}
-
-	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
-	return err
+	return nil
 }
 
-func (h *StreamHandler[Req, Res]) writeSSEError(w http.ResponseWriter, err error, logger *slog.Logger) {
-	svcErr := DefaultErrorTransformer(err)
+func marshalSSEEventFrame(event any) ([]byte, error) {
+	var (
+		eventID    string
+		hasEventID bool
+	)
+	if evt, ok := event.(sseEvent); ok {
+		eventID = evt.id
+		hasEventID = true
+		event = evt.event
+	}
+	if err := validateSSEEventID(eventID); err != nil {
+		return nil, err
+	}
 
-	envelope := errorResponse{Error: svcErr}
-	data, marshalErr := json.Marshal(envelope)
-	if marshalErr != nil {
-		logger.Error("failed to marshal SSE error",
-			slog.Any("original_error", err),
-			slog.Any("marshal_error", marshalErr))
+	data, err := json.Marshal(response{Result: event})
+	if err != nil {
+		return nil, fmt.Errorf("marshal event: %w", err)
+	}
+
+	var frame bytes.Buffer
+	if hasEventID {
+		fmt.Fprintf(&frame, "id: %s\n", eventID)
+	}
+	fmt.Fprintf(&frame, "data: %s\n\n", data)
+	return frame.Bytes(), nil
+}
+
+func marshalSSEErrorFrame(ctx *rpcContext, err error) []byte {
+	prepared := prepareErrorResponse(ctx.errorTransformer, ctx.maskInternalErrors, err)
+	if prepared.usedFallback {
+		h := slog.Default()
+		if ctx.logger != nil {
+			h = ctx.logger
+		}
+		h.Error("error policy failed; using internal SSE fallback",
+			slog.String("endpoint", ctx.EndpointID()),
+			slog.Any("error", prepared.fallbackErr))
+	}
+	data := prepared.data
+	data = bytes.TrimSuffix(data, []byte{'\n'})
+	frame := make([]byte, 0, len(data)+8)
+	frame = append(frame, "data: "...)
+	frame = append(frame, data...)
+	frame = append(frame, '\n', '\n')
+	return frame
+}
+
+func (h *StreamHandler[Req, Res]) logStreamFailure(ctx *rpcContext, message string, err error) {
+	logger := ctx.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if isClientDisconnect(err) {
+		logger.Debug(message,
+			slog.String("endpoint", ctx.EndpointID()))
 		return
 	}
-	fmt.Fprintf(w, "data: %s\n\n", data)
+	logger.Error(message,
+		slog.String("endpoint", ctx.EndpointID()),
+		slog.Any("error", err))
 }
 
 // StreamHandlerFunc represents the next handler in a stream interceptor chain.
@@ -621,26 +828,45 @@ type StreamHandlerFunc func(ctx context.Context, req any) iter.Seq2[any, error]
 //	}
 type StreamInterceptor func(ctx Context, req any, handler StreamHandlerFunc) iter.Seq2[any, error]
 
-// chainStreamInterceptors combines multiple stream interceptors into one.
-func chainStreamInterceptors(interceptors []StreamInterceptor) StreamInterceptor {
+func latchStreamHandlerPanic(state *streamResponseState, handler StreamHandlerFunc) StreamHandlerFunc {
+	return func(ctx context.Context, req any) iter.Seq2[any, error] {
+		defer func() {
+			if rec := recover(); rec != nil {
+				state.handlerPanic = rec
+				panic(rec)
+			}
+		}()
+
+		events := handler(ctx, req)
+		if events == nil {
+			return nil
+		}
+		return func(yield func(any, error) bool) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					state.handlerPanic = rec
+					panic(rec)
+				}
+			}()
+			events(yield)
+		}
+	}
+}
+
+// chainStreamInterceptors combines multiple stream interceptors into one and
+// latches panics at each boundary before an outer interceptor can recover them.
+func chainStreamInterceptors(interceptors []StreamInterceptor, state *streamResponseState) StreamInterceptor {
 	if len(interceptors) == 0 {
 		return nil
-	}
-	if len(interceptors) == 1 {
-		return interceptors[0]
 	}
 	return func(ctx Context, req any, handler StreamHandlerFunc) iter.Seq2[any, error] {
 		var chain StreamHandlerFunc = handler
 		for i := len(interceptors) - 1; i >= 0; i-- {
 			current := interceptors[i]
 			next := chain
-			chain = func(c context.Context, r any) iter.Seq2[any, error] {
-				tygorCtx, ok := c.(Context)
-				if !ok {
-					tygorCtx, _ = FromContext(c)
-				}
-				return current(tygorCtx, r, next)
-			}
+			chain = latchStreamHandlerPanic(state, func(c context.Context, r any) iter.Seq2[any, error] {
+				return current(contextWithMetadata(c, ctx), r, next)
+			})
 		}
 		return chain(ctx, req)
 	}
