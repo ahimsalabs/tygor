@@ -261,7 +261,7 @@ func TestTypeScriptGenerator_Generate_Primitives(t *testing.T) {
 		{"uint", ir.Uint(0), "number /* uint */"},
 		{"float32", ir.Float(32), "number /* float32 */"},
 		{"float64", ir.Float(64), "number /* float64 */"},
-		{"bytes", ir.Bytes(), "string /* base64 */"},
+		{"bytes", ir.Bytes(), "string /* base64 */ | null"},
 		{"time", ir.Time(), "string /* RFC3339 */"},
 		{"duration", ir.Duration(), "number /* nanoseconds */"},
 		{"any", ir.Any(), "unknown"},
@@ -625,7 +625,7 @@ func TestTypeScriptGenerator_Generate_Manifest(t *testing.T) {
 		"res: types.User;",
 		`"Users.List": {`,
 		"req: Record<string, never>;",
-		"res: types.User[];",
+		"res: (types.User[] | null);",
 	}
 
 	for _, want := range wants {
@@ -767,12 +767,12 @@ func TestTypeScriptGenerator_Generate_FixedArray(t *testing.T) {
 		{
 			name:   "small fixed array as tuple",
 			length: 3,
-			want:   "items: [string, string, string] | null;",
+			want:   "items: [string, string, string];",
 		},
 		{
 			name:   "large fixed array",
 			length: 20,
-			want:   "items: string[] | null;",
+			want:   "items: string[];",
 		},
 	}
 
@@ -919,7 +919,7 @@ func TestTypeScriptGenerator_Generate_MultiFile(t *testing.T) {
 
 	// Check v1 file
 	v1File := string(memSink.Get("types_example_com_api_v1.ts"))
-	if !strings.Contains(v1File, "export interface User {") {
+	if !strings.Contains(v1File, "export interface example_com_api_v1_User {") {
 		t.Errorf("v1 file should contain User interface, got:\n%s", v1File)
 	}
 	if strings.Contains(v1File, "email") {
@@ -928,7 +928,7 @@ func TestTypeScriptGenerator_Generate_MultiFile(t *testing.T) {
 
 	// Check v2 file
 	v2File := string(memSink.Get("types_example_com_api_v2.ts"))
-	if !strings.Contains(v2File, "export interface User {") {
+	if !strings.Contains(v2File, "export interface example_com_api_v2_User {") {
 		t.Errorf("v2 file should contain User interface, got:\n%s", v2File)
 	}
 	if !strings.Contains(v2File, "email") {

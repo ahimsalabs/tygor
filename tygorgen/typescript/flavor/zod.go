@@ -3,6 +3,7 @@ package flavor
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"tygor.dev/tygorgen/ir"
@@ -39,6 +40,9 @@ func (f *ZodFlavor) EmitPreamble(ctx *EmitContext) []byte {
 	} else {
 		buf.WriteString("import { z } from 'zod';\n\n")
 	}
+	if ctx.EmitTypes && (len(ctx.RecursiveTypes) > 0 || schemaHasConstrainedGenerics(ctx.Schema)) {
+		buf.WriteString("import type * as types from './types';\n\n")
+	}
 	return buf.Bytes()
 }
 
@@ -55,11 +59,60 @@ func (f *ZodFlavor) EmitType(ctx *EmitContext, typ ir.TypeDescriptor) ([]byte, e
 	}
 }
 
+// ZodSchemaExpression emits a standalone schema expression for an endpoint or
+// other container position. Named schemas are resolved through ctx.SchemaPrefix.
+func ZodSchemaExpression(ctx *EmitContext, typ ir.TypeDescriptor, mini bool) (string, error) {
+	f := &ZodFlavor{mini: mini}
+	return f.typeToZod(ctx, typ, false)
+}
+
 func (f *ZodFlavor) emitStruct(ctx *EmitContext, s *ir.StructDescriptor) ([]byte, error) {
 	var buf bytes.Buffer
-	schemaName := s.Name.Name + "Schema"
+	typeName := ctx.TypeName(s.Name)
+	schemaName := ctx.SchemaName(s.Name)
+	if declaration := ctx.TypeDeclarations[s.Name]; declaration != "" {
+		buf.WriteString(declaration)
+		buf.WriteString("\n")
+	}
 
-	buf.WriteString(fmt.Sprintf("export const %s = z.object({\n", schemaName))
+	generic := len(s.TypeParameters) > 0
+	returnType := f.genericSchemaReturnType(ctx, s.Name, s.TypeParameters, "output")
+	inputType := f.genericSchemaReturnType(ctx, s.Name, s.TypeParameters, "input")
+	extendedSchemas := make([]string, len(s.Extends))
+	for i, extended := range s.Extends {
+		var err error
+		extendedSchemas[i], err = f.typeToZod(ctx, ir.Ref(extended.Name, extended.Package), false)
+		if err != nil {
+			return nil, fmt.Errorf("embedded type %s: %w", extended.Name, err)
+		}
+	}
+	if generic {
+		schemaParams, err := f.schemaTypeParameters(ctx, s.TypeParameters)
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteString("export function ")
+		buf.WriteString(schemaName)
+		buf.WriteString(schemaParams)
+		if ctx.RecursiveTypes[s.Name] {
+			buf.WriteString(": ")
+			buf.WriteString(f.zodTypeName())
+			buf.WriteString("<")
+			buf.WriteString(returnType)
+			buf.WriteString(", ")
+			buf.WriteString(inputType)
+			buf.WriteString(">")
+		}
+		buf.WriteString(" {\n  const schema = ")
+	} else {
+		buf.WriteString(fmt.Sprintf("export const %s = ", schemaName))
+	}
+	for _, extendedSchema := range extendedSchemas {
+		buf.WriteString("z.intersection(")
+		buf.WriteString(extendedSchema)
+		buf.WriteString(", ")
+	}
+	buf.WriteString("z.object({\n")
 
 	for _, field := range s.Fields {
 		if field.Skip {
@@ -72,7 +125,14 @@ func (f *ZodFlavor) emitStruct(ctx *EmitContext, s *ir.StructDescriptor) ([]byte
 		}
 
 		buf.WriteString(ctx.IndentStr)
-		buf.WriteString(field.JSONName)
+		if generic {
+			buf.WriteString(ctx.IndentStr)
+		}
+		jsonName := field.JSONName
+		if jsonName == "" {
+			jsonName = field.Name
+		}
+		buf.WriteString(strconv.Quote(jsonName))
 		buf.WriteString(": ")
 		buf.WriteString(result.schema)
 		buf.WriteString(",")
@@ -83,11 +143,27 @@ func (f *ZodFlavor) emitStruct(ctx *EmitContext, s *ir.StructDescriptor) ([]byte
 		buf.WriteString("\n")
 	}
 
-	buf.WriteString("});\n")
+	buf.WriteString("})")
+	buf.WriteString(strings.Repeat(")", len(extendedSchemas)))
+	if generic {
+		buf.WriteString(";\n  return schema")
+		if ctx.RecursiveTypes[s.Name] {
+			buf.WriteString(" as unknown as ")
+			buf.WriteString(f.zodTypeName())
+			buf.WriteString("<")
+			buf.WriteString(returnType)
+			buf.WriteString(", ")
+			buf.WriteString(inputType)
+			buf.WriteString(">")
+		}
+		buf.WriteString(";\n}\n")
+	} else {
+		buf.WriteString(";\n")
+	}
 
 	// Export inferred type when base types.ts is not being generated
-	if !ctx.EmitTypes {
-		buf.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n", s.Name.Name, schemaName))
+	if !ctx.EmitTypes && ctx.TypeDeclarations[s.Name] == "" {
+		buf.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n", typeName, schemaName))
 	}
 	buf.WriteString("\n")
 
@@ -101,22 +177,15 @@ type fieldSchemaResult struct {
 }
 
 func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, typeName string) (fieldSchemaResult, error) {
-	// Check for oneof first - it replaces the base type with z.enum
 	rules := ParseValidateTag(field.ValidateTag)
-	if values := HasOneOf(rules); values != nil {
-		quoted := make([]string, len(values))
-		for i, v := range values {
-			quoted[i] = fmt.Sprintf("%q", v)
-		}
-		schema := fmt.Sprintf("z.enum([%s])", strings.Join(quoted, ", "))
-		if field.Optional {
-			if f.mini {
-				schema = fmt.Sprintf("z.optional(%s)", schema)
-			} else {
-				schema += ".optional()"
-			}
-		}
-		return fieldSchemaResult{schema: schema}, nil
+	outerRules, nestedRules, hasDive := splitDiveRules(rules)
+	if hasDive {
+		rules = outerRules
+	}
+	var err error
+	rules, err = canonicalizeValidationRules(ctx, rules, field.Type, f.mini)
+	if err != nil {
+		return fieldSchemaResult{}, err
 	}
 
 	// Get base schema from type, tracking nullability separately
@@ -125,21 +194,52 @@ func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, 
 	if err != nil {
 		return fieldSchemaResult{}, err
 	}
+	if hasDive {
+		array, ok := resolveValidationType(ctx, field.Type).(*ir.ArrayDescriptor)
+		if !ok {
+			if allSkippableNestedValidators(nestedRules) {
+				hasDive = false
+			} else {
+				return fieldSchemaResult{}, fmt.Errorf("validator composition %q is only supported on arrays and slices", "dive")
+			}
+		}
+		if hasDive {
+			nested, err := f.emitFieldSchema(ctx, ir.FieldDescriptor{
+				Name:        field.Name + "Element",
+				Type:        array.Element,
+				ValidateTag: formatValidateRules(nestedRules),
+			}, typeName)
+			if err != nil {
+				return fieldSchemaResult{}, err
+			}
+			baseSchema = f.arraySchema(array, nested.schema)
+		}
+	}
+	if hasValidationRule(rules, "required") {
+		isNullable = false
+	}
 
 	// Get type hint for the underlying type
 	typeHint := f.typeHint(field.Type, field.StringEncoded)
 
 	// Determine type kind for validation semantics
-	isString := f.isPrimitiveString(field.Type)
-	typeKind := f.getTypeKind(field.Type)
+	isPointer := validationTypeStartsWithPointer(ctx, field.Type)
+	isString := f.isPrimitiveString(ctx, field.Type) && !isPointer
+	typeKind := f.getTypeKind(ctx, field.Type)
+	if isPointer {
+		rules = withoutValidationRule(rules, "required")
+	}
 
 	var schema string
 	if f.mini {
 		// Zod-mini: use .check() for validations, functional wrapping for optional/nullable
-		schema = f.emitFieldSchemaMini(ctx, baseSchema, rules, typeKind, isNullable, field.Optional, typeName, field.Name)
+		schema, err = f.emitFieldSchemaMini(ctx, baseSchema, rules, typeKind, isNullable, field.Optional, typeName, field.Name, field.Type, field.StringEncoded)
 	} else {
 		// Regular Zod: use method chaining
-		schema = f.emitFieldSchemaRegular(ctx, baseSchema, rules, isString, isNullable, field.Optional, typeName, field.Name)
+		schema, err = f.emitFieldSchemaRegular(ctx, baseSchema, rules, isString, isNullable, field.Optional, typeName, field.Name, field.Type, field.StringEncoded)
+	}
+	if err != nil {
+		return fieldSchemaResult{}, err
 	}
 
 	// Build comment from type hint and validate tag
@@ -148,10 +248,133 @@ func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, 
 	return fieldSchemaResult{schema: schema, comment: comment}, nil
 }
 
+func allSkippableNestedValidators(rules []ValidateRule) bool {
+	for _, rule := range rules {
+		if !isSkippableNestedValidator(rule.Name) {
+			return false
+		}
+	}
+	return true
+}
+
+func splitDiveRules(rules []ValidateRule) (outer, nested []ValidateRule, found bool) {
+	for i, rule := range rules {
+		if rule.Name == "dive" {
+			return rules[:i], rules[i+1:], true
+		}
+	}
+	return rules, nil, false
+}
+
+func formatValidateRules(rules []ValidateRule) string {
+	parts := make([]string, len(rules))
+	for i, rule := range rules {
+		parts[i] = rule.Name
+		if rule.Param != "" {
+			parts[i] += "=" + rule.Param
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+func hasValidationRule(rules []ValidateRule, name string) bool {
+	for _, rule := range rules {
+		if rule.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutValidationRule(rules []ValidateRule, name string) []ValidateRule {
+	result := make([]ValidateRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Name != name {
+			result = append(result, rule)
+		}
+	}
+	return result
+}
+
+func validationTypeStartsWithPointer(ctx *EmitContext, typ ir.TypeDescriptor) bool {
+	seen := make(map[ir.GoIdentifier]bool)
+	for {
+		switch typed := typ.(type) {
+		case *ir.PtrDescriptor:
+			return true
+		case *ir.ReferenceDescriptor:
+			if len(typed.TypeArguments) > 0 || ctx == nil || ctx.Schema == nil || seen[typed.Target] {
+				return false
+			}
+			seen[typed.Target] = true
+			alias, ok := ctx.Schema.FindType(typed.Target).(*ir.AliasDescriptor)
+			if !ok {
+				return false
+			}
+			typ = alias.Underlying
+		default:
+			return false
+		}
+	}
+}
+
+func (f *ZodFlavor) arraySchema(array *ir.ArrayDescriptor, element string) string {
+	if array.IsSlice() {
+		return fmt.Sprintf("z.array(%s)", element)
+	}
+	if array.Length <= 10 {
+		items := make([]string, array.Length)
+		for i := range items {
+			items[i] = element
+		}
+		return fmt.Sprintf("z.tuple([%s])", strings.Join(items, ", "))
+	}
+	if f.mini {
+		return fmt.Sprintf("z.array(%s).check(z.length(%d))", element, array.Length)
+	}
+	return fmt.Sprintf("z.array(%s).length(%d)", element, array.Length)
+}
+
 // emitFieldSchemaRegular generates schema using regular Zod method chaining.
-func (f *ZodFlavor) emitFieldSchemaRegular(ctx *EmitContext, baseSchema string, rules []ValidateRule, isString, isNullable, isOptional bool, typeName, fieldName string) string {
+func (f *ZodFlavor) emitFieldSchemaRegular(ctx *EmitContext, baseSchema string, rules []ValidateRule, isString, isNullable, isOptional bool, typeName, fieldName string, typ ir.TypeDescriptor, stringEncoded bool) (string, error) {
 	var validations strings.Builder
 	for _, rule := range rules {
+		if method, support, handled := f.stringEncodedStringValidation(ctx, rule, typ, stringEncoded); handled {
+			if support == ZodUnsupported {
+				ctx.AddWarning("%s.%s: unsupported validator %q has no Zod equivalent", typeName, fieldName, rule.Name)
+			}
+			validations.WriteString(method)
+			continue
+		}
+		if method, handled := lengthValidation(ctx, rule, typ, false); handled {
+			validations.WriteString(method)
+			continue
+		}
+		if rule.Name == "oneof" {
+			method, err := f.oneOfValidation(ctx, rule, typ, stringEncoded)
+			if err != nil {
+				return "", err
+			}
+			validations.WriteString(method)
+			continue
+		}
+		if stringEncoded {
+			if method, handled := f.stringEncodedValidation(ctx, rule, typ); handled {
+				validations.WriteString(method)
+				continue
+			}
+		}
+		if method, handled := numericLenValidation(ctx, rule, typ, false); handled {
+			validations.WriteString(method)
+			continue
+		}
+		if method, support, handled := f.namedEnumValidation(ctx, rule, typ, false); handled {
+			if support == ZodUnsupported {
+				ctx.AddWarning("%s.%s: unsupported validator %q has no Zod equivalent", typeName, fieldName, rule.Name)
+			}
+			validations.WriteString(method)
+			continue
+		}
 		method, support := rule.ZodMethodWithSupport(isString)
 		if support == ZodUnsupported {
 			ctx.AddWarning("%s.%s: unsupported validator %q has no Zod equivalent",
@@ -174,14 +397,54 @@ func (f *ZodFlavor) emitFieldSchemaRegular(ctx *EmitContext, baseSchema string, 
 		schema += ".optional()"
 	}
 
-	return schema
+	return schema, nil
 }
 
 // emitFieldSchemaMini generates schema using zod-mini functional API.
-func (f *ZodFlavor) emitFieldSchemaMini(ctx *EmitContext, baseSchema string, rules []ValidateRule, typeKind ZodMiniTypeKind, isNullable, isOptional bool, typeName, fieldName string) string {
+func (f *ZodFlavor) emitFieldSchemaMini(ctx *EmitContext, baseSchema string, rules []ValidateRule, typeKind ZodMiniTypeKind, isNullable, isOptional bool, typeName, fieldName string, typ ir.TypeDescriptor, stringEncoded bool) (string, error) {
 	// Collect all checks
 	var checks []string
 	for _, rule := range rules {
+		if check, support, handled := f.stringEncodedStringValidation(ctx, rule, typ, stringEncoded); handled {
+			if support == ZodUnsupported {
+				ctx.AddWarning("%s.%s: unsupported validator %q has no Zod equivalent", typeName, fieldName, rule.Name)
+			}
+			if check != "" {
+				checks = append(checks, check)
+			}
+			continue
+		}
+		if check, handled := lengthValidation(ctx, rule, typ, true); handled {
+			checks = append(checks, check)
+			continue
+		}
+		if rule.Name == "oneof" {
+			check, err := f.oneOfValidation(ctx, rule, typ, stringEncoded)
+			if err != nil {
+				return "", err
+			}
+			checks = append(checks, check)
+			continue
+		}
+		if stringEncoded {
+			if check, handled := f.stringEncodedValidation(ctx, rule, typ); handled {
+				checks = append(checks, check)
+				continue
+			}
+		}
+		if check, handled := numericLenValidation(ctx, rule, typ, true); handled {
+			checks = append(checks, check)
+			continue
+		}
+		if check, support, handled := f.namedEnumValidation(ctx, rule, typ, true); handled {
+			if support == ZodUnsupported {
+				ctx.AddWarning("%s.%s: unsupported validator %q has no Zod equivalent", typeName, fieldName, rule.Name)
+			}
+			if check != "" {
+				checks = append(checks, check)
+			}
+			continue
+		}
 		check, support := rule.ZodMiniCheck(typeKind)
 		if support == ZodUnsupported {
 			ctx.AddWarning("%s.%s: unsupported validator %q has no Zod equivalent",
@@ -209,19 +472,41 @@ func (f *ZodFlavor) emitFieldSchemaMini(ctx *EmitContext, baseSchema string, rul
 		schema = fmt.Sprintf("z.optional(%s)", schema)
 	}
 
-	return schema
+	return schema, nil
+}
+
+func (f *ZodFlavor) namedEnumValidation(ctx *EmitContext, rule ValidateRule, typ ir.TypeDescriptor, mini bool) (string, ZodSupport, bool) {
+	if resolveValidationEnum(ctx, typ) == nil {
+		return "", ZodSkipped, false
+	}
+	primitive, ok := resolveValidationType(ctx, typ).(*ir.PrimitiveDescriptor)
+	if !ok {
+		return "", ZodUnsupported, true
+	}
+
+	base := f.primitiveToZod(primitive, false)
+	if mini {
+		check, support := rule.ZodMiniCheck(f.getTypeKind(ctx, typ))
+		if check == "" || strings.HasPrefix(check, "__ENUM__") {
+			return "", support, true
+		}
+		predicate := fmt.Sprintf("v => %s.check(%s).safeParse(v).success", base, check)
+		return "z.refine(" + predicate + ")", support, true
+	}
+
+	isString := primitive.PrimitiveKind == ir.PrimitiveString || primitive.PrimitiveKind == ir.PrimitiveBytes
+	method, support := rule.ZodMethodWithSupport(isString)
+	if method == "" || strings.HasPrefix(method, "__ENUM__") {
+		return "", support, true
+	}
+	predicate := fmt.Sprintf("v => %s%s.safeParse(v).success", base, method)
+	return ".refine(" + predicate + ")", support, true
 }
 
 // getTypeKind returns the ZodMiniTypeKind for a type descriptor.
-func (f *ZodFlavor) getTypeKind(typ ir.TypeDescriptor) ZodMiniTypeKind {
+func (f *ZodFlavor) getTypeKind(ctx *EmitContext, typ ir.TypeDescriptor) ZodMiniTypeKind {
 	// Unwrap pointers
-	for {
-		if ptr, ok := typ.(*ir.PtrDescriptor); ok {
-			typ = ptr.Element
-		} else {
-			break
-		}
-	}
+	typ = resolveValidationType(ctx, typ)
 
 	switch t := typ.(type) {
 	case *ir.PrimitiveDescriptor:
@@ -229,11 +514,124 @@ func (f *ZodFlavor) getTypeKind(typ ir.TypeDescriptor) ZodMiniTypeKind {
 			return ZodMiniTypeString
 		}
 		return ZodMiniTypeNumber
-	case *ir.ArrayDescriptor:
+	case *ir.ArrayDescriptor, *ir.MapDescriptor:
 		return ZodMiniTypeArray
 	default:
 		return ZodMiniTypeNumber
 	}
+}
+
+func lengthValidation(ctx *EmitContext, rule ValidateRule, typ ir.TypeDescriptor, mini bool) (string, bool) {
+	base := resolveValidationType(ctx, typ)
+	var length string
+	switch typed := base.(type) {
+	case *ir.PrimitiveDescriptor:
+		if typed.PrimitiveKind != ir.PrimitiveString && typed.PrimitiveKind != ir.PrimitiveBytes {
+			return "", false
+		}
+		if rule.Name != "gt" && rule.Name != "gte" && rule.Name != "lt" && rule.Name != "lte" {
+			return "", false
+		}
+		length = "Array.from(v).length"
+	case *ir.ArrayDescriptor:
+		if typed.IsSlice() && (rule.Name == "min" || rule.Name == "max" || rule.Name == "len") {
+			return "", false
+		}
+		length = "v.length"
+	case *ir.MapDescriptor:
+		length = "Object.keys(v).length"
+	default:
+		return "", false
+	}
+
+	operator := map[string]string{
+		"min": ">=", "gte": ">=", "gt": ">", "max": "<=", "lte": "<=", "lt": "<", "len": "===", "eq": "===", "ne": "!==",
+	}[rule.Name]
+	if operator == "" || rule.Param == "" {
+		return "", false
+	}
+	predicate := fmt.Sprintf("v => %s %s %s", length, operator, rule.Param)
+	if mini {
+		return "z.refine(" + predicate + ")", true
+	}
+	return ".refine(" + predicate + ")", true
+}
+
+func numericLenValidation(ctx *EmitContext, rule ValidateRule, typ ir.TypeDescriptor, mini bool) (string, bool) {
+	if rule.Name != "len" || rule.Param == "" {
+		return "", false
+	}
+	primitive, ok := resolveValidationType(ctx, typ).(*ir.PrimitiveDescriptor)
+	if !ok {
+		return "", false
+	}
+	switch primitive.PrimitiveKind {
+	case ir.PrimitiveInt, ir.PrimitiveUint, ir.PrimitiveFloat, ir.PrimitiveDuration:
+		predicate := fmt.Sprintf("v => v === %s", rule.Param)
+		if mini {
+			return "z.refine(" + predicate + ")", true
+		}
+		return ".refine(" + predicate + ")", true
+	default:
+		return "", false
+	}
+}
+
+func (f *ZodFlavor) stringEncodedStringValidation(ctx *EmitContext, rule ValidateRule, typ ir.TypeDescriptor, stringEncoded bool) (string, ZodSupport, bool) {
+	if !stringEncoded {
+		return "", ZodSkipped, false
+	}
+	primitive, ok := resolveValidationType(ctx, typ).(*ir.PrimitiveDescriptor)
+	if !ok || primitive.PrimitiveKind != ir.PrimitiveString {
+		return "", ZodSkipped, false
+	}
+
+	var schema string
+	var support ZodSupport
+	if check, handled := lengthValidation(ctx, rule, typ, f.mini); handled {
+		if f.mini {
+			schema = "z.string().check(" + check + ")"
+		} else {
+			schema = "z.string()" + check
+		}
+		support = ZodSupported
+	} else if rule.Name == "oneof" {
+		values := parseOneOfValues(rule.Param)
+		if len(values) == 0 {
+			return "", ZodUnsupported, true
+		}
+		quoted := make([]string, len(values))
+		for i, value := range values {
+			quoted[i] = strconv.Quote(value)
+		}
+		predicate := fmt.Sprintf("v => [%s].includes(v)", strings.Join(quoted, ", "))
+		if f.mini {
+			schema = "z.string().check(z.refine(" + predicate + "))"
+		} else {
+			schema = "z.string().refine(" + predicate + ")"
+		}
+		support = ZodSupported
+	} else if f.mini {
+		check, currentSupport := rule.ZodMiniCheck(ZodMiniTypeString)
+		support = currentSupport
+		if check != "" {
+			schema = "z.string().check(" + check + ")"
+		}
+	} else {
+		method, currentSupport := rule.ZodMethodWithSupport(true)
+		support = currentSupport
+		if method != "" && !strings.HasPrefix(method, "__ENUM__") {
+			schema = "z.string()" + method
+		}
+	}
+	if schema == "" {
+		return "", support, true
+	}
+	predicate := fmt.Sprintf("v => { try { return %s.safeParse(JSON.parse(v)).success; } catch { return false; } }", schema)
+	if f.mini {
+		return "z.refine(" + predicate + ")", support, true
+	}
+	return ".refine(" + predicate + ")", support, true
 }
 
 // typeHint returns the Go type name for types worth documenting.
@@ -313,18 +711,57 @@ func (f *ZodFlavor) buildFieldComment(typeHint, validateTag string) string {
 // typeToZodWithNullable returns the Zod schema and whether it's nullable.
 // This allows callers to apply validations before .nullable().
 func (f *ZodFlavor) typeToZodWithNullable(ctx *EmitContext, typ ir.TypeDescriptor, stringEncoded bool) (string, bool, error) {
-	if ptr, ok := typ.(*ir.PtrDescriptor); ok {
-		inner, err := f.typeToZod(ctx, ptr.Element, stringEncoded)
-		if err != nil {
-			return "", false, err
+	nullable := false
+	seen := make(map[ir.GoIdentifier]bool)
+	for {
+		switch t := typ.(type) {
+		case *ir.PtrDescriptor:
+			nullable = true
+			typ = t.Element
+		case *ir.ReferenceDescriptor:
+			if len(t.TypeArguments) > 0 || ctx == nil || ctx.Schema == nil || ctx.SchemaPrefix != "" || ctx.RecursiveTypes[t.Target] || seen[t.Target] {
+				goto resolved
+			}
+			alias, ok := ctx.Schema.FindType(t.Target).(*ir.AliasDescriptor)
+			if !ok {
+				goto resolved
+			}
+			seen[t.Target] = true
+			typ = alias.Underlying
+		default:
+			goto resolved
 		}
-		return inner, true, nil
 	}
-	schema, err := f.typeToZod(ctx, typ, stringEncoded)
-	return schema, false, err
+
+resolved:
+	if array, ok := typ.(*ir.ArrayDescriptor); ok && array.IsSlice() {
+		inner, err := f.typeToZodBase(ctx, array, stringEncoded)
+		return inner, true, err
+	}
+	if _, ok := typ.(*ir.MapDescriptor); ok {
+		inner, err := f.typeToZodBase(ctx, typ, stringEncoded)
+		return inner, true, err
+	}
+	if primitive, ok := typ.(*ir.PrimitiveDescriptor); ok && primitive.PrimitiveKind == ir.PrimitiveBytes {
+		inner, err := f.typeToZodBase(ctx, typ, stringEncoded)
+		return inner, true, err
+	}
+	schema, err := f.typeToZodBase(ctx, typ, stringEncoded)
+	return schema, nullable, err
 }
 
 func (f *ZodFlavor) typeToZod(ctx *EmitContext, typ ir.TypeDescriptor, stringEncoded bool) (string, error) {
+	schema, nullable, err := f.typeToZodWithNullable(ctx, typ, stringEncoded)
+	if err != nil || !nullable {
+		return schema, err
+	}
+	if f.mini {
+		return fmt.Sprintf("z.nullable(%s)", schema), nil
+	}
+	return schema + ".nullable()", nil
+}
+
+func (f *ZodFlavor) typeToZodBase(ctx *EmitContext, typ ir.TypeDescriptor, stringEncoded bool) (string, error) {
 	switch t := typ.(type) {
 	case *ir.PrimitiveDescriptor:
 		return f.primitiveToZod(t, stringEncoded), nil
@@ -335,11 +772,11 @@ func (f *ZodFlavor) typeToZod(ctx *EmitContext, typ ir.TypeDescriptor, stringEnc
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("z.array(%s)", elem), nil
+		return f.arraySchema(t, elem), nil
 
 	case *ir.MapDescriptor:
-		// StringEncoded doesn't apply to map keys/values
-		key, err := f.typeToZod(ctx, t.Key, false)
+		// JSON object keys are strings even when the Go map key is numeric.
+		key, err := f.mapKeyToZod(ctx, t.Key)
 		if err != nil {
 			return "", err
 		}
@@ -350,17 +787,33 @@ func (f *ZodFlavor) typeToZod(ctx *EmitContext, typ ir.TypeDescriptor, stringEnc
 		return fmt.Sprintf("z.record(%s, %s)", key, value), nil
 
 	case *ir.ReferenceDescriptor:
-		return t.Target.Name + "Schema", nil
-
-	case *ir.PtrDescriptor:
-		elem, err := f.typeToZod(ctx, t.Element, stringEncoded)
-		if err != nil {
-			return "", err
+		if stringEncoded {
+			switch underlying := resolveNamedWireType(ctx, t.Target).(type) {
+			case *ir.PrimitiveDescriptor:
+				return f.typeToZodBase(ctx, underlying, true)
+			case *ir.EnumDescriptor:
+				return f.stringEncodedEnumSchema(underlying)
+			}
 		}
-		if f.mini {
-			return fmt.Sprintf("z.nullable(%s)", elem), nil
+		schema := ctx.SchemaName(t.Target)
+		if len(t.TypeArguments) > 0 {
+			args := make([]string, len(t.TypeArguments))
+			for i, arg := range t.TypeArguments {
+				var err error
+				args[i], err = f.typeToZod(ctx, arg, false)
+				if err != nil {
+					return "", err
+				}
+			}
+			schema += "(" + strings.Join(args, ", ") + ")"
 		}
-		return elem + ".nullable()", nil
+		if ctx.RecursiveTypes[t.Target] {
+			if len(t.TypeArguments) > 0 {
+				return "z.lazy(() => " + schema + ")", nil
+			}
+			return f.lazyReference(ctx, t.Target, schema), nil
+		}
+		return schema, nil
 
 	case *ir.UnionDescriptor:
 		if len(t.Types) == 1 {
@@ -377,12 +830,346 @@ func (f *ZodFlavor) typeToZod(ctx *EmitContext, typ ir.TypeDescriptor, stringEnc
 		return fmt.Sprintf("z.union([%s])", strings.Join(parts, ", ")), nil
 
 	case *ir.TypeParameterDescriptor:
-		// Generic type parameter - use unknown
-		return "z.unknown()", nil
+		return t.ParamName + "Schema", nil
 
 	default:
 		return "z.unknown()", nil
 	}
+}
+
+func (f *ZodFlavor) zodTypeName() string {
+	if f.mini {
+		return "z.ZodMiniType"
+	}
+	return "z.ZodType"
+}
+
+func (f *ZodFlavor) schemaTypeParameters(ctx *EmitContext, params []ir.TypeParameterDescriptor) (string, error) {
+	parts := make([]string, len(params))
+	for i, param := range params {
+		schemaConstraint := f.zodTypeName()
+		if param.Constraint != nil {
+			if ctx.TypeExpressionWithTypeParameters == nil {
+				return "", fmt.Errorf("emit schema constraint for %s: type-parameter expression emission is not configured", param.ParamName)
+			}
+			outputConstraint, err := ctx.TypeExpressionWithTypeParameters(param.Constraint, func(name string) string {
+				return "z.output<" + name + "Schema>"
+			})
+			if err != nil {
+				return "", fmt.Errorf("emit output schema constraint for %s: %w", param.ParamName, err)
+			}
+			inputConstraint, err := ctx.TypeExpressionWithTypeParameters(param.Constraint, func(name string) string {
+				return "z.input<" + name + "Schema>"
+			})
+			if err != nil {
+				return "", fmt.Errorf("emit input schema constraint for %s: %w", param.ParamName, err)
+			}
+			schemaConstraint += "<" + outputConstraint + ", " + inputConstraint + ">"
+		}
+		parts[i] = param.ParamName + "Schema extends " + schemaConstraint
+	}
+	arguments := make([]string, len(params))
+	for i, param := range params {
+		arguments[i] = param.ParamName + "Schema: " + param.ParamName + "Schema"
+	}
+	return "<" + strings.Join(parts, ", ") + ">(" + strings.Join(arguments, ", ") + ")", nil
+}
+
+func schemaHasConstrainedGenerics(schema *ir.Schema) bool {
+	if schema == nil {
+		return false
+	}
+	for _, typ := range schema.Types {
+		var params []ir.TypeParameterDescriptor
+		switch t := typ.(type) {
+		case *ir.StructDescriptor:
+			params = t.TypeParameters
+		case *ir.AliasDescriptor:
+			params = t.TypeParameters
+		}
+		for _, param := range params {
+			if param.Constraint != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (f *ZodFlavor) genericSchemaReturnType(ctx *EmitContext, id ir.GoIdentifier, params []ir.TypeParameterDescriptor, direction string) string {
+	args := make([]string, len(params))
+	for i, param := range params {
+		args[i] = fmt.Sprintf("z.%s<%sSchema>", direction, param.ParamName)
+	}
+	return ctx.DataTypeName(id) + "<" + strings.Join(args, ", ") + ">"
+}
+
+func (f *ZodFlavor) lazyReference(ctx *EmitContext, id ir.GoIdentifier, schema string) string {
+	return fmt.Sprintf("z.lazy((): %s<%s> => %s)", f.zodTypeName(), ctx.DataTypeName(id), schema)
+}
+
+func (f *ZodFlavor) mapKeyToZod(ctx *EmitContext, typ ir.TypeDescriptor) (string, error) {
+	for {
+		ptr, ok := typ.(*ir.PtrDescriptor)
+		if !ok {
+			break
+		}
+		typ = ptr.Element
+	}
+	if ref, ok := typ.(*ir.ReferenceDescriptor); ok {
+		if ctx != nil && ctx.Schema != nil {
+			target := ctx.Schema.FindType(ref.Target)
+			if alias, ok := target.(*ir.AliasDescriptor); ok {
+				return f.mapKeyToZod(ctx, alias.Underlying)
+			}
+			if enum, ok := target.(*ir.EnumDescriptor); ok && integerEnum(enum) {
+				return f.integerMapKeySchema(), nil
+			}
+		}
+		return "z.string()", nil
+	}
+	primitive, ok := typ.(*ir.PrimitiveDescriptor)
+	if !ok {
+		return "z.string()", nil
+	}
+	switch primitive.PrimitiveKind {
+	case ir.PrimitiveInt:
+		return f.integerStringSchema(primitive, false, true), nil
+	case ir.PrimitiveUint:
+		return f.integerStringSchema(primitive, true, true), nil
+	default:
+		return "z.string()", nil
+	}
+}
+
+func integerEnum(enum *ir.EnumDescriptor) bool {
+	if enum == nil || len(enum.Members) == 0 {
+		return false
+	}
+	for _, member := range enum.Members {
+		if _, ok := member.Value.(int64); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *ZodFlavor) integerMapKeySchema() string {
+	const pattern = `[+-]?[0-9]+$(?![\s\S])`
+	if f.mini {
+		return fmt.Sprintf("z.string().check(z.regex(/^(?:%s)/))", pattern)
+	}
+	return fmt.Sprintf("z.string().regex(/^(?:%s)/)", pattern)
+}
+
+func resolveNamedWireType(ctx *EmitContext, id ir.GoIdentifier) ir.TypeDescriptor {
+	if ctx == nil || ctx.Schema == nil {
+		return nil
+	}
+	seen := make(map[ir.GoIdentifier]bool)
+	typ := ctx.Schema.FindType(id)
+	for {
+		switch t := typ.(type) {
+		case *ir.ReferenceDescriptor:
+			if seen[t.Target] {
+				return nil
+			}
+			seen[t.Target] = true
+			typ = ctx.Schema.FindType(t.Target)
+		case *ir.AliasDescriptor:
+			typ = t.Underlying
+		default:
+			return typ
+		}
+	}
+}
+
+func (f *ZodFlavor) stringEncodedEnumSchema(enum *ir.EnumDescriptor) (string, error) {
+	if len(enum.Members) == 0 {
+		return "z.never()", nil
+	}
+	refine := func(base, predicate string) string {
+		if f.mini {
+			return base + ".check(z.refine(" + predicate + "))"
+		}
+		return base + ".refine(" + predicate + ")"
+	}
+
+	switch enum.Members[0].Value.(type) {
+	case string:
+		values := make([]string, len(enum.Members))
+		for i, member := range enum.Members {
+			value, ok := member.Value.(string)
+			if !ok {
+				return "", fmt.Errorf("enum %s has mixed wire value types", enum.Name.Name)
+			}
+			values[i] = strconv.Quote(value)
+		}
+		predicate := fmt.Sprintf(`v => { try { return [%s].includes(JSON.parse(v)); } catch { return false; } }`, strings.Join(values, ", "))
+		return refine("z.string()", predicate), nil
+	case int64:
+		values := make([]string, len(enum.Members))
+		for i, member := range enum.Members {
+			value, ok := member.Value.(int64)
+			if !ok {
+				return "", fmt.Errorf("enum %s has mixed wire value types", enum.Name.Name)
+			}
+			values[i] = strconv.Quote(strconv.FormatInt(value, 10))
+		}
+		base := f.integerStringSchema(ir.Int(64), false, false)
+		return refine(base, fmt.Sprintf(`v => { try { return [%s].includes(BigInt(v).toString()); } catch { return false; } }`, strings.Join(values, ", "))), nil
+	case float64:
+		values := make([]string, len(enum.Members))
+		for i, member := range enum.Members {
+			value, ok := member.Value.(float64)
+			if !ok {
+				return "", fmt.Errorf("enum %s has mixed wire value types", enum.Name.Name)
+			}
+			values[i] = strconv.FormatFloat(value, 'g', -1, 64)
+		}
+		base := f.floatStringSchema(ir.Float(64))
+		return refine(base, fmt.Sprintf(`v => [%s].includes(Number(v))`, strings.Join(values, ", "))), nil
+	default:
+		return "", fmt.Errorf("enum %s has unsupported wire value type %T", enum.Name.Name, enum.Members[0].Value)
+	}
+}
+
+func (f *ZodFlavor) oneOfValidation(ctx *EmitContext, rule ValidateRule, typ ir.TypeDescriptor, stringEncoded bool) (string, error) {
+	values := parseOneOfValues(rule.Param)
+	if len(values) == 0 {
+		return "", fmt.Errorf("oneof requires at least one value")
+	}
+
+	base := resolveValidationType(ctx, typ)
+	var predicate string
+	switch t := base.(type) {
+	case *ir.PrimitiveDescriptor:
+		switch t.PrimitiveKind {
+		case ir.PrimitiveString:
+			quoted := make([]string, len(values))
+			for i, value := range values {
+				quoted[i] = strconv.Quote(value)
+			}
+			predicate = fmt.Sprintf("v => [%s].includes(v)", strings.Join(quoted, ", "))
+		case ir.PrimitiveInt, ir.PrimitiveDuration:
+			if stringEncoded {
+				quoted := make([]string, len(values))
+				for i, value := range values {
+					canonical, err := canonicalInt(value, t.BitSize)
+					if err != nil {
+						return "", fmt.Errorf("invalid oneof integer %q: %w", value, err)
+					}
+					quoted[i] = strconv.Quote(canonical)
+				}
+				predicate = fmt.Sprintf("v => { try { return [%s].includes(BigInt(v).toString()); } catch { return false; } }", strings.Join(quoted, ", "))
+			} else {
+				literals := make([]string, len(values))
+				for i, value := range values {
+					canonical, err := canonicalInt(value, t.BitSize)
+					if err != nil {
+						return "", fmt.Errorf("invalid oneof integer %q: %w", value, err)
+					}
+					parsed, _ := strconv.ParseInt(canonical, 10, 64)
+					if parsed < -9007199254740991 || parsed > 9007199254740991 {
+						return "", fmt.Errorf("oneof integer %q is outside JavaScript's safe range; use json:\",string\"", value)
+					}
+					literals[i] = canonical
+				}
+				predicate = fmt.Sprintf("v => [%s].includes(v)", strings.Join(literals, ", "))
+			}
+		case ir.PrimitiveUint:
+			if stringEncoded {
+				quoted := make([]string, len(values))
+				for i, value := range values {
+					canonical, err := canonicalUint(value, t.BitSize)
+					if err != nil {
+						return "", fmt.Errorf("invalid oneof unsigned integer %q: %w", value, err)
+					}
+					quoted[i] = strconv.Quote(canonical)
+				}
+				predicate = fmt.Sprintf("v => { try { return [%s].includes(BigInt(v).toString()); } catch { return false; } }", strings.Join(quoted, ", "))
+			} else {
+				literals := make([]string, len(values))
+				for i, value := range values {
+					canonical, err := canonicalUint(value, t.BitSize)
+					if err != nil {
+						return "", fmt.Errorf("invalid oneof unsigned integer %q: %w", value, err)
+					}
+					parsed, _ := strconv.ParseUint(canonical, 10, 64)
+					if parsed > 9007199254740991 {
+						return "", fmt.Errorf("oneof integer %q is outside JavaScript's safe range; use json:\",string\"", value)
+					}
+					literals[i] = canonical
+				}
+				predicate = fmt.Sprintf("v => [%s].includes(v)", strings.Join(literals, ", "))
+			}
+		case ir.PrimitiveFloat:
+			literals := make([]string, len(values))
+			for i, value := range values {
+				canonical, err := canonicalFloat(value, t.BitSize)
+				if err != nil {
+					return "", fmt.Errorf("invalid oneof float %q: %w", value, err)
+				}
+				literals[i] = canonical
+			}
+			if stringEncoded {
+				predicate = fmt.Sprintf("v => [%s].includes(Number(v))", strings.Join(literals, ", "))
+			} else {
+				predicate = fmt.Sprintf("v => [%s].includes(v)", strings.Join(literals, ", "))
+			}
+		case ir.PrimitiveBool:
+			quoted := make([]string, len(values))
+			for i, value := range values {
+				if value != "true" && value != "false" {
+					return "", fmt.Errorf("invalid oneof boolean %q: expected true or false", value)
+				}
+				quoted[i] = strconv.Quote(value)
+			}
+			if stringEncoded {
+				predicate = fmt.Sprintf("v => [%s].includes(v)", strings.Join(quoted, ", "))
+			} else {
+				predicate = fmt.Sprintf("v => [%s].includes(String(v))", strings.Join(quoted, ", "))
+			}
+		default:
+			return "", fmt.Errorf("oneof is unsupported for %v fields", t.PrimitiveKind)
+		}
+	default:
+		return "", fmt.Errorf("oneof is unsupported for %T fields", base)
+	}
+
+	if f.mini {
+		return "z.refine(" + predicate + ")", nil
+	}
+	return ".refine(" + predicate + ")", nil
+}
+
+func (f *ZodFlavor) stringEncodedValidation(ctx *EmitContext, rule ValidateRule, typ ir.TypeDescriptor) (string, bool) {
+	base, ok := resolveValidationType(ctx, typ).(*ir.PrimitiveDescriptor)
+	if !ok {
+		return "", false
+	}
+	operator := map[string]string{
+		"min": ">=", "gte": ">=", "gt": ">", "max": "<=", "lte": "<=", "lt": "<", "len": "===", "eq": "===", "ne": "!==",
+	}[rule.Name]
+	if operator == "" || rule.Param == "" {
+		return "", false
+	}
+
+	var predicate string
+	switch base.PrimitiveKind {
+	case ir.PrimitiveInt, ir.PrimitiveUint, ir.PrimitiveDuration:
+		predicate = fmt.Sprintf(`v => { try { return BigInt(v) %s BigInt(%q); } catch { return false; } }`, operator, rule.Param)
+	case ir.PrimitiveFloat:
+		predicate = fmt.Sprintf("v => Number(v) %s %s", operator, rule.Param)
+	case ir.PrimitiveBool:
+		predicate = fmt.Sprintf("v => v %s %q", operator, rule.Param)
+	default:
+		return "", false
+	}
+	if f.mini {
+		return "z.refine(" + predicate + ")", true
+	}
+	return ".refine(" + predicate + ")", true
 }
 
 func (f *ZodFlavor) primitiveToZod(p *ir.PrimitiveDescriptor, stringEncoded bool) string {
@@ -396,30 +1183,31 @@ func (f *ZodFlavor) primitiveToZodRegular(p *ir.PrimitiveDescriptor, stringEncod
 	switch p.PrimitiveKind {
 	case ir.PrimitiveBool:
 		if stringEncoded {
-			return "z.coerce.boolean()"
+			return `z.enum(["true", "false"])`
 		}
 		return "z.boolean()"
 
 	case ir.PrimitiveString:
+		if stringEncoded {
+			return `z.string().refine(v => { try { return typeof JSON.parse(v) === "string"; } catch { return false; } })`
+		}
 		return "z.string()"
 
 	case ir.PrimitiveInt:
-		base := "z.number().int()"
 		if stringEncoded {
-			base = "z.coerce.number().int()"
+			return f.integerStringSchema(p, false, false)
 		}
-		return base + f.intConstraints(p.BitSize)
+		return "z.number().int()" + f.intConstraints(p.BitSize)
 
 	case ir.PrimitiveUint:
-		base := "z.number().int().nonnegative()"
 		if stringEncoded {
-			base = "z.coerce.number().int().nonnegative()"
+			return f.integerStringSchema(p, true, false)
 		}
-		return base + f.uintConstraints(p.BitSize)
+		return "z.number().int().nonnegative()" + f.uintConstraints(p.BitSize)
 
 	case ir.PrimitiveFloat:
 		if stringEncoded {
-			return "z.coerce.number()"
+			return f.floatStringSchema(p)
 		}
 		return "z.number()"
 
@@ -430,6 +1218,9 @@ func (f *ZodFlavor) primitiveToZodRegular(p *ir.PrimitiveDescriptor, stringEncod
 		return "z.string().datetime()"
 
 	case ir.PrimitiveDuration:
+		if stringEncoded {
+			return f.integerStringSchema(ir.Int(64), false, false)
+		}
 		return "z.number().int()" // nanoseconds
 
 	case ir.PrimitiveAny:
@@ -446,20 +1237,22 @@ func (f *ZodFlavor) primitiveToZodRegular(p *ir.PrimitiveDescriptor, stringEncod
 func (f *ZodFlavor) primitiveToZodMini(p *ir.PrimitiveDescriptor, stringEncoded bool) string {
 	switch p.PrimitiveKind {
 	case ir.PrimitiveBool:
-		// zod-mini doesn't have z.coerce, use pipe transform for string-encoded
 		if stringEncoded {
-			return "z.pipe(z.string(), z.transform(v => v === 'true' || v === '1'))"
+			return `z.enum(["true", "false"])`
 		}
 		return "z.boolean()"
 
 	case ir.PrimitiveString:
+		if stringEncoded {
+			return `z.string().check(z.refine(v => { try { return typeof JSON.parse(v) === "string"; } catch { return false; } }))`
+		}
 		return "z.string()"
 
 	case ir.PrimitiveInt:
-		base := "z.number()"
 		if stringEncoded {
-			base = "z.pipe(z.string(), z.transform(Number))"
+			return f.integerStringSchema(p, false, false)
 		}
+		base := "z.number()"
 		checks := f.intChecksMini(p.BitSize, true)
 		if checks != "" {
 			return base + ".check(" + checks + ")"
@@ -467,10 +1260,10 @@ func (f *ZodFlavor) primitiveToZodMini(p *ir.PrimitiveDescriptor, stringEncoded 
 		return base
 
 	case ir.PrimitiveUint:
-		base := "z.number()"
 		if stringEncoded {
-			base = "z.pipe(z.string(), z.transform(Number))"
+			return f.integerStringSchema(p, true, false)
 		}
+		base := "z.number()"
 		checks := f.uintChecksMini(p.BitSize)
 		if checks != "" {
 			return base + ".check(" + checks + ")"
@@ -479,7 +1272,7 @@ func (f *ZodFlavor) primitiveToZodMini(p *ir.PrimitiveDescriptor, stringEncoded 
 
 	case ir.PrimitiveFloat:
 		if stringEncoded {
-			return "z.pipe(z.string(), z.transform(Number))"
+			return f.floatStringSchema(p)
 		}
 		return "z.number()"
 
@@ -491,6 +1284,9 @@ func (f *ZodFlavor) primitiveToZodMini(p *ir.PrimitiveDescriptor, stringEncoded 
 		return "z.string().check(z.iso.datetime())"
 
 	case ir.PrimitiveDuration:
+		if stringEncoded {
+			return f.integerStringSchema(ir.Int(64), false, false)
+		}
 		return "z.number().check(z.int())" // nanoseconds
 
 	case ir.PrimitiveAny:
@@ -502,6 +1298,58 @@ func (f *ZodFlavor) primitiveToZodMini(p *ir.PrimitiveDescriptor, stringEncoded 
 	default:
 		return "z.unknown()"
 	}
+}
+
+func (f *ZodFlavor) integerStringSchema(p *ir.PrimitiveDescriptor, unsigned, mapKey bool) string {
+	pattern := `-?[0-9]+$(?![\s\S])`
+	if unsigned {
+		pattern = `[0-9]+$(?![\s\S])`
+	} else if mapKey {
+		pattern = `[+-]?[0-9]+$(?![\s\S])`
+	}
+	min, max := integerBounds(p.BitSize, unsigned)
+	predicate := fmt.Sprintf(`v => { try { const n = BigInt(v); return n >= BigInt(%q) && n <= BigInt(%q); } catch { return false; } }`, min, max)
+	if f.mini {
+		return fmt.Sprintf("z.string().check(z.regex(/^(?:%s)/), z.refine(%s))", pattern, predicate)
+	}
+	return fmt.Sprintf("z.string().regex(/^(?:%s)/).refine(%s)", pattern, predicate)
+}
+
+func integerBounds(bitSize int, unsigned bool) (string, string) {
+	if unsigned {
+		switch bitSize {
+		case 8:
+			return "0", "255"
+		case 16:
+			return "0", "65535"
+		case 32:
+			return "0", "4294967295"
+		default:
+			return "0", "18446744073709551615"
+		}
+	}
+	switch bitSize {
+	case 8:
+		return "-128", "127"
+	case 16:
+		return "-32768", "32767"
+	case 32:
+		return "-2147483648", "2147483647"
+	default:
+		return "-9223372036854775808", "9223372036854775807"
+	}
+}
+
+func (f *ZodFlavor) floatStringSchema(p *ir.PrimitiveDescriptor) string {
+	predicate := "v => Number.isFinite(Number(v))"
+	if p.BitSize == 32 {
+		predicate = "v => Number.isFinite(Number(v)) && Number.isFinite(Math.fround(Number(v)))"
+	}
+	pattern := `-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$(?![\s\S])`
+	if f.mini {
+		return fmt.Sprintf("z.string().check(z.regex(/^(?:%s)/), z.refine(%s))", pattern, predicate)
+	}
+	return fmt.Sprintf("z.string().regex(/^(?:%s)/).refine(%s)", pattern, predicate)
 }
 
 // intConstraints returns regular Zod method chain for int bounds.
@@ -572,26 +1420,60 @@ func (f *ZodFlavor) uintChecksMini(bitSize int) string {
 	}
 }
 
-func (f *ZodFlavor) isPrimitiveString(typ ir.TypeDescriptor) bool {
-	if p, ok := typ.(*ir.PrimitiveDescriptor); ok {
+func (f *ZodFlavor) isPrimitiveString(ctx *EmitContext, typ ir.TypeDescriptor) bool {
+	if p, ok := resolveValidationType(ctx, typ).(*ir.PrimitiveDescriptor); ok {
 		return p.PrimitiveKind == ir.PrimitiveString
 	}
 	return false
 }
 
 func (f *ZodFlavor) emitAlias(ctx *EmitContext, a *ir.AliasDescriptor) ([]byte, error) {
+	if ctx.Schema.HasPointerOnlyAliasCycle(a) {
+		return nil, fmt.Errorf("recursive pointer-only alias %s cannot be represented safely in Zod", a.Name.Name)
+	}
+
 	var buf bytes.Buffer
-	schemaName := a.Name.Name + "Schema"
+	typeName := ctx.TypeName(a.Name)
+	schemaName := ctx.SchemaName(a.Name)
+	if declaration := ctx.TypeDeclarations[a.Name]; declaration != "" {
+		buf.WriteString(declaration)
+		buf.WriteString("\n")
+	}
 
 	underlying, err := f.typeToZod(ctx, a.Underlying, false)
 	if err != nil {
 		return nil, err
 	}
 
-	buf.WriteString(fmt.Sprintf("export const %s = %s;\n", schemaName, underlying))
+	if len(a.TypeParameters) > 0 {
+		schemaParams, err := f.schemaTypeParameters(ctx, a.TypeParameters)
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteString("export function ")
+		buf.WriteString(schemaName)
+		buf.WriteString(schemaParams)
+		returnType := f.genericSchemaReturnType(ctx, a.Name, a.TypeParameters, "output")
+		inputType := f.genericSchemaReturnType(ctx, a.Name, a.TypeParameters, "input")
+		if ctx.RecursiveTypes[a.Name] {
+			buf.WriteString(": ")
+			buf.WriteString(f.zodTypeName())
+			buf.WriteString("<" + returnType + ", " + inputType + ">")
+		}
+		buf.WriteString(" {\n  return ")
+		buf.WriteString(underlying)
+		if ctx.RecursiveTypes[a.Name] {
+			buf.WriteString(" as unknown as ")
+			buf.WriteString(f.zodTypeName())
+			buf.WriteString("<" + returnType + ", " + inputType + ">")
+		}
+		buf.WriteString(";\n}\n")
+	} else {
+		buf.WriteString(fmt.Sprintf("export const %s = %s;\n", schemaName, underlying))
+	}
 
-	if !ctx.EmitTypes {
-		buf.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n", a.Name.Name, schemaName))
+	if !ctx.EmitTypes && ctx.TypeDeclarations[a.Name] == "" {
+		buf.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n", typeName, schemaName))
 	}
 	buf.WriteString("\n")
 
@@ -600,7 +1482,8 @@ func (f *ZodFlavor) emitAlias(ctx *EmitContext, a *ir.AliasDescriptor) ([]byte, 
 
 func (f *ZodFlavor) emitEnum(ctx *EmitContext, e *ir.EnumDescriptor) ([]byte, error) {
 	var buf bytes.Buffer
-	schemaName := e.Name.Name + "Schema"
+	typeName := ctx.TypeName(e.Name)
+	schemaName := ctx.SchemaName(e.Name)
 
 	// Collect string values
 	values := make([]string, 0, len(e.Members))
@@ -640,7 +1523,7 @@ func (f *ZodFlavor) emitEnum(ctx *EmitContext, e *ir.EnumDescriptor) ([]byte, er
 	}
 
 	if !ctx.EmitTypes {
-		buf.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n", e.Name.Name, schemaName))
+		buf.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n", typeName, schemaName))
 	}
 	buf.WriteString("\n")
 

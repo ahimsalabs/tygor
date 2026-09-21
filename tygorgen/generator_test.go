@@ -2,17 +2,149 @@ package tygorgen
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"tygor.dev/internal/testfixtures"
 	"tygor.dev/tygor"
+	"tygor.dev/tygorgen/ir"
 	"tygor.dev/tygorgen/provider/testdata"
+	"tygor.dev/tygorgen/provider/testdata/genericbytes"
+	"tygor.dev/tygorgen/provider/testdata/shadow"
 	v1 "tygor.dev/tygorgen/provider/testdata/v1"
 	v2 "tygor.dev/tygorgen/provider/testdata/v2"
 )
+
+type namedEmptyRequest struct{}
+type namedStrings []string
+type reflectedRecursivePointerAlias *reflectedRecursivePointerAlias
+
+func TestReflectTypeToIRRefPreservesWireShapeAndGenericIdentity(t *testing.T) {
+	t.Run("scalar", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[string](), true, false)
+		primitive, ok := descriptor.(*ir.PrimitiveDescriptor)
+		if !ok || primitive.PrimitiveKind != ir.PrimitiveString {
+			t.Fatalf("string endpoint = %#v, want string primitive", descriptor)
+		}
+	})
+
+	t.Run("pointer response", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[*v1.User](), true, false)
+		pointer, ok := descriptor.(*ir.PtrDescriptor)
+		if !ok {
+			t.Fatalf("pointer response = %T, want *ir.PtrDescriptor", descriptor)
+		}
+		ref, ok := pointer.Element.(*ir.ReferenceDescriptor)
+		if !ok || ref.Target.Name != "User" || ref.Target.Package != "tygor.dev/tygorgen/provider/testdata/v1" {
+			t.Fatalf("pointer element = %#v, want v1.User reference", pointer.Element)
+		}
+	})
+
+	t.Run("outer pointer to recursive pointer alias", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[*reflectedRecursivePointerAlias](), true, false)
+		pointer, ok := descriptor.(*ir.PtrDescriptor)
+		if !ok {
+			t.Fatalf("recursive pointer endpoint = %#v, want pointer", descriptor)
+		}
+		ref, ok := pointer.Element.(*ir.ReferenceDescriptor)
+		if !ok || ref.Target.Name != "reflectedRecursivePointerAlias" {
+			t.Fatalf("recursive pointer endpoint element = %#v, want named alias reference", pointer.Element)
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[[]*v1.User](), true, false)
+		array, ok := descriptor.(*ir.ArrayDescriptor)
+		if !ok || array.Length != 0 {
+			t.Fatalf("slice endpoint = %#v, want slice descriptor", descriptor)
+		}
+		if _, ok := array.Element.(*ir.PtrDescriptor); !ok {
+			t.Fatalf("slice element = %T, want nullable pointer", array.Element)
+		}
+	})
+
+	t.Run("defined byte elements", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[[]testdata.Octet](), true, false)
+		primitive, ok := descriptor.(*ir.PrimitiveDescriptor)
+		if !ok || primitive.PrimitiveKind != ir.PrimitiveBytes {
+			t.Fatalf("[]Octet endpoint = %#v, want bytes primitive", descriptor)
+		}
+
+		descriptor = reflectTypeToIRRef(reflect.TypeFor[[]testdata.MarshaledOctet](), true, false)
+		array, ok := descriptor.(*ir.ArrayDescriptor)
+		if !ok || array.Length != 0 {
+			t.Fatalf("[]MarshaledOctet endpoint = %#v, want slice descriptor", descriptor)
+		}
+	})
+
+	t.Run("named container identity", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[namedStrings](), true, false)
+		ref, ok := descriptor.(*ir.ReferenceDescriptor)
+		if !ok || ref.Target.Name != "namedStrings" || ref.Target.Package != "tygor.dev/tygorgen" {
+			t.Fatalf("named container = %#v, want named reference", descriptor)
+		}
+	})
+
+	t.Run("special wire scalars", func(t *testing.T) {
+		number := reflectTypeToIRRef(reflect.TypeFor[json.Number](), true, false)
+		primitive, ok := number.(*ir.PrimitiveDescriptor)
+		if !ok || primitive.PrimitiveKind != ir.PrimitiveFloat || primitive.BitSize != 64 {
+			t.Fatalf("json.Number endpoint = %#v, want float64 wire value", number)
+		}
+		raw := reflectTypeToIRRef(reflect.TypeFor[json.RawMessage](), true, false)
+		primitive, ok = raw.(*ir.PrimitiveDescriptor)
+		if !ok || primitive.PrimitiveKind != ir.PrimitiveAny {
+			t.Fatalf("json.RawMessage endpoint = %#v, want arbitrary JSON", raw)
+		}
+		numberMap := reflectTypeToIRRef(reflect.TypeFor[map[json.Number]string](), true, false)
+		mapDescriptor, ok := numberMap.(*ir.MapDescriptor)
+		if !ok {
+			t.Fatalf("map[json.Number]string endpoint = %T, want map descriptor", numberMap)
+		}
+		key, ok := mapDescriptor.Key.(*ir.PrimitiveDescriptor)
+		if !ok || key.PrimitiveKind != ir.PrimitiveString {
+			t.Fatalf("json.Number map key = %#v, want string wire key", mapDescriptor.Key)
+		}
+	})
+
+	t.Run("source generic application", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[testdata.Page[v1.User]](), true, false)
+		ref, ok := descriptor.(*ir.ReferenceDescriptor)
+		if !ok || ref.Target.Name != "Page" || len(ref.TypeArguments) != 1 {
+			t.Fatalf("source generic = %#v, want Page with one argument", descriptor)
+		}
+		arg, ok := ref.TypeArguments[0].(*ir.ReferenceDescriptor)
+		if !ok || arg.Target.Name != "User" || arg.Target.Package != "tygor.dev/tygorgen/provider/testdata/v1" {
+			t.Fatalf("source generic argument = %#v, want v1.User", ref.TypeArguments[0])
+		}
+	})
+
+	t.Run("reflection generic application", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[testdata.Page[v1.User]](), true, true)
+		ref, ok := descriptor.(*ir.ReferenceDescriptor)
+		if !ok || !strings.HasPrefix(ref.Target.Name, "Page_") || len(ref.TypeArguments) != 0 {
+			t.Fatalf("reflection generic = %#v, want monomorphized reference", descriptor)
+		}
+	})
+
+	t.Run("named empty declaration", func(t *testing.T) {
+		descriptor := reflectTypeToIRRef(reflect.TypeFor[namedEmptyRequest](), false, false)
+		ref, ok := descriptor.(*ir.ReferenceDescriptor)
+		if !ok || ref.Target.Name != "namedEmptyRequest" || ref.Target.Package != "tygor.dev/tygorgen" {
+			t.Fatalf("named empty request = %#v, want named reference", descriptor)
+		}
+		if isUnnamedEmptyStructType(reflect.TypeFor[namedEmptyRequest]()) {
+			t.Fatal("named empty request must remain a provider root")
+		}
+		if !isUnnamedEmptyStructType(reflect.TypeFor[struct{}]()) {
+			t.Fatal("anonymous empty request must not become a top-level schema type")
+		}
+	})
+}
 
 func TestApplyConfigDefaults(t *testing.T) {
 	tests := []struct {
@@ -28,7 +160,7 @@ func TestApplyConfigDefaults(t *testing.T) {
 				return c.Provider == "source" &&
 					c.PreserveComments == "default" &&
 					c.EnumStyle == "union" &&
-					c.OptionalType == "undefined"
+					c.OptionalType == "default"
 			},
 			errMsg: "defaults not applied correctly",
 		},
@@ -56,7 +188,7 @@ func TestApplyConfigDefaults(t *testing.T) {
 			check: func(c *Config) bool {
 				return c.PreserveComments == "default" &&
 					c.EnumStyle == "const" &&
-					c.OptionalType == "undefined"
+					c.OptionalType == "default"
 			},
 			errMsg: "partial config not handled correctly",
 		},
@@ -130,6 +262,215 @@ func TestGenerate_NoOutDir_ReturnsFilesInMemory(t *testing.T) {
 	}
 	if !hasManifest {
 		t.Error("missing manifest.ts in result files")
+	}
+}
+
+func TestGenerate_SourceGenericDefinedBytesUseJSONWireType(t *testing.T) {
+	type byteResponse = testdata.Response[[]testdata.Octet]
+	type customResponse = testdata.Response[[]testdata.MarshaledOctet]
+	type nestedResponse = testdata.Response[map[string][][]testdata.Octet]
+	type phantomResponse = testdata.Phantom[[]testdata.Octet]
+
+	app := tygor.NewApp()
+	app.Service("Bytes").Register("Echo", tygor.Exec(func(context.Context, byteResponse) (byteResponse, error) {
+		return byteResponse{}, nil
+	}))
+	app.Service("Bytes").Register("Custom", tygor.Exec(func(context.Context, customResponse) (customResponse, error) {
+		return customResponse{}, nil
+	}))
+	app.Service("Bytes").Register("Nested", tygor.Exec(func(context.Context, nestedResponse) (nestedResponse, error) {
+		return nestedResponse{}, nil
+	}))
+	app.Service("Bytes").Register("Phantom", tygor.Exec(func(context.Context, phantomResponse) (phantomResponse, error) {
+		return phantomResponse{}, nil
+	}))
+
+	dir := t.TempDir()
+	result, err := Generate(app, &Config{
+		OutDir:     dir,
+		Provider:   "source",
+		SingleFile: true,
+		Flavors:    []Flavor{FlavorZod, FlavorZodMini},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	service := result.Schema.FindService("Bytes")
+	if service == nil || len(service.Endpoints) != 4 {
+		t.Fatalf("Bytes service = %#v, want four endpoints", service)
+	}
+	endpoints := make(map[string]ir.EndpointDescriptor, len(service.Endpoints))
+	for _, endpoint := range service.Endpoints {
+		endpoints[endpoint.Name] = endpoint
+	}
+	assertArgument := func(endpointName string, check func(ir.TypeDescriptor) bool, want string) {
+		t.Helper()
+		endpoint := endpoints[endpointName]
+		for name, descriptor := range map[string]ir.TypeDescriptor{
+			"request":  endpoint.Request,
+			"response": endpoint.Response,
+		} {
+			ref, ok := descriptor.(*ir.ReferenceDescriptor)
+			if !ok || len(ref.TypeArguments) != 1 {
+				t.Fatalf("%s %s descriptor = %#v, want one type argument", endpointName, name, descriptor)
+			}
+			if !check(ref.TypeArguments[0]) {
+				t.Fatalf("%s %s argument = %#v, want %s", endpointName, name, ref.TypeArguments[0], want)
+			}
+		}
+	}
+	isBytes := func(descriptor ir.TypeDescriptor) bool {
+		primitive, ok := descriptor.(*ir.PrimitiveDescriptor)
+		return ok && primitive.PrimitiveKind == ir.PrimitiveBytes
+	}
+	assertArgument("Echo", isBytes, "bytes primitive")
+	assertArgument("Phantom", isBytes, "bytes primitive even though the generic field is unused")
+	assertArgument("Custom", func(descriptor ir.TypeDescriptor) bool {
+		array, ok := descriptor.(*ir.ArrayDescriptor)
+		if !ok || array.Length != 0 {
+			return false
+		}
+		primitive, ok := array.Element.(*ir.PrimitiveDescriptor)
+		return ok && primitive.PrimitiveKind == ir.PrimitiveAny
+	}, "slice of custom-marshaled values")
+	assertArgument("Nested", func(descriptor ir.TypeDescriptor) bool {
+		mapping, ok := descriptor.(*ir.MapDescriptor)
+		if !ok {
+			return false
+		}
+		array, ok := mapping.Value.(*ir.ArrayDescriptor)
+		return ok && array.Length == 0 && isBytes(array.Element)
+	}, "map of byte-slice arrays")
+
+	bytePayload, err := json.Marshal(byteResponse{Data: []testdata.Octet{1, 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(bytePayload), `{"data":"AQI="}`; got != want {
+		t.Fatalf("encoding/json payload = %s, want %s", got, want)
+	}
+}
+
+func TestGenerate_SourceGenericPointerArgumentsResolvePackages(t *testing.T) {
+	type pointerResponse = testdata.Response[[]*v1.User]
+	type nestedPointerResponse = testdata.Response[[]*map[string]v1.User]
+
+	app := tygor.NewApp()
+	app.Service("Pointers").Register("Slice", tygor.Exec(func(context.Context, pointerResponse) (pointerResponse, error) {
+		return pointerResponse{}, nil
+	}))
+	app.Service("Pointers").Register("Nested", tygor.Exec(func(context.Context, nestedPointerResponse) (nestedPointerResponse, error) {
+		return nestedPointerResponse{}, nil
+	}))
+	result, err := Generate(app, &Config{Provider: "source", SingleFile: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := result.Schema.FindService("Pointers")
+	if service == nil || len(service.Endpoints) != 2 {
+		t.Fatalf("Pointers service = %#v, want two endpoints", service)
+	}
+	endpoints := make(map[string]ir.EndpointDescriptor, len(service.Endpoints))
+	for _, endpoint := range service.Endpoints {
+		endpoints[endpoint.Name] = endpoint
+	}
+	responseArgument := func(endpointName string) ir.TypeDescriptor {
+		t.Helper()
+		ref, ok := endpoints[endpointName].Response.(*ir.ReferenceDescriptor)
+		if !ok || ref.Target.Name != "Response" || len(ref.TypeArguments) != 1 {
+			t.Fatalf("%s response = %#v, want Response with one argument", endpointName, endpoints[endpointName].Response)
+		}
+		return ref.TypeArguments[0]
+	}
+	slice, ok := responseArgument("Slice").(*ir.ArrayDescriptor)
+	if !ok || slice.Length != 0 {
+		t.Fatalf("Slice argument = %#v, want slice", responseArgument("Slice"))
+	}
+	pointer, ok := slice.Element.(*ir.PtrDescriptor)
+	if !ok {
+		t.Fatalf("Slice element = %#v, want pointer", slice.Element)
+	}
+	user, ok := pointer.Element.(*ir.ReferenceDescriptor)
+	if !ok || user.Target.Package != "tygor.dev/tygorgen/provider/testdata/v1" || user.Target.Name != "User" {
+		t.Fatalf("Slice pointer target = %#v, want v1.User", pointer.Element)
+	}
+	nested, ok := responseArgument("Nested").(*ir.ArrayDescriptor)
+	if !ok || nested.Length != 0 {
+		t.Fatalf("Nested argument = %#v, want slice", responseArgument("Nested"))
+	}
+	nestedPointer, ok := nested.Element.(*ir.PtrDescriptor)
+	if !ok {
+		t.Fatalf("Nested element = %#v, want pointer", nested.Element)
+	}
+	if _, ok := nestedPointer.Element.(*ir.MapDescriptor); !ok {
+		t.Fatalf("Nested pointer target = %#v, want map", nestedPointer.Element)
+	}
+}
+
+func TestGenerate_SourceDefinedByteSliceDoesNotExtractUnrelatedPackageTypes(t *testing.T) {
+	app := tygor.NewApp()
+	app.Service("Bytes").Register("Raw", tygor.Exec(func(context.Context, struct{}) ([]genericbytes.Octet, error) {
+		return []genericbytes.Octet{1, 2}, nil
+	}))
+	result, err := Generate(app, &Config{Provider: "source", SingleFile: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Schema.Types) != 0 {
+		t.Fatalf("scalar byte endpoint extracted unrelated types: %#v", result.Schema.Types)
+	}
+	service := result.Schema.FindService("Bytes")
+	if service == nil || len(service.Endpoints) != 1 {
+		t.Fatalf("Bytes service = %#v, want one endpoint", service)
+	}
+	primitive, ok := service.Endpoints[0].Response.(*ir.PrimitiveDescriptor)
+	if !ok || primitive.PrimitiveKind != ir.PrimitiveBytes {
+		t.Fatalf("defined byte response = %#v, want bytes primitive", service.Endpoints[0].Response)
+	}
+	payload, err := json.Marshal([]genericbytes.Octet{1, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(payload), `"AQI="`; got != want {
+		t.Fatalf("encoding/json payload = %s, want %s", got, want)
+	}
+}
+
+func TestGenerate_SourceNamedTypeCanShadowPredeclaredIdentifier(t *testing.T) {
+	app := tygor.NewApp()
+	app.Service("Shadow").Register("Echo", tygor.Exec(shadow.EchoHandler()))
+	result, err := Generate(app, &Config{Provider: "source", SingleFile: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := result.Schema.FindService("Shadow")
+	if service == nil || len(service.Endpoints) != 1 {
+		t.Fatalf("Shadow service = %#v, want one endpoint", service)
+	}
+	for name, descriptor := range map[string]ir.TypeDescriptor{
+		"request":  service.Endpoints[0].Request,
+		"response": service.Endpoints[0].Response,
+	} {
+		ref, ok := descriptor.(*ir.ReferenceDescriptor)
+		if !ok || ref.Target.Package != "tygor.dev/tygorgen/provider/testdata/shadow" || ref.Target.Name != "int" {
+			t.Fatalf("%s descriptor = %#v, want shadow.int reference", name, descriptor)
+		}
+		alias, ok := result.Schema.FindType(ref.Target).(*ir.AliasDescriptor)
+		if !ok {
+			t.Fatalf("%s target = %#v, want alias", name, result.Schema.FindType(ref.Target))
+		}
+		primitive, ok := alias.Underlying.(*ir.PrimitiveDescriptor)
+		if !ok || primitive.PrimitiveKind != ir.PrimitiveString {
+			t.Fatalf("shadow.int underlying = %#v, want string", alias.Underlying)
+		}
+	}
+	payload, err := shadow.JSONValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(payload), `"value"`; got != want {
+		t.Fatalf("encoding/json payload = %s, want %s", got, want)
 	}
 }
 
@@ -221,7 +562,7 @@ func TestGenerate_ManifestStructure(t *testing.T) {
 	manifestStr := string(content)
 
 	// Verify imports
-	if !strings.Contains(manifestStr, "import * as types") {
+	if !strings.Contains(manifestStr, "import type * as types") {
 		t.Error("manifest.ts missing types import")
 	}
 
@@ -474,6 +815,25 @@ func TestFromTypes_WithZodFlavor(t *testing.T) {
 	}
 }
 
+func TestFromTypes_CustomMarshalerValidatorRejectsUnknownWireSchema(t *testing.T) {
+	for _, flavor := range []Flavor{FlavorZod, FlavorZodMini} {
+		t.Run(flavor.String(), func(t *testing.T) {
+			result, err := FromTypes(testdata.CustomMarshalerValidation{}).
+				Provider("source").
+				WithFlavor(flavor).
+				Generate()
+			if err == nil {
+				t.Fatalf("Generate() = %#v, want unsupported validator error", result)
+			}
+			for _, context := range []string{"CustomMarshalerValidation", "field Address", `validator "email"`, "unknown wire schema"} {
+				if !strings.Contains(err.Error(), context) {
+					t.Fatalf("Generate() error = %v, want context %q", err, context)
+				}
+			}
+		})
+	}
+}
+
 func TestFromTypes_MultiPackageGenericInstantiation(t *testing.T) {
 	// Test that Page[v1.User] and Page[v2.User] both work correctly.
 	// The reflection provider:
@@ -512,17 +872,12 @@ func TestFromTypes_MultiPackageGenericInstantiation(t *testing.T) {
 		t.Error("expected v2.User role field")
 	}
 
-	// Count User interface definitions - should have 2 (one per package)
-	userCount := strings.Count(allContent, "export interface User")
-	if userCount != 2 {
-		t.Errorf("expected 2 User interface definitions (v1 and v2), got %d", userCount)
-	}
 }
 
-// TestGenerate_PointerStripping verifies that pointer types are handled correctly:
-// - Top-level endpoint request/response pointers are stripped (Go idiom, not nullability)
-// - Nested pointers in slices/maps are preserved (indicate nullable elements)
-func TestGenerate_PointerStripping(t *testing.T) {
+// TestGenerate_PointerNullability verifies the endpoint wire contract:
+// request pointers remain an implementation detail, while response pointers and
+// nested pointer elements preserve JSON nullability.
+func TestGenerate_PointerNullability(t *testing.T) {
 	reg := tygor.NewApp()
 	outDir := t.TempDir()
 
@@ -548,19 +903,16 @@ func TestGenerate_PointerStripping(t *testing.T) {
 	content, _ := os.ReadFile(manifestPath)
 	manifestStr := string(content)
 
-	// Top-level pointers should be stripped - no "| null" on req/res types
-	// Users.Create: req should be CreateUserRequest, not (CreateUserRequest | null)
+	// Request pointers are stripped.
 	if strings.Contains(manifestStr, "(types.CreateUserRequest | null)") {
 		t.Error("request type should not be nullable - pointer should be stripped")
 	}
-	if strings.Contains(manifestStr, "(types.User | null)") {
-		t.Error("response type should not be nullable - pointer should be stripped")
+	if !strings.Contains(manifestStr, "res: (types.User | null)") {
+		t.Error("pointer response should be nullable")
 	}
 
-	// Pointer elements in slices should be unwrapped - []*T → T[]
-	// Posts.List: res should be types.Post[] - pointer is implementation detail, not nullability
-	if !strings.Contains(manifestStr, "types.Post[]") {
-		t.Error("slice element pointers should be unwrapped: expected types.Post[]")
+	if !strings.Contains(manifestStr, "res: ((types.Post | null)[] | null)") {
+		t.Error("slice and pointer elements should preserve nullability")
 	}
 }
 
@@ -634,9 +986,4 @@ func TestFromTypes_SourceProviderGenericDefinition(t *testing.T) {
 		t.Error("expected v2.User role field")
 	}
 
-	// Count User interface definitions - should have 2 (one per package)
-	userCount := strings.Count(allContent, "export interface User")
-	if userCount != 2 {
-		t.Errorf("expected 2 User interface definitions (v1 and v2), got %d", userCount)
-	}
 }

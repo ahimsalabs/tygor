@@ -102,8 +102,8 @@ func (g *Generator) EnumStyle(style string) *Generator {
 	return g
 }
 
-// OptionalType controls how optional fields are typed.
-// Valid values: "undefined" (default), "null".
+// OptionalType controls how optional and nullable fields are typed.
+// Valid values: "default" (default), "undefined", "null".
 func (g *Generator) OptionalType(t string) *Generator {
 	g.cfg.OptionalType = t
 	return g

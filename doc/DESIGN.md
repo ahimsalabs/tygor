@@ -142,7 +142,7 @@ type UnaryInterceptor func(ctx tygor.Context, req any, handler tygor.HandlerFunc
 tygorgen.FromApp(app).
     TypeMapping("time.Time", "string").
     TypeMapping("uuid.UUID", "string").
-    OptionalType("undefined"). // Go pointers → T | undefined
+    OptionalType("default").   // omitempty controls absence; nil-capable values permit null
     EnumStyle("union").        // type Status = "draft" | "published"
     ToDir("./client/src/rpc")
 ```

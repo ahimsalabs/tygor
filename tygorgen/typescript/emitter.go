@@ -12,11 +12,14 @@ import (
 
 // Emitter handles TypeScript code emission for IR type descriptors.
 type Emitter struct {
-	schema    *ir.Schema
-	config    GeneratorConfig
-	tsConfig  TypeScriptConfig
-	indent    string // current indentation prefix (for nested emissions)
-	indentStr string // single indent unit (tab or spaces from config)
+	schema                  *ir.Schema
+	config                  GeneratorConfig
+	tsConfig                TypeScriptConfig
+	plan                    *generationPlan
+	referencePrefix         string
+	typeParameterExpression func(string) string
+	indent                  string // current indentation prefix (for nested emissions)
+	indentStr               string // single indent unit (tab or spaces from config)
 }
 
 // qualifyTypeName returns the qualified TypeScript name for a Go type.
@@ -24,6 +27,12 @@ type Emitter struct {
 // Types from other packages are qualified with the sanitized package path
 // after removing StripPackagePrefix.
 func (e *Emitter) qualifyTypeName(id ir.GoIdentifier) string {
+	if e.plan != nil {
+		if name, ok := e.plan.typeNames[id]; ok {
+			return name
+		}
+	}
+
 	typeName := applyNameTransforms(id.Name, e.config)
 
 	// If no StripPackagePrefix is configured, don't qualify anything (backward compat)
@@ -206,9 +215,17 @@ func (e *Emitter) emitStruct(buf *bytes.Buffer, s *ir.StructDescriptor) ([]ir.Wa
 				break
 			}
 		}
-		typeExpr, err := e.EmitTypeExpr(fieldType)
-		if err != nil {
-			return nil, fmt.Errorf("failed to emit field %s type: %w", field.Name, err)
+		var typeExpr string
+		if field.StringEncoded {
+			typeExpr = "string"
+			if e.primitiveKind(fieldType) == ir.PrimitiveBool {
+				typeExpr = `"true" | "false"`
+			}
+		} else {
+			typeExpr, err = e.emitTypeExpr(fieldType, false)
+			if err != nil {
+				return nil, fmt.Errorf("failed to emit field %s type: %w", field.Name, err)
+			}
 		}
 		buf.WriteString(typeExpr)
 
@@ -232,6 +249,23 @@ func (e *Emitter) emitStruct(buf *bytes.Buffer, s *ir.StructDescriptor) ([]ir.Wa
 
 // emitAlias emits a type alias.
 func (e *Emitter) emitAlias(buf *bytes.Buffer, a *ir.AliasDescriptor) ([]ir.Warning, error) {
+	if e.schema.HasPointerOnlyAliasCycle(a) {
+		return nil, fmt.Errorf("recursive pointer-only alias %s cannot be represented safely in TypeScript", a.Name.Name)
+	}
+	if e.plan != nil {
+		if cycle := e.plan.unguardedAliasCycles[a.Name]; len(cycle) > 0 {
+			names := make([]string, len(cycle))
+			for i, identifier := range cycle {
+				names[i] = identifier.Name
+			}
+			return nil, fmt.Errorf(
+				"recursive alias %s cannot be represented safely in TypeScript: unguarded alias cycle %s through generic aliases or Record",
+				a.Name.Name,
+				strings.Join(names, " -> "),
+			)
+		}
+	}
+
 	// Apply name transforms with package qualification
 	typeName := e.qualifyTypeName(a.Name)
 	typeName = escapeReservedWord(typeName)
@@ -259,14 +293,42 @@ func (e *Emitter) emitAlias(buf *bytes.Buffer, a *ir.AliasDescriptor) ([]ir.Warn
 	buf.WriteString(" = ")
 
 	// Emit underlying type
-	underlying, err := e.EmitTypeExpr(a.Underlying)
-	if err != nil {
-		return nil, fmt.Errorf("failed to emit alias underlying type: %w", err)
+	var underlying string
+	if recursiveMap, ok := unwrapPointers(a.Underlying).(*ir.MapDescriptor); ok && e.plan != nil && e.plan.recursive[a.Name] {
+		valueType, err := e.emitTypeExpr(recursiveMap.Value, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to emit recursive map value type: %w", err)
+		}
+		key := "key: string"
+		if ref, ok := recursiveMap.Key.(*ir.ReferenceDescriptor); ok && e.referenceIsStringValued(ref.Target) {
+			keyType, err := e.emitTypeExpr(recursiveMap.Key, false)
+			if err != nil {
+				return nil, fmt.Errorf("failed to emit recursive map key type: %w", err)
+			}
+			key = "key in " + keyType
+		}
+		underlying = fmt.Sprintf("({ [%s]: %s } | null)", key, valueType)
+	} else {
+		var err error
+		underlying, err = e.EmitTypeExpr(a.Underlying)
+		if err != nil {
+			return nil, fmt.Errorf("failed to emit alias underlying type: %w", err)
+		}
 	}
 	buf.WriteString(underlying)
 	buf.WriteString(";")
 
 	return nil, nil
+}
+
+func unwrapPointers(typ ir.TypeDescriptor) ir.TypeDescriptor {
+	for {
+		pointer, ok := typ.(*ir.PtrDescriptor)
+		if !ok {
+			return typ
+		}
+		typ = pointer.Element
+	}
 }
 
 // emitEnum emits an enum based on the configured style.
@@ -396,15 +458,34 @@ func (e *Emitter) emitEnumAsObject(buf *bytes.Buffer, typeName string, enum *ir.
 
 // EmitTypeExpr emits a type expression (non-top-level types).
 func (e *Emitter) EmitTypeExpr(typ ir.TypeDescriptor) (string, error) {
+	return e.emitTypeExpr(typ, true)
+}
+
+// EmitTypeExprWithTypeParameters emits a type expression while replacing type
+// parameter references with render's direction-specific schema-derived type.
+func (e *Emitter) EmitTypeExprWithTypeParameters(typ ir.TypeDescriptor, render func(string) string) (string, error) {
+	emitter := *e
+	emitter.typeParameterExpression = render
+	return emitter.EmitTypeExpr(typ)
+}
+
+func (e *Emitter) emitTypeExpr(typ ir.TypeDescriptor, includeSelfNullability bool) (string, error) {
+	if typ == nil {
+		return "unknown", nil
+	}
 	switch t := typ.(type) {
 	case *ir.PrimitiveDescriptor:
-		return e.emitPrimitive(t), nil
+		result := e.emitPrimitive(t)
+		if includeSelfNullability && t.PrimitiveKind == ir.PrimitiveBytes {
+			return "(" + result + " | null)", nil
+		}
+		return result, nil
 	case *ir.ArrayDescriptor:
-		return e.emitArray(t)
+		return e.emitArray(t, includeSelfNullability)
 	case *ir.MapDescriptor:
-		return e.emitMap(t)
+		return e.emitMap(t, includeSelfNullability)
 	case *ir.ReferenceDescriptor:
-		return e.emitReference(t), nil
+		return e.emitReference(t)
 	case *ir.PtrDescriptor:
 		return e.emitPtr(t)
 	case *ir.UnionDescriptor:
@@ -478,31 +559,16 @@ func (e *Emitter) intHint(bitSize int, signed bool) string {
 	return fmt.Sprintf("%s%d", prefix, bitSize)
 }
 
-// emitArray emits an array type.
-// By default, pointer element types are unwrapped: []*T → T[] rather than (T | null)[].
-// This matches Go semantics where []*T means "a slice of T values" - the pointer is an
-// implementation detail (efficiency/mutability), not expressing optionality of elements.
-// Set NullableSliceElements=true to preserve pointer nullability in array elements.
-func (e *Emitter) emitArray(a *ir.ArrayDescriptor) (string, error) {
-	elem := a.Element
-
-	// Unless NullableSliceElements is set, unwrap pointer elements
-	if !e.tsConfig.NullableSliceElements {
-		for {
-			if ptr, ok := elem.(*ir.PtrDescriptor); ok {
-				elem = ptr.Element
-			} else {
-				break
-			}
-		}
-	}
-
-	elemType, err := e.EmitTypeExpr(elem)
+// emitArray emits an array type. Pointer and nil-capable container elements
+// retain their JSON nullability.
+func (e *Emitter) emitArray(a *ir.ArrayDescriptor, includeSelfNullability bool) (string, error) {
+	elemType, err := e.emitTypeExpr(a.Element, true)
 	if err != nil {
 		return "", err
 	}
 
-	if a.Length > 0 {
+	var result string
+	if !a.IsSlice() {
 		// Fixed-length array: emit as tuple if small, otherwise regular array
 		if a.Length <= 10 {
 			// Emit as tuple: [T, T, T]
@@ -517,56 +583,66 @@ func (e *Emitter) emitArray(a *ir.ArrayDescriptor) (string, error) {
 
 	// Slice or large array: T[] or readonly T[]
 	if e.tsConfig.UseReadonlyArrays {
-		return "readonly " + elemType + "[]", nil
+		result = "readonly " + elemType + "[]"
+	} else {
+		result = elemType + "[]"
 	}
-	return elemType + "[]", nil
+	if includeSelfNullability && a.IsSlice() {
+		return "(" + result + " | null)", nil
+	}
+	return result, nil
 }
 
 // emitMap emits a map type.
-func (e *Emitter) emitMap(m *ir.MapDescriptor) (string, error) {
-	keyType, err := e.EmitTypeExpr(m.Key)
+func (e *Emitter) emitMap(m *ir.MapDescriptor, includeSelfNullability bool) (string, error) {
+	keyType, err := e.emitTypeExpr(m.Key, false)
 	if err != nil {
 		return "", err
 	}
-	valueType, err := e.EmitTypeExpr(m.Value)
+	valueType, err := e.emitTypeExpr(m.Value, true)
 	if err != nil {
 		return "", err
 	}
 
-	// All maps serialize to string keys in JSON
-	// But preserve the key type for named string types
-	if _, ok := m.Key.(*ir.ReferenceDescriptor); ok {
-		// Named type - preserve it
-		return fmt.Sprintf("Record<%s, %s>", keyType, valueType), nil
+	var result string
+	// JSON object keys are strings. Preserve a named key only when its generated
+	// type is also string-valued; integer aliases still arrive over JSON as strings.
+	if ref, ok := m.Key.(*ir.ReferenceDescriptor); ok && e.referenceIsStringValued(ref.Target) {
+		result = fmt.Sprintf("Record<%s, %s>", keyType, valueType)
+	} else {
+		result = fmt.Sprintf("Record<string, %s>", valueType)
 	}
-	// Primitive key - always use string
-	return fmt.Sprintf("Record<string, %s>", valueType), nil
+	if includeSelfNullability {
+		return "(" + result + " | null)", nil
+	}
+	return result, nil
 }
 
 // emitReference emits a reference to a named type.
-func (e *Emitter) emitReference(r *ir.ReferenceDescriptor) string {
-	typeName := e.qualifyTypeName(r.Target)
-	return escapeReservedWord(typeName)
+func (e *Emitter) emitReference(r *ir.ReferenceDescriptor) (string, error) {
+	typeName := e.referencePrefix + e.qualifyTypeName(r.Target)
+	if len(r.TypeArguments) == 0 {
+		return escapeReservedWord(typeName), nil
+	}
+	args := make([]string, len(r.TypeArguments))
+	for i, arg := range r.TypeArguments {
+		var err error
+		args[i], err = e.emitTypeExpr(arg, true)
+		if err != nil {
+			return "", fmt.Errorf("emit type argument %d for %s: %w", i, r.Target.Name, err)
+		}
+	}
+	return escapeReservedWord(typeName) + "<" + strings.Join(args, ", ") + ">", nil
 }
 
 // emitPtr emits a pointer type with | null.
 // Note: PtrDescriptor nullability is context-dependent (§4.9).
 // For field-level pointers, determineOptionalNullable handles nullability.
-// For array elements, emitArray unwraps pointers (Go's []*T is semantically T[]).
-// For map values, we add | null here since map[K]*V can have nil values.
+// For array elements and map values, pointers remain nullable because nil
+// elements and values encode as JSON null.
 // This method recursively unwraps nested pointers to avoid (T | null) | null.
 func (e *Emitter) emitPtr(p *ir.PtrDescriptor) (string, error) {
-	// Unwrap all nested pointers to get to the base type
-	elem := p.Element
-	for {
-		if innerPtr, ok := elem.(*ir.PtrDescriptor); ok {
-			elem = innerPtr.Element
-		} else {
-			break
-		}
-	}
-
-	elemType, err := e.EmitTypeExpr(elem)
+	elemType, err := e.emitTypeExpr(unwrapPointers(p.Element), false)
 	if err != nil {
 		return "", err
 	}
@@ -590,6 +666,9 @@ func (e *Emitter) emitUnion(u *ir.UnionDescriptor) (string, error) {
 
 // emitTypeParameter emits a type parameter reference.
 func (e *Emitter) emitTypeParameter(tp *ir.TypeParameterDescriptor) string {
+	if e.typeParameterExpression != nil {
+		return e.typeParameterExpression(tp.ParamName)
+	}
 	return tp.ParamName
 }
 
@@ -626,13 +705,15 @@ func (e *Emitter) determineOptionalNullable(field ir.FieldDescriptor) (optional,
 	// Nullable is determined by whether the type can hold nil
 	// Check for pointer, slice, or map (unwrapping pointers to get to the base)
 	fieldType := field.Type
-	switch fieldType.(type) {
+	switch t := fieldType.(type) {
 	case *ir.PtrDescriptor:
 		nullable = true
 	case *ir.ArrayDescriptor:
-		nullable = true
+		nullable = t.IsSlice()
 	case *ir.MapDescriptor:
 		nullable = true
+	case *ir.PrimitiveDescriptor:
+		nullable = t.PrimitiveKind == ir.PrimitiveBytes
 	}
 
 	// Apply OptionalType override if configured
@@ -682,7 +763,7 @@ func (e *Emitter) emitJSDocWithSee(buf *bytes.Buffer, doc ir.Documentation, seeR
 	// Simple case: only @see, no doc
 	if !hasDoc && hasSee {
 		buf.WriteString("/** @see ")
-		buf.WriteString(seeRef)
+		buf.WriteString(sanitizeJSDocText(seeRef))
 		buf.WriteString(" */\n")
 		return
 	}
@@ -694,7 +775,7 @@ func (e *Emitter) emitJSDocWithSee(buf *bytes.Buffer, doc ir.Documentation, seeR
 	if !needsMultiLine {
 		// Single line doc without @see or @deprecated
 		buf.WriteString("/** ")
-		buf.WriteString(strings.TrimSpace(lines[0]))
+		buf.WriteString(sanitizeJSDocText(strings.TrimSpace(lines[0])))
 		buf.WriteString(" */\n")
 		return
 	}
@@ -703,7 +784,7 @@ func (e *Emitter) emitJSDocWithSee(buf *bytes.Buffer, doc ir.Documentation, seeR
 	buf.WriteString("/**\n")
 	for _, line := range lines {
 		buf.WriteString(" * ")
-		buf.WriteString(strings.TrimSpace(line))
+		buf.WriteString(sanitizeJSDocText(strings.TrimSpace(line)))
 		buf.WriteString("\n")
 	}
 
@@ -711,14 +792,14 @@ func (e *Emitter) emitJSDocWithSee(buf *bytes.Buffer, doc ir.Documentation, seeR
 		buf.WriteString(" * @deprecated")
 		if *doc.Deprecated != "" {
 			buf.WriteString(" ")
-			buf.WriteString(*doc.Deprecated)
+			buf.WriteString(sanitizeJSDocText(*doc.Deprecated))
 		}
 		buf.WriteString("\n")
 	}
 
 	if hasSee {
 		buf.WriteString(" * @see ")
-		buf.WriteString(seeRef)
+		buf.WriteString(sanitizeJSDocText(seeRef))
 		buf.WriteString("\n")
 	}
 
@@ -728,6 +809,57 @@ func (e *Emitter) emitJSDocWithSee(buf *bytes.Buffer, doc ir.Documentation, seeR
 // emitJSDoc emits JSDoc-style documentation comments.
 func (e *Emitter) emitJSDoc(buf *bytes.Buffer, doc ir.Documentation) {
 	e.emitJSDocWithSee(buf, doc, "")
+}
+
+func sanitizeJSDocText(value string) string {
+	return strings.ReplaceAll(value, "*/", "*\\/")
+}
+
+func (e *Emitter) primitiveKind(typ ir.TypeDescriptor) ir.PrimitiveKind {
+	seen := make(map[ir.GoIdentifier]bool)
+	for {
+		switch t := typ.(type) {
+		case *ir.PtrDescriptor:
+			typ = t.Element
+		case *ir.ReferenceDescriptor:
+			if e.schema == nil || seen[t.Target] {
+				return ir.PrimitiveKind(-1)
+			}
+			seen[t.Target] = true
+			alias, ok := e.schema.FindType(t.Target).(*ir.AliasDescriptor)
+			if !ok {
+				return ir.PrimitiveKind(-1)
+			}
+			typ = alias.Underlying
+		case *ir.PrimitiveDescriptor:
+			return t.PrimitiveKind
+		default:
+			return ir.PrimitiveKind(-1)
+		}
+	}
+}
+
+func (e *Emitter) referenceIsStringValued(id ir.GoIdentifier) bool {
+	if e.schema == nil {
+		return false
+	}
+	target := e.schema.FindType(id)
+	switch t := target.(type) {
+	case *ir.AliasDescriptor:
+		return e.primitiveKind(t.Underlying) == ir.PrimitiveString
+	case *ir.EnumDescriptor:
+		if len(t.Members) == 0 {
+			return false
+		}
+		for _, member := range t.Members {
+			if _, ok := member.Value.(string); !ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // formatEnumValue formats an enum member value for output.

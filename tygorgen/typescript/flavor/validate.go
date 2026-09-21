@@ -2,8 +2,12 @@ package flavor
 
 import (
 	"fmt"
+	"math"
+	"regexp"
 	"strconv"
 	"strings"
+
+	"tygor.dev/tygorgen/ir"
 )
 
 // ValidateRule represents a single validation rule from a validate tag.
@@ -56,6 +60,319 @@ func ParseValidateTag(tag string) []ValidateRule {
 	}
 
 	return rules
+}
+
+func canonicalizeValidationRules(ctx *EmitContext, rules []ValidateRule, typ ir.TypeDescriptor, mini bool) ([]ValidateRule, error) {
+	result := append([]ValidateRule(nil), rules...)
+	if err := rejectUnsupportedStructuralValidation(result); err != nil {
+		return nil, err
+	}
+	base := resolveValidationType(ctx, typ)
+	if primitive, ok := base.(*ir.PrimitiveDescriptor); ok && primitive.PrimitiveKind == ir.PrimitiveAny {
+		for _, rule := range result {
+			if validationOperation(rule, false) != "" || validationOperation(rule, true) != "" {
+				return nil, fmt.Errorf("validator %q on unknown wire schema is not supported", rule.Name)
+			}
+		}
+	}
+	if parameter, ok := base.(*ir.TypeParameterDescriptor); ok {
+		for _, rule := range result {
+			if validationOperation(rule, mini) != "" {
+				return nil, fmt.Errorf("validator %q on unresolved type parameter %s is not supported", rule.Name, parameter.ParamName)
+			}
+		}
+	}
+	if applied, ok := retainedAppliedGenericType(ctx, typ); ok {
+		for _, rule := range result {
+			if validationOperation(rule, mini) != "" {
+				return nil, fmt.Errorf("validator %q on applied generic type %s is not supported", rule.Name, applied.Name)
+			}
+		}
+	}
+	for i := range result {
+		rule := &result[i]
+		if rule.Param == "" || rule.Name == "oneof" || !ruleEmbedsParameter(rule.Name) {
+			continue
+		}
+
+		var canonical string
+		var err error
+		switch t := base.(type) {
+		case *ir.PrimitiveDescriptor:
+			switch t.PrimitiveKind {
+			case ir.PrimitiveBytes:
+				return nil, fmt.Errorf("validator %q on byte slices is not supported because JSON uses base64 encoding", rule.Name)
+			case ir.PrimitiveString:
+				if rule.Name == "eq" || rule.Name == "ne" {
+					continue
+				}
+				canonical, err = canonicalLength(rule.Param)
+			case ir.PrimitiveTime:
+				if rule.Name == "eq" || rule.Name == "ne" {
+					return nil, fmt.Errorf("validator %q on time.Time is not supported", rule.Name)
+				}
+				canonical, err = canonicalLength(rule.Param)
+			case ir.PrimitiveInt, ir.PrimitiveDuration:
+				canonical, err = canonicalInt(rule.Param, t.BitSize)
+			case ir.PrimitiveUint:
+				canonical, err = canonicalUint(rule.Param, t.BitSize)
+			case ir.PrimitiveFloat:
+				canonical, err = canonicalFloat(rule.Param, t.BitSize)
+			case ir.PrimitiveBool:
+				if rule.Name != "eq" && rule.Name != "ne" {
+					err = fmt.Errorf("validator %q is not numeric for bool", rule.Name)
+				} else if rule.Param == "true" || rule.Param == "false" {
+					canonical = rule.Param
+				} else {
+					err = fmt.Errorf("expected true or false")
+				}
+			default:
+				err = fmt.Errorf("unsupported validation parameter type")
+			}
+		case *ir.ArrayDescriptor, *ir.MapDescriptor:
+			canonical, err = canonicalLength(rule.Param)
+		default:
+			err = fmt.Errorf("unsupported validation parameter type")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s parameter %q: %w", rule.Name, rule.Param, err)
+		}
+		rule.Param = canonical
+	}
+	if alias, ok := retainedRecursiveAlias(ctx, typ); ok {
+		switch base.(type) {
+		case *ir.ArrayDescriptor, *ir.MapDescriptor:
+			for _, rule := range result {
+				if rule.Param != "" && ruleEmbedsParameter(rule.Name) {
+					return nil, fmt.Errorf("validator %q on recursive alias %s is not supported", rule.Name, alias.Name)
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+func validationOperation(rule ValidateRule, mini bool) string {
+	if mini {
+		validation, _ := rule.ZodMiniCheck(ZodMiniTypeNumber)
+		return validation
+	}
+	validation, _ := rule.ZodMethodWithSupport(false)
+	return validation
+}
+
+func retainedAppliedGenericType(ctx *EmitContext, typ ir.TypeDescriptor) (ir.GoIdentifier, bool) {
+	if ctx == nil || ctx.Schema == nil {
+		return ir.GoIdentifier{}, false
+	}
+	seen := make(map[ir.GoIdentifier]bool)
+	for {
+		switch typed := typ.(type) {
+		case *ir.PtrDescriptor:
+			typ = typed.Element
+		case *ir.ReferenceDescriptor:
+			if len(typed.TypeArguments) > 0 {
+				return typed.Target, true
+			}
+			if seen[typed.Target] {
+				return ir.GoIdentifier{}, false
+			}
+			alias, ok := ctx.Schema.FindType(typed.Target).(*ir.AliasDescriptor)
+			if !ok {
+				return ir.GoIdentifier{}, false
+			}
+			seen[typed.Target] = true
+			typ = alias.Underlying
+		default:
+			return ir.GoIdentifier{}, false
+		}
+	}
+}
+
+func retainedRecursiveAlias(ctx *EmitContext, typ ir.TypeDescriptor) (ir.GoIdentifier, bool) {
+	if ctx == nil || ctx.Schema == nil {
+		return ir.GoIdentifier{}, false
+	}
+	seen := make(map[ir.GoIdentifier]bool)
+	for {
+		switch typed := typ.(type) {
+		case *ir.PtrDescriptor:
+			typ = typed.Element
+		case *ir.ReferenceDescriptor:
+			if len(typed.TypeArguments) > 0 {
+				return ir.GoIdentifier{}, false
+			}
+			alias, ok := ctx.Schema.FindType(typed.Target).(*ir.AliasDescriptor)
+			if !ok {
+				return ir.GoIdentifier{}, false
+			}
+			if ctx.RecursiveTypes[typed.Target] {
+				return typed.Target, true
+			}
+			if seen[typed.Target] {
+				return ir.GoIdentifier{}, false
+			}
+			seen[typed.Target] = true
+			typ = alias.Underlying
+		default:
+			return ir.GoIdentifier{}, false
+		}
+	}
+}
+
+func resolveValidationType(ctx *EmitContext, typ ir.TypeDescriptor) ir.TypeDescriptor {
+	seen := make(map[ir.TypeDescriptor]bool)
+	for {
+		if typ == nil || seen[typ] {
+			return typ
+		}
+		seen[typ] = true
+		switch t := typ.(type) {
+		case *ir.PtrDescriptor:
+			typ = t.Element
+		case *ir.ReferenceDescriptor:
+			if len(t.TypeArguments) > 0 || ctx == nil || ctx.Schema == nil {
+				return typ
+			}
+			target := ctx.Schema.FindType(t.Target)
+			switch target := target.(type) {
+			case *ir.AliasDescriptor:
+				typ = target.Underlying
+			case *ir.EnumDescriptor:
+				if len(target.Members) == 0 {
+					return typ
+				}
+				switch target.Members[0].Value.(type) {
+				case string:
+					return ir.String()
+				case int64:
+					return ir.Int(64)
+				case float64:
+					return ir.Float(64)
+				default:
+					return typ
+				}
+			default:
+				return typ
+			}
+		default:
+			return typ
+		}
+	}
+}
+
+func rejectUnsupportedStructuralValidation(rules []ValidateRule) error {
+	for _, rule := range rules {
+		switch rule.Name {
+		case "keys", "endkeys":
+			return fmt.Errorf("validator %q composition is not supported for TypeScript schema generation", rule.Name)
+		}
+	}
+	return nil
+}
+
+func isSkippableNestedValidator(name string) bool {
+	switch name {
+	case "omitempty", "omitzero", "omitnil", "unique",
+		"required_with", "required_without", "required_if", "excluded_if", "excluded_unless",
+		"eqfield", "nefield", "gtfield", "gtefield", "ltfield", "ltefield",
+		"eqcsfield", "necsfield", "gtcsfield", "gtecsfield", "ltcsfield", "ltecsfield":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveValidationEnum(ctx *EmitContext, typ ir.TypeDescriptor) *ir.EnumDescriptor {
+	if ctx == nil || ctx.Schema == nil {
+		return nil
+	}
+	seen := make(map[ir.GoIdentifier]bool)
+	for {
+		switch t := typ.(type) {
+		case *ir.PtrDescriptor:
+			typ = t.Element
+		case *ir.ReferenceDescriptor:
+			if len(t.TypeArguments) > 0 || seen[t.Target] {
+				return nil
+			}
+			seen[t.Target] = true
+			target := ctx.Schema.FindType(t.Target)
+			switch target := target.(type) {
+			case *ir.AliasDescriptor:
+				typ = target.Underlying
+			case *ir.EnumDescriptor:
+				return target
+			default:
+				return nil
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+func ruleEmbedsParameter(name string) bool {
+	switch name {
+	case "min", "max", "len", "gt", "gte", "lt", "lte", "eq", "ne":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalLength(value string) (string, error) {
+	parsed, err := strconv.ParseUint(value, 10, 53)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatUint(parsed, 10), nil
+}
+
+func canonicalInt(value string, bitSize int) (string, error) {
+	if bitSize == 0 {
+		bitSize = 64
+	}
+	parsed, err := strconv.ParseInt(value, 10, bitSize)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(parsed, 10), nil
+}
+
+func canonicalUint(value string, bitSize int) (string, error) {
+	if bitSize == 0 {
+		bitSize = 64
+	}
+	parsed, err := strconv.ParseUint(value, 10, bitSize)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatUint(parsed, 10), nil
+}
+
+func canonicalFloat(value string, bitSize int) (string, error) {
+	if bitSize == 0 {
+		bitSize = 64
+	}
+	parsed, err := strconv.ParseFloat(value, bitSize)
+	if err != nil {
+		return "", err
+	}
+	if math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+		return "", fmt.Errorf("value must be finite")
+	}
+	return strconv.FormatFloat(parsed, 'g', -1, bitSize), nil
+}
+
+var oneOfParamPattern = regexp.MustCompile(`'[^']*'|\S+`)
+
+func parseOneOfValues(param string) []string {
+	values := oneOfParamPattern.FindAllString(param, -1)
+	for i := range values {
+		values[i] = strings.ReplaceAll(values[i], "'", "")
+	}
+	return values
 }
 
 // ZodMethod converts a ValidateRule to a Zod method chain.
@@ -166,11 +483,11 @@ func (r ValidateRule) ZodMethodWithSupport(isString bool) (string, ZodSupport) {
 	case "datetime":
 		return ".datetime()", ZodSupported
 	case "ip":
-		return ".ip()", ZodSupported
+		return ".refine(v => z.union([z.ipv4(), z.ipv6()]).safeParse(v).success)", ZodSupported
 	case "ip4", "ipv4":
-		return ".ip({ version: \"v4\" })", ZodSupported
+		return ".ipv4()", ZodSupported
 	case "ip6", "ipv6":
-		return ".ip({ version: \"v6\" })", ZodSupported
+		return ".ipv6()", ZodSupported
 	case "base64":
 		return ".regex(/^[A-Za-z0-9+/]*={0,2}$/)", ZodSupported
 	case "base64url":
@@ -335,7 +652,7 @@ func (r ValidateRule) ZodMiniCheck(typeKind ZodMiniTypeKind) (string, ZodSupport
 	case "datetime":
 		return "z.iso.datetime()", ZodSupported
 	case "ip":
-		return "z.ip()", ZodSupported
+		return "z.refine(v => z.union([z.ipv4(), z.ipv6()]).safeParse(v).success)", ZodSupported
 	case "ip4", "ipv4":
 		return "z.ipv4()", ZodSupported
 	case "ip6", "ipv6":
