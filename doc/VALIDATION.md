@@ -31,7 +31,7 @@ By default, GET requests ignore unknown query parameters. This provides flexibil
 
 ```go
 // Unknown params like ?typo=value or ?analytics_id=123 are silently ignored
-Query(ListUsers)
+users.Query("List", ListUsers)
 ```
 
 ### Strict Mode
@@ -45,7 +45,7 @@ type SearchParams struct {
 }
 
 // Returns error if client sends unknown query parameters
-Query(SearchUsers).WithStrictQueryParams()
+users.Query("Search", SearchUsers, tygor.WithStrictQueryParams())
 ```
 
 This helps during development to catch mistakes like `?usre_id=123` instead of `?user_id=123`.
@@ -67,7 +67,7 @@ func BulkUpdate(ctx context.Context, req *BulkRequest) (*BulkResponse, error) {
     // ...
 }
 
-Exec(BulkUpdate).WithSkipValidation()
+users.Exec("BulkUpdate", BulkUpdate, tygor.WithoutValidation())
 ```
 
 ## Custom Validation with Interceptors
@@ -97,11 +97,11 @@ func CustomValidationInterceptor(ctx *tygor.Context, req any, handler tygor.Hand
     return handler(ctx, req)
 }
 
-// Apply globally
-app.WithUnaryInterceptor(CustomValidationInterceptor)
+// Apply globally when constructing the app
+app := tygor.NewApp(tygor.WithUnaryInterceptors(CustomValidationInterceptor))
 
 // Or per-handler
-Query(Search).WithUnaryInterceptor(CustomValidationInterceptor)
+users.Query("Search", Search, tygor.WithUnaryInterceptors(CustomValidationInterceptor))
 ```
 
 Interceptors are useful for:
@@ -117,7 +117,7 @@ When a request arrives, validation happens in this order:
 
 1. **Query/Body Decoding**: Parameters are decoded into the request struct
    - For GET requests with `WithStrictQueryParams()`, unknown parameters cause an error here
-2. **Struct Validation**: The `validator` package validates struct tags (unless `WithSkipValidation()` is used)
+2. **Struct Validation**: The `validator` package validates struct tags (unless `WithoutValidation()` is used)
 3. **Interceptors**: Global, service, and handler-level interceptors run (can include custom validation)
 4. **Handler Function**: Your handler executes with a validated request
 
@@ -129,7 +129,7 @@ When a request arrives, validation happens in this order:
 | Catch query parameter typos | `WithStrictQueryParams()` |
 | Complex cross-field validation | Interceptor |
 | Business logic validation | Interceptor |
-| Manual validation | `WithSkipValidation()` + validate in handler |
+| Manual validation | `WithoutValidation()` + validate in handler |
 | Different rules per handler | Handler-level interceptor |
 | Database lookups for validation | Interceptor |
 

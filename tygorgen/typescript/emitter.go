@@ -705,6 +705,9 @@ func (e *Emitter) determineOptionalNullable(field ir.FieldDescriptor) (optional,
 	// Nullable is determined by whether the type can hold nil
 	// Check for pointer, slice, or map (unwrapping pointers to get to the base)
 	fieldType := field.Type
+	if field.StringEncoded {
+		fieldType = e.resolveStringEncodedFieldType(fieldType)
+	}
 	switch t := fieldType.(type) {
 	case *ir.PtrDescriptor:
 		nullable = true
@@ -732,6 +735,32 @@ func (e *Emitter) determineOptionalNullable(field ir.FieldDescriptor) (optional,
 	// default: use the independent optional/nullable values as computed
 
 	return optional, nullable, nil
+}
+
+func (e *Emitter) resolveStringEncodedFieldType(typ ir.TypeDescriptor) ir.TypeDescriptor {
+	seen := make(map[ir.GoIdentifier]bool)
+	for {
+		switch t := typ.(type) {
+		case *ir.ReferenceDescriptor:
+			if e.schema == nil || seen[t.Target] {
+				return typ
+			}
+			alias, ok := e.schema.FindType(t.Target).(*ir.AliasDescriptor)
+			if !ok {
+				return typ
+			}
+			seen[t.Target] = true
+			typ = alias.Underlying
+		case *ir.AliasDescriptor:
+			if seen[t.Name] {
+				return typ
+			}
+			seen[t.Name] = true
+			typ = t.Underlying
+		default:
+			return typ
+		}
+	}
 }
 
 // getPropertyName returns the property name for a field.

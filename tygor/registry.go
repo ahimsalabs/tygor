@@ -1,13 +1,13 @@
 package tygor
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
-
-	"tygor.dev/internal"
 )
 
 // App is the central router for API handlers.
@@ -15,7 +15,7 @@ import (
 // Use Handler() to get an http.Handler for use with http.ListenAndServe.
 type App struct {
 	mu                      sync.RWMutex
-	routes                  map[string]Endpoint
+	routes                  map[string]endpointHandler
 	errorTransformer        ErrorTransformer
 	maskInternalErrors      bool
 	interceptors            []UnaryInterceptor
@@ -26,6 +26,7 @@ type App struct {
 	streamWriteTimeoutIsSet bool // distinguishes zero (disabled) from unset (use default)
 	streamHeartbeat         time.Duration
 	streamHeartbeatIsSet    bool // distinguishes zero (disabled) from unset (use default)
+	handler                 http.Handler
 }
 
 const (
@@ -51,75 +52,18 @@ func primitiveToHTTPMethod(primitive string) string {
 	}
 }
 
-func NewApp() *App {
-	return &App{
-		routes:             make(map[string]Endpoint),
+// NewApp creates an application and applies options from left to right.
+func NewApp(options ...AppOption) *App {
+	app := &App{
+		routes:             make(map[string]endpointHandler),
 		maxRequestBodySize: 1 << 20, // 1MB default
 		// streamWriteTimeout uses DefaultStreamWriteTimeout when not explicitly set
 	}
-}
-
-// WithErrorTransformer adds a custom error transformer.
-// It returns the app for chaining.
-func (a *App) WithErrorTransformer(fn ErrorTransformer) *App {
-	a.errorTransformer = fn
-	return a
-}
-
-// WithMaskInternalErrors enables masking of internal error messages.
-// This is useful in production to avoid leaking sensitive information.
-// The original error is still available to interceptors and logging.
-func (a *App) WithMaskInternalErrors() *App {
-	a.maskInternalErrors = true
-	return a
-}
-
-// WithUnaryInterceptor adds a global interceptor.
-// Global interceptors are executed before service-level and handler-level interceptors.
-//
-// Interceptor execution order:
-//  1. Global interceptors (added via App.WithUnaryInterceptor)
-//  2. Service interceptors (added via Service.WithUnaryInterceptor)
-//  3. Handler interceptors (added via Handler.WithUnaryInterceptor)
-//  4. Handler function
-//
-// Within each level, interceptors execute in the order they were added.
-func (a *App) WithUnaryInterceptor(i UnaryInterceptor) *App {
-	a.interceptors = append(a.interceptors, i)
-	return a
-}
-
-// WithMiddleware adds an HTTP middleware to wrap the app.
-// Middleware is applied in the order added (first added is outermost).
-func (a *App) WithMiddleware(mw func(http.Handler) http.Handler) *App {
-	a.middlewares = append(a.middlewares, mw)
-	return a
-}
-
-// WithLogger sets a custom logger for the app.
-// If not set, slog.Default() will be used.
-func (a *App) WithLogger(logger *slog.Logger) *App {
-	a.logger = logger
-	return a
-}
-
-// WithMaxRequestBodySize sets the default maximum request body size for all handlers.
-// Individual handlers can override this with Handler.WithMaxRequestBodySize.
-// A value of 0 means no limit. Default is 1MB (1 << 20).
-func (a *App) WithMaxRequestBodySize(size uint64) *App {
-	a.maxRequestBodySize = size
-	return a
-}
-
-// WithStreamWriteTimeout sets the default timeout for writing SSE events.
-// If a single event write takes longer than this, the stream is closed.
-// Individual handlers can override this with StreamHandler.WithWriteTimeout.
-//
-// Default is 30 seconds. Use 0 to disable (not recommended - risks goroutine leaks).
-func (a *App) WithStreamWriteTimeout(d time.Duration) *App {
-	a.streamWriteTimeout = d
-	a.streamWriteTimeoutIsSet = true
-	return a
+	for _, option := range options {
+		option.applyApp(app)
+	}
+	app.handler = app.buildHandler()
+	return app
 }
 
 // getStreamWriteTimeout returns the effective stream write timeout.
@@ -128,17 +72,6 @@ func (a *App) getStreamWriteTimeout() time.Duration {
 		return a.streamWriteTimeout
 	}
 	return defaultStreamWriteTimeout
-}
-
-// WithStreamHeartbeat sets the default interval for sending SSE heartbeat comments.
-// Heartbeats keep connections alive through proxies with idle timeouts.
-// Individual handlers can override this with StreamHandler.WithHeartbeat.
-//
-// Default is 30 seconds. Use 0 to disable heartbeats.
-func (a *App) WithStreamHeartbeat(d time.Duration) *App {
-	a.streamHeartbeat = d
-	a.streamHeartbeatIsSet = true
-	return a
 }
 
 // getStreamHeartbeat returns the effective stream heartbeat interval.
@@ -154,9 +87,13 @@ func (a *App) getStreamHeartbeat() time.Duration {
 //
 // Example:
 //
-//	app := tygor.NewApp().WithMiddleware(cors)
+//	app := tygor.NewApp(tygor.WithHTTPMiddleware(cors))
 //	http.ListenAndServe(":8080", app.Handler())
 func (a *App) Handler() http.Handler {
+	return a.handler
+}
+
+func (a *App) buildHandler() http.Handler {
 	var h http.Handler = http.HandlerFunc(a.serveHTTP)
 	// Apply middleware in reverse order so first added is outermost
 	for i := len(a.middlewares) - 1; i >= 0; i-- {
@@ -165,12 +102,21 @@ func (a *App) Handler() http.Handler {
 	return h
 }
 
-// Service returns a Service namespace.
-func (a *App) Service(name string) *Service {
-	return &Service{
+// ServeHTTP implements [http.Handler].
+func (a *App) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	a.handler.ServeHTTP(w, req)
+}
+
+// Service returns a namespace with options applied from left to right.
+func (a *App) Service(name string, options ...ServiceOption) *Service {
+	service := &Service{
 		registry: a,
 		name:     name,
 	}
+	for _, option := range options {
+		option.applyService(service)
+	}
+	return service
 }
 
 // serveHTTP handles incoming API requests (internal, called via Handler()).
@@ -219,15 +165,8 @@ func (a *App) serveHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Type assert to internal handler interface
-	h, ok := handler.(endpointHandler)
-	if !ok {
-		writeError(recovery, w, NewError(CodeInternal, "invalid handler type"), a.logger)
-		return
-	}
-
 	// Check HTTP Method based on primitive
-	meta := h.metadata()
+	meta := handler.metadata()
 	expectedMethod := primitiveToHTTPMethod(meta.Primitive)
 	if req.Method != expectedMethod {
 		writeError(recovery, w, Errorf(CodeMethodNotAllowed, "method %s not allowed, expected %s", req.Method, expectedMethod), a.logger)
@@ -246,33 +185,96 @@ func (a *App) serveHTTP(w http.ResponseWriter, req *http.Request) {
 	rpcCtx.streamHeartbeat = a.getStreamHeartbeat()
 
 	// Execute handler
-	h.serveHTTP(rpcCtx)
+	handler.serveHTTP(rpcCtx)
 }
 
+// Service groups endpoints under one URL and metadata namespace.
+// Options passed to [App.Service] become defaults for its endpoints.
 type Service struct {
-	registry     *App
-	name         string
-	interceptors []UnaryInterceptor
+	registry           *App
+	name               string
+	interceptors       []UnaryInterceptor
+	streamInterceptors []StreamInterceptor
+	maxRequestBodySize *uint64
+	streamWriteTimeout *time.Duration
+	streamHeartbeat    *time.Duration
 }
 
-// WithUnaryInterceptor adds an interceptor to this service.
-// Service interceptors execute after global interceptors but before handler interceptors.
-// See App.WithUnaryInterceptor for the complete execution order.
-func (s *Service) WithUnaryInterceptor(i UnaryInterceptor) *Service {
-	s.interceptors = append(s.interceptors, i)
-	return s
+// Exec registers a POST handler for a non-streaming API operation. Options are
+// applied before the endpoint becomes visible to requests.
+func (s *Service) Exec[Req, Res any](name string, fn func(context.Context, Req) (Res, error), options ...ExecOption) {
+	config := execConfig{
+		interceptors:       slices.Clone(s.interceptors),
+		maxRequestBodySize: clonePtr(s.maxRequestBodySize),
+	}
+	for _, option := range options {
+		option.applyExec(&config)
+	}
+	handler := makeExecHandler(fn, config)
+	s.register(name, handler)
 }
 
-// Register registers a handler for the given operation name.
+// Query registers a GET handler for a read operation. Options are applied
+// before the endpoint becomes visible to requests.
+func (s *Service) Query[Req, Res any](name string, fn func(context.Context, Req) (Res, error), options ...QueryOption) {
+	config := queryConfig{interceptors: slices.Clone(s.interceptors)}
+	for _, option := range options {
+		option.applyQuery(&config)
+	}
+	handler := makeQueryHandler(fn, config)
+	s.register(name, handler)
+}
+
+// Stream registers an SSE streaming handler. Options are applied before the
+// endpoint becomes visible to requests.
+//
+// The handler receives a [StreamWriter] to send events to the client. Send and
+// SendWithID return an error when the client disconnects, the context ends, or
+// a write fails. Disconnect-related errors satisfy errors.Is(err,
+// [ErrStreamClosed]); handlers should return when a send fails. Application
+// errors after SSE starts are sent as a final event only while the transport
+// remains usable.
+//
+// Example:
+//
+//	feed.Stream("Subscribe", Subscribe,
+//	    tygor.WithStreamHeartbeat(15*time.Second),
+//	    tygor.WithUnaryInterceptors(authInterceptor),
+//	)
+func (s *Service) Stream[Req, Res any](name string, fn func(context.Context, Req, StreamWriter[Res]) error, options ...StreamOption) {
+	config := streamConfig{
+		unaryInterceptors:  slices.Clone(s.interceptors),
+		streamInterceptors: slices.Clone(s.streamInterceptors),
+		maxRequestBodySize: clonePtr(s.maxRequestBodySize),
+		writeTimeout:       clonePtr(s.streamWriteTimeout),
+		heartbeatInterval:  clonePtr(s.streamHeartbeat),
+	}
+	for _, option := range options {
+		option.applyStream(&config)
+	}
+	handler := makeStreamHandler(fn, config)
+	s.register(name, handler)
+}
+
+// LiveValue registers a synchronized value as an SSE endpoint. Options are
+// applied before the endpoint becomes visible to requests.
+func (s *Service) LiveValue[T any](name string, value *LiveValue[T], options ...LiveValueOption) {
+	config := liveValueConfig{
+		interceptors:      slices.Clone(s.interceptors),
+		writeTimeout:      clonePtr(s.streamWriteTimeout),
+		heartbeatInterval: clonePtr(s.streamHeartbeat),
+	}
+	for _, option := range options {
+		option.applyLiveValue(&config)
+	}
+	handler := makeLiveValueHandler(value, config)
+	s.register(name, handler)
+}
+
+// register registers a handler for the given operation name.
 // If a handler is already registered for this service and method, it will be replaced
 // and a warning will be logged.
-func (s *Service) Register(name string, handler Endpoint) {
-	// Type assert to internal handler interface
-	h, ok := handler.(endpointHandler)
-	if !ok {
-		panic("tygor: handler must be created with Exec(), Query(), or Stream()")
-	}
-
+func (s *Service) register(name string, handler endpointHandler) {
 	key := s.name + "." + name
 	s.registry.mu.Lock()
 	defer s.registry.mu.Unlock()
@@ -289,36 +291,5 @@ func (s *Service) Register(name string, handler Endpoint) {
 			slog.String("route", key))
 	}
 
-	// Wrap the handler to include service interceptors
-	wrappedHandler := &serviceWrappedHandler{
-		inner:        h,
-		interceptors: s.interceptors,
-	}
-
-	s.registry.routes[key] = wrappedHandler
-}
-
-type serviceWrappedHandler struct {
-	inner        endpointHandler
-	interceptors []UnaryInterceptor
-}
-
-func (h *serviceWrappedHandler) serveHTTP(ctx *rpcContext) {
-	// Combine: Global (ctx.interceptors) + Service (h.interceptors)
-	combined := make([]UnaryInterceptor, 0, len(ctx.interceptors)+len(h.interceptors))
-	combined = append(combined, ctx.interceptors...)
-	combined = append(combined, h.interceptors...)
-
-	// Update context with combined interceptors
-	ctx.interceptors = combined
-
-	h.inner.serveHTTP(ctx)
-}
-
-func (h *serviceWrappedHandler) metadata() *internal.MethodMetadata {
-	return h.inner.metadata()
-}
-
-func (h *serviceWrappedHandler) Metadata() *internal.MethodMetadata {
-	return h.inner.Metadata()
+	s.registry.routes[key] = handler
 }

@@ -44,10 +44,10 @@ func (event errorJSONEvent) MarshalJSON() ([]byte, error) {
 }
 
 func TestStreamMarshalPanicAfterCommitRejectsRealClientReads(t *testing.T) {
-	app := tygor.NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0)
-	app.Service("Feed").Register("Subscribe", tygor.Stream(func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[panicJSONEvent]) error {
+	app := tygor.NewApp(tygor.WithMaskInternalErrors(), tygor.WithStreamWriteTimeout(0))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[panicJSONEvent]) error {
 		return stream.Send(panicJSONEvent{})
-	}))
+	})
 	server := httptest.NewServer(app.Handler())
 	t.Cleanup(server.Close)
 
@@ -62,13 +62,13 @@ func TestStreamInterceptorCannotRecoverProducerPanicFromRealClient(t *testing.T)
 			events(yield)
 		}
 	}
-	app := tygor.NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0)
-	app.Service("Feed").Register("Subscribe", tygor.Stream(func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[streamEvent]) error {
+	app := tygor.NewApp(tygor.WithMaskInternalErrors(), tygor.WithStreamWriteTimeout(0))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[streamEvent]) error {
 		if err := stream.Send(streamEvent{ID: 1, Message: "before panic"}); err != nil {
 			return err
 		}
 		panic("private producer panic")
-	}).WithStreamInterceptor(recoveringInterceptor))
+	}, tygor.WithStreamInterceptors(recoveringInterceptor))
 	server := httptest.NewServer(app.Handler())
 	t.Cleanup(server.Close)
 
@@ -94,11 +94,14 @@ func TestStreamUnaryInterceptorSetupRecoveryDoesNotAffectStreamLifetime(t *testi
 		defer panic("private unary cleanup panic")
 		return next(ctx, req)
 	}
-	app := tygor.NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).
-		WithUnaryInterceptor(outer).WithUnaryInterceptor(inner)
-	app.Service("Feed").Register("Subscribe", tygor.Stream(func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[streamEvent]) error {
+	app := tygor.NewApp(
+		tygor.WithMaskInternalErrors(),
+		tygor.WithStreamWriteTimeout(0),
+		tygor.WithUnaryInterceptors(outer, inner),
+	)
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[streamEvent]) error {
 		return stream.Send(streamEvent{ID: 1, Message: "before panic"})
-	}))
+	})
 	server := httptest.NewServer(app.Handler())
 	t.Cleanup(server.Close)
 
@@ -129,13 +132,17 @@ func TestStreamUnaryInterceptorDoesNotObserveCommittedMarshalErrorFromRealClient
 				}
 				return nil, nil
 			}
-			app := tygor.NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-			app.Service("Feed").Register("Subscribe", tygor.Stream(func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[errorJSONEvent]) error {
+			app := tygor.NewApp(
+				tygor.WithMaskInternalErrors(),
+				tygor.WithStreamWriteTimeout(0),
+				tygor.WithUnaryInterceptors(interceptor),
+			)
+			app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[errorJSONEvent]) error {
 				if err := stream.Send(errorJSONEvent{ID: 1}); err != nil {
 					return err
 				}
 				return stream.Send(errorJSONEvent{Err: test.err})
-			}))
+			})
 			server := httptest.NewServer(app.Handler())
 			t.Cleanup(server.Close)
 
@@ -166,10 +173,10 @@ func (w *partialEventWriter) Write(p []byte) (int, error) {
 func (w *partialEventWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func TestStreamPartialEventWriteDoesNotCompleteRealClientRead(t *testing.T) {
-	app := tygor.NewApp().WithStreamWriteTimeout(0)
-	app.Service("Feed").Register("Subscribe", tygor.Stream(func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[streamEvent]) error {
+	app := tygor.NewApp(tygor.WithStreamWriteTimeout(0))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ tygor.Empty, stream tygor.StreamWriter[streamEvent]) error {
 		return stream.Send(streamEvent{ID: 1})
-	}))
+	})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		app.Handler().ServeHTTP(&partialEventWriter{ResponseWriter: w}, req)
 	}))

@@ -28,8 +28,8 @@ func SetupApp() *tygor.App {
 	app := tygor.NewApp()
 
 	users := app.Service("Users")
-	users.Register("Get", tygor.Query(GetUser))      // GET request
-	users.Register("Create", tygor.Exec(CreateUser)) // POST request
+	users.Query("Get", GetUser)      // GET request
+	users.Exec("Create", CreateUser) // POST request
 
 	return app
 }

@@ -51,7 +51,7 @@ var ErrLiveValueClosed = errors.New("livevalue closed")
 //	}
 //
 //	// Register SSE endpoint with proper "livevalue" primitive
-//	svc.Register("Status", status.Handler())
+//	svc.LiveValue("Status", status)
 type LiveValue[T any] struct {
 	mu          sync.RWMutex
 	bytes       json.RawMessage
@@ -151,14 +151,13 @@ func (a *LiveValue[T]) Subscribe(ctx context.Context) iter.Seq[T] {
 	}
 }
 
-// Handler returns a LiveValueHandler for registering with a Service.
-// The handler uses the "livevalue" primitive for proper TypeScript codegen.
-//
-// Example:
-//
-//	svc.Register("Status", statusLiveValue.Handler())
-func (a *LiveValue[T]) Handler() *LiveValueHandler[T] {
-	return &LiveValueHandler[T]{liveValue: a}
+func makeLiveValueHandler[T any](a *LiveValue[T], config liveValueConfig) *liveValueHandler[T] {
+	return &liveValueHandler[T]{
+		liveValue:         a,
+		interceptors:      config.interceptors,
+		writeTimeout:      config.writeTimeout,
+		heartbeatInterval: config.heartbeatInterval,
+	}
 }
 
 func (a *LiveValue[T]) isClosed() bool {
@@ -261,38 +260,15 @@ func mustDecodeLiveValue[T any](data json.RawMessage) T {
 	return value
 }
 
-// LiveValueHandler implements [Endpoint] for LiveValue subscriptions.
-// It streams the current value immediately, then pushes updates via SSE.
-type LiveValueHandler[T any] struct {
+type liveValueHandler[T any] struct {
 	liveValue         *LiveValue[T]
 	interceptors      []UnaryInterceptor
-	writeTimeout      time.Duration
-	writeTimeoutIsSet bool
-	heartbeatInterval time.Duration
+	writeTimeout      *time.Duration
+	heartbeatInterval *time.Duration
 }
 
-// WithUnaryInterceptor adds an interceptor that runs during stream setup.
-func (h *LiveValueHandler[T]) WithUnaryInterceptor(i UnaryInterceptor) *LiveValueHandler[T] {
-	h.interceptors = append(h.interceptors, i)
-	return h
-}
-
-// WithWriteTimeout sets the timeout for writing each event to the client.
-// A zero duration explicitly disables deadlines but still requires flushing.
-func (h *LiveValueHandler[T]) WithWriteTimeout(d time.Duration) *LiveValueHandler[T] {
-	h.writeTimeout = d
-	h.writeTimeoutIsSet = true
-	return h
-}
-
-// WithHeartbeat sets the interval for sending SSE heartbeat comments.
-func (h *LiveValueHandler[T]) WithHeartbeat(d time.Duration) *LiveValueHandler[T] {
-	h.heartbeatInterval = d
-	return h
-}
-
-// Metadata implements [Endpoint].
-func (h *LiveValueHandler[T]) Metadata() *internal.MethodMetadata {
+// metadata returns the runtime metadata for the livevalue handler.
+func (h *liveValueHandler[T]) metadata() *internal.MethodMetadata {
 	var req Empty
 	var res T
 	return &internal.MethodMetadata{
@@ -302,13 +278,8 @@ func (h *LiveValueHandler[T]) Metadata() *internal.MethodMetadata {
 	}
 }
 
-// metadata returns the runtime metadata for the livevalue handler.
-func (h *LiveValueHandler[T]) metadata() *internal.MethodMetadata {
-	return h.Metadata()
-}
-
 // serveHTTP implements the SSE streaming for livevalue subscriptions.
-func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
+func (h *liveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 	state := &streamResponseState{}
 	logger := ctx.logger
 	if logger == nil {
@@ -344,8 +315,8 @@ func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 	}
 
 	writeTimeout := ctx.streamWriteTimeout
-	if h.writeTimeoutIsSet {
-		writeTimeout = h.writeTimeout
+	if h.writeTimeout != nil {
+		writeTimeout = *h.writeTimeout
 	}
 	var preflightErr error
 	ctx.panicRecovery.own(func() {
@@ -377,8 +348,8 @@ func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 	})
 
 	heartbeatInterval := ctx.streamHeartbeat
-	if h.heartbeatInterval > 0 {
-		heartbeatInterval = h.heartbeatInterval
+	if h.heartbeatInterval != nil {
+		heartbeatInterval = *h.heartbeatInterval
 	}
 
 	abortTransport := func(message string, err error) {

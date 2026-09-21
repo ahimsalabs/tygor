@@ -1,40 +1,6 @@
 package ir
 
-import (
-	"encoding/json"
-	"reflect"
-	"strconv"
-)
-
-type stringEncodingProbePointer *int
-
-type definedPointerStringEncodingSupport struct {
-	direct  bool
-	pointer bool
-}
-
-var definedPointerStringEncoding = func() definedPointerStringEncodingSupport {
-	value := 1
-	directValue := stringEncodingProbePointer(&value)
-	probeType := reflect.StructOf([]reflect.StructField{
-		{Name: "Direct", Type: reflect.TypeOf(directValue), Tag: `json:"direct,string"`},
-		{Name: "Pointer", Type: reflect.TypeOf(&directValue), Tag: `json:"pointer,string"`},
-	})
-	probe := reflect.New(probeType).Elem()
-	probe.Field(0).Set(reflect.ValueOf(directValue))
-	probe.Field(1).Set(reflect.ValueOf(&directValue))
-	payload, err := json.Marshal(probe.Interface())
-	if err != nil {
-		return definedPointerStringEncodingSupport{}
-	}
-	var decoded map[string]any
-	if json.Unmarshal(payload, &decoded) != nil {
-		return definedPointerStringEncodingSupport{}
-	}
-	_, direct := decoded["direct"].(string)
-	_, pointer := decoded["pointer"].(string)
-	return definedPointerStringEncodingSupport{direct: direct, pointer: pointer}
-}()
+import "strconv"
 
 // Schema represents a complete set of types and services to generate.
 type Schema struct {
@@ -414,20 +380,21 @@ func validateTypeParameters(parameters []TypeParameterDescriptor, context string
 }
 
 // StringEncodingApplies reports whether encoding/json applies a field's
-// json:",string" option to td. The exact defined-pointer behavior is probed
-// because encoding/json v2 changed it while retaining the same public API.
+// json:",string" option to td. encoding/json dereferences at most one pointer,
+// including a defined pointer, before checking the field kind. A second pointer
+// does not use string encoding.
 func (s *Schema) StringEncodingApplies(td TypeDescriptor) bool {
-	fieldPointer := false
-	if ptr, ok := td.(*PtrDescriptor); ok {
-		td = ptr.Element
-		fieldPointer = true
-	}
-
+	pointerSeen := false
 	visited := make(map[TypeDescriptor]bool)
-	resolvedAlias := false
 	for !isNilTypeDescriptor(td) && !visited[td] {
 		visited[td] = true
 		switch d := td.(type) {
+		case *PtrDescriptor:
+			if pointerSeen {
+				return false
+			}
+			pointerSeen = true
+			td = d.Element
 		case *PrimitiveDescriptor:
 			switch d.PrimitiveKind {
 			case PrimitiveString, PrimitiveBool, PrimitiveInt, PrimitiveUint, PrimitiveFloat, PrimitiveDuration:
@@ -437,14 +404,7 @@ func (s *Schema) StringEncodingApplies(td TypeDescriptor) bool {
 		case *ReferenceDescriptor:
 			td = s.FindType(d.Target)
 		case *AliasDescriptor:
-			resolvedAlias = true
 			td = d.Underlying
-		case *PtrDescriptor:
-			if !resolvedAlias || (fieldPointer && !definedPointerStringEncoding.pointer) || (!fieldPointer && !definedPointerStringEncoding.direct) {
-				return false
-			}
-			td = d.Element
-			resolvedAlias = false
 		case *EnumDescriptor:
 			if len(d.Members) == 0 {
 				return false

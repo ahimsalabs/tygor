@@ -8,7 +8,7 @@ Thanks for your interest in contributing to tygor!
 
 ### Prerequisites
 
-- Go 1.25.3 or later (that's it!)
+- Go 1.27.1 or later (that's it!)
 - Docker (optional, for local CI testing)
 
 All other tools (Bun, staticcheck, etc.) are managed automatically.

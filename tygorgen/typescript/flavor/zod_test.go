@@ -828,6 +828,47 @@ func TestZodFlavor_StringEncodedNamedScalars(t *testing.T) {
 	}
 }
 
+func TestZodFlavor_StringEncodedAppliedDefinedPointer(t *testing.T) {
+	pkg := "example.com/model"
+	pointerID := ir.GoIdentifier{Name: "PhantomPointer", Package: pkg}
+	applied := ir.RefWithArgs(pointerID.Name, pointerID.Package, ir.String())
+	schema := &ir.Schema{Types: []ir.TypeDescriptor{&ir.AliasDescriptor{
+		Name:           pointerID,
+		TypeParameters: []ir.TypeParameterDescriptor{{ParamName: "T"}},
+		Underlying:     ir.Ptr(ir.Int(64)),
+	}}}
+
+	for _, mini := range []bool{false, true} {
+		t.Run(map[bool]string{false: "regular", true: "mini"}[mini], func(t *testing.T) {
+			flavor := &ZodFlavor{mini: mini}
+			ctx := &EmitContext{Schema: schema}
+			encoded, err := flavor.typeToZod(ctx, applied, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(encoded, "z.string()") || !strings.Contains(encoded, "nullable") || strings.Contains(encoded, "PhantomPointerSchema") {
+				t.Fatalf("string-encoded applied pointer schema = %s", encoded)
+			}
+
+			plain, err := flavor.typeToZod(ctx, applied, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(plain, "PhantomPointerSchema") {
+				t.Fatalf("ordinary applied pointer bypassed its named schema: %s", plain)
+			}
+
+			double, err := flavor.typeToZod(ctx, ir.Ptr(applied), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(double, "PhantomPointerSchema") || !strings.Contains(double, "nullable") {
+				t.Fatalf("double pointer schema = %s", double)
+			}
+		})
+	}
+}
+
 // ============================================================================
 // Zod-Mini Tests
 // ============================================================================

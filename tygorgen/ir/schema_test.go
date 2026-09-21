@@ -847,9 +847,11 @@ func TestSchema_Validate_StringEncodedOnPointerToValid(t *testing.T) {
 func TestSchema_StringEncodingAppliesAtExactPointerDepth(t *testing.T) {
 	scalarID := GoIdentifier{Name: "Scalar", Package: "test"}
 	pointerID := GoIdentifier{Name: "DefinedPointer", Package: "test"}
+	pointerAliasID := GoIdentifier{Name: "DefinedPointerAlias", Package: "test"}
 	s := &Schema{Types: []TypeDescriptor{
 		&AliasDescriptor{Name: scalarID, Underlying: Int(64)},
 		&AliasDescriptor{Name: pointerID, Underlying: Ptr(Int(64))},
+		&AliasDescriptor{Name: pointerAliasID, Underlying: Ref(pointerID.Name, pointerID.Package)},
 	}}
 
 	tests := []struct {
@@ -863,8 +865,10 @@ func TestSchema_StringEncodingAppliesAtExactPointerDepth(t *testing.T) {
 		{name: "double pointer", typ: Ptr(Ptr(Int(64))), want: false},
 		{name: "named scalar", typ: Ref(scalarID.Name, scalarID.Package), want: true},
 		{name: "pointer to named scalar", typ: Ptr(Ref(scalarID.Name, scalarID.Package)), want: true},
-		{name: "defined pointer", typ: Ref(pointerID.Name, pointerID.Package), want: definedPointerStringEncoding.direct},
-		{name: "pointer to defined pointer", typ: Ptr(Ref(pointerID.Name, pointerID.Package)), want: definedPointerStringEncoding.pointer},
+		{name: "defined pointer", typ: Ref(pointerID.Name, pointerID.Package), want: true},
+		{name: "alias to defined pointer", typ: Ref(pointerAliasID.Name, pointerAliasID.Package), want: true},
+		{name: "pointer to defined pointer", typ: Ptr(Ref(pointerID.Name, pointerID.Package)), want: false},
+		{name: "pointer to alias to defined pointer", typ: Ptr(Ref(pointerAliasID.Name, pointerAliasID.Package)), want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -872,6 +876,16 @@ func TestSchema_StringEncodingAppliesAtExactPointerDepth(t *testing.T) {
 				t.Fatalf("StringEncodingApplies() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+
+	s.AddType(&StructDescriptor{
+		Name: GoIdentifier{Name: "ValidDefinedPointer", Package: "test"},
+		Fields: []FieldDescriptor{{
+			Name: "Value", Type: Ref(pointerAliasID.Name, pointerAliasID.Package), StringEncoded: true,
+		}},
+	})
+	if errors := s.Validate(); len(errors) != 0 {
+		t.Fatalf("StringEncoded on a defined pointer should validate, got errors: %v", errors)
 	}
 }
 
