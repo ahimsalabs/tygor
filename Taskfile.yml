@@ -1,5 +1,5 @@
 # Taskfile for tygor
-# Bootstrap: go run github.com/go-task/task/v3/cmd/task@latest setup
+# Bootstrap: go run github.com/go-task/task/v3/cmd/task@v3.45.4 setup
 # https://taskfile.dev/
 
 version: '3'
@@ -7,9 +7,16 @@ version: '3'
 vars:
   TOOLS_DIR: "{{.ROOT_DIR}}/.tools"
   AQUA_ROOT: "{{.ROOT_DIR}}/.tools/aqua-pkgs"
+  STATICCHECK_VERSION:
+    sh: |
+      case "$(go env GOVERSION)" in
+        go1.25*) echo v0.7.0 ;;
+        *) echo v0.8.1 ;;
+      esac
 
 env:
   GOBIN: "{{.TOOLS_DIR}}"
+  AQUA_CONFIG: "{{.ROOT_DIR}}/aqua.yaml"
   AQUA_ROOT_DIR: "{{.AQUA_ROOT}}"
   PATH: "{{.TOOLS_DIR}}:{{.AQUA_ROOT}}/bin:{{.Env.PATH}}"
 
@@ -21,11 +28,11 @@ tasks:
   setup:
     desc: Bootstrap project (only requires Go)
     cmds:
-      - go install github.com/go-task/task/v3/cmd/task@latest
-      - go install github.com/aquaproj/aqua/v2/cmd/aqua@latest
-      - go install honnef.co/go/tools/cmd/staticcheck@latest
+      - go install github.com/go-task/task/v3/cmd/task@v3.45.4
+      - go install github.com/aquaproj/aqua/v2/cmd/aqua@v2.54.1
+      - go install honnef.co/go/tools/cmd/staticcheck@{{.STATICCHECK_VERSION}}
       - "{{.TOOLS_DIR}}/aqua i"
-      - "{{.TOOLS_DIR}}/aqua exec -- bun install --ignore-scripts"
+      - "{{.TOOLS_DIR}}/aqua exec -- bun install --frozen-lockfile --ignore-scripts"
     sources:
       - aqua.yaml
       - package.json
@@ -43,11 +50,16 @@ tasks:
     cmds:
       - GOWORK=off go test ./...
 
+  test:e2e:
+    desc: Run cross-language end-to-end tests
+    cmds:
+      - GOWORK=off go test -count=1 -tags=e2e ./e2e
+
   lint:
     desc: Run go vet and staticcheck
     cmds:
       - GOWORK=off go vet ./...
-      - GOWORK=off staticcheck ./...
+      - GOWORK=off {{.TOOLS_DIR}}/staticcheck ./...
 
   fmt:
     desc: Format Go code
@@ -95,6 +107,7 @@ tasks:
     deps:
       - fmt:check
     cmds:
+      - task: precommit:client-package
       - task: precommit:parallel
       - echo "All precommit checks passed."
 
@@ -102,6 +115,7 @@ tasks:
     internal: true
     deps:
       - precommit:test
+      - test:e2e
       - precommit:lint
       - precommit:typecheck
       - precommit:vite-plugin
@@ -121,7 +135,7 @@ tasks:
     cmds:
       - cmd: output=$(GOWORK=off go vet ./... 2>&1) || (echo "$output"; exit 1)
         silent: true
-      - cmd: output=$(GOWORK=off staticcheck ./... 2>&1) || (echo "$output"; exit 1)
+      - cmd: output=$(GOWORK=off {{.TOOLS_DIR}}/staticcheck ./... 2>&1) || (echo "$output"; exit 1)
         silent: true
 
   precommit:typecheck:
@@ -129,6 +143,12 @@ tasks:
     cmds:
       - bun x typescript --noEmit --project doc/examples/tsconfig.json
       - bun x typescript --noEmit --project packages/client/tsconfig.test.json
+
+  precommit:client-package:
+    internal: true
+    cmds:
+      - bun run --silent build:client
+      - bun test packages/client/runtime.test.ts
 
   precommit:vite-plugin:
     internal: true
