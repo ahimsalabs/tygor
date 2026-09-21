@@ -60,10 +60,14 @@ func (d *ArrayDescriptor) MarshalJSON() ([]byte, error) {
 		Kind    string         `json:"kind"`
 		Element TypeDescriptor `json:"element"`
 		Length  int            `json:"length"`
+		IsArray bool           `json:"isArray,omitempty"`
 	}{
 		Kind:    "array",
 		Element: d.Element,
 		Length:  d.Length,
+		// The marker only adds information for [0]T. Positive lengths already
+		// identify arrays and retain the historical JSON representation.
+		IsArray: d.IsArray && d.Length == 0,
 	})
 }
 
@@ -83,13 +87,15 @@ func (d *MapDescriptor) MarshalJSON() ([]byte, error) {
 // MarshalJSON implements json.Marshaler for ReferenceDescriptor.
 func (d *ReferenceDescriptor) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
-		Kind string `json:"kind"`
-		Name string `json:"name"`
-		Pkg  string `json:"package,omitempty"`
+		Kind          string           `json:"kind"`
+		Name          string           `json:"name"`
+		Pkg           string           `json:"package,omitempty"`
+		TypeArguments []TypeDescriptor `json:"typeArguments,omitempty"`
 	}{
-		Kind: "reference",
-		Name: d.Target.Name,
-		Pkg:  d.Target.Package,
+		Kind:          "reference",
+		Name:          d.Target.Name,
+		Pkg:           d.Target.Package,
+		TypeArguments: d.TypeArguments,
 	})
 }
 

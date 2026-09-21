@@ -77,9 +77,10 @@ type SliceAndArrayTypes struct {
 
 // MapTypes demonstrates map usage.
 type MapTypes struct {
-	StringMap map[string]int    `json:"string_map"`
-	IntMap    map[int]string    `json:"int_map"`
-	NestedMap map[string][]User `json:"nested_map,omitempty"`
+	StringMap  map[string]int     `json:"string_map"`
+	IntMap     map[int]string     `json:"int_map"`
+	UintptrMap map[uintptr]string `json:"uintptr_map"`
+	NestedMap  map[string][]User  `json:"nested_map,omitempty"`
 }
 
 // PointerTypes demonstrates pointer fields.
@@ -116,6 +117,25 @@ type TaggedFields struct {
 	Validated     string `json:"validated" validate:"required,email"`
 	OmitZero      []int  `json:"omit_zero,omitzero"`
 	CustomTags    string `json:"custom" db:"custom_db" xml:"CustomXML"`
+}
+
+type DefinedIntPointer *int
+
+// StringEncodingDepths exercises encoding/json's exact ,string applicability.
+type StringEncodingDepths struct {
+	Direct   int               `json:"direct,string"`
+	Single   *int              `json:"single,string"`
+	Double   **int             `json:"double,string"`
+	Triple   ***int            `json:"triple,string"`
+	Duration time.Duration     `json:"duration,string"`
+	Defined  DefinedIntPointer `json:"defined,string"`
+}
+
+type Octet uint8
+
+// DefinedByteSlices exercises encoding/json's base64 treatment of []Octet.
+type DefinedByteSlices struct {
+	Data []Octet `json:"data"`
 }
 
 // Deprecated: OldStruct is deprecated, use User instead.

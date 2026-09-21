@@ -22,6 +22,74 @@ func (c CustomTextType) MarshalText() ([]byte, error) {
 	return []byte(c.value), nil
 }
 
+type MarshalerBytes = []byte
+type MarshalerError = error
+
+type AliasJSONValue int
+
+const AliasJSONValueOne AliasJSONValue = 1
+
+func (AliasJSONValue) MarshalJSON() (MarshalerBytes, error) {
+	return MarshalerBytes(`"json-value"`), nil
+}
+
+type ValidatedAliasJSON string
+
+func (value ValidatedAliasJSON) MarshalJSON() (MarshalerBytes, error) {
+	return json.Marshal(string(value))
+}
+
+type CustomMarshalerValidation struct {
+	Address ValidatedAliasJSON `json:"address" validate:"email"`
+}
+
+type AliasJSONPointer int
+
+func (*AliasJSONPointer) MarshalJSON() (MarshalerBytes, error) {
+	return MarshalerBytes(`"json-pointer"`), nil
+}
+
+type AliasTextValue int
+
+func (AliasTextValue) MarshalText() (MarshalerBytes, error) {
+	return MarshalerBytes("text-value"), nil
+}
+
+type AliasTextPointer int
+
+func (*AliasTextPointer) MarshalText() (MarshalerBytes, error) {
+	return MarshalerBytes("text-pointer"), nil
+}
+
+type AliasResultTextMapKey struct {
+	ID string
+}
+
+func (k AliasResultTextMapKey) MarshalText() (MarshalerBytes, MarshalerError) {
+	return MarshalerBytes(k.ID), nil
+}
+
+type AliasResultMarshalers struct {
+	JSONValue   AliasJSONValue    `json:"json_value"`
+	JSONPointer AliasJSONPointer  `json:"json_pointer"`
+	TextValue   AliasTextValue    `json:"text_value"`
+	TextPointer *AliasTextPointer `json:"text_pointer"`
+}
+
+type AliasResultTextMap struct {
+	Values map[AliasResultTextMapKey]int `json:"values"`
+}
+
+type MarshaledOctet uint8
+
+func (*MarshaledOctet) MarshalJSON() ([]byte, error) {
+	return []byte(`"octet"`), nil
+}
+
+type CustomElementByteSlice struct {
+	Data []MarshaledOctet `json:"data"`
+}
+
 // TypeWithCustomMarshaler uses a custom marshaler
 type TypeWithCustomMarshaler struct {
 	Custom CustomJSONType `json:"custom"`

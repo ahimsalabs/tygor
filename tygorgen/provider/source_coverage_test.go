@@ -2,9 +2,11 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"tygor.dev/tygorgen/ir"
+	"tygor.dev/tygorgen/provider/testdata"
 )
 
 func TestSourceProvider_CustomMarshalers(t *testing.T) {
@@ -163,7 +165,7 @@ func TestSourceProvider_MapWithTextMarshalerKey(t *testing.T) {
 	provider := &SourceProvider{}
 	schema, err := provider.BuildSchema(context.Background(), SourceInputOptions{
 		Packages:  []string{"tygor.dev/tygorgen/provider/testdata"},
-		RootTypes: rootTypes("MapWithTextMarshalerKey"),
+		RootTypes: rootTypes("MapWithTextMarshalerKey", "AliasResultTextMap"),
 	})
 
 	if err != nil {
@@ -188,6 +190,33 @@ func TestSourceProvider_MapWithTextMarshalerKey(t *testing.T) {
 	// Should be a map
 	if dataField.Type.Kind() != ir.KindMap {
 		t.Errorf("Data field should be KindMap, got %v", dataField.Type.Kind())
+	}
+
+	aliasResultMap, ok := findType(schema, "AliasResultTextMap").(*ir.StructDescriptor)
+	if !ok {
+		t.Fatalf("AliasResultTextMap = %T, want StructDescriptor", findType(schema, "AliasResultTextMap"))
+	}
+	valuesField := findFieldByName(aliasResultMap.Fields, "Values")
+	if valuesField == nil {
+		t.Fatalf("AliasResultTextMap.Values = %#v, want map", valuesField)
+	}
+	mapDescriptor, ok := valuesField.Type.(*ir.MapDescriptor)
+	if !ok {
+		t.Fatalf("AliasResultTextMap.Values = %#v, want map", valuesField.Type)
+	}
+	key, ok := mapDescriptor.Key.(*ir.PrimitiveDescriptor)
+	if !ok || key.PrimitiveKind != ir.PrimitiveAny {
+		t.Fatalf("AliasResultTextMap key = %#v, want custom-marshaled unknown", mapDescriptor.Key)
+	}
+
+	wire, err := json.Marshal(testdata.AliasResultTextMap{
+		Values: map[testdata.AliasResultTextMapKey]int{{ID: "abc"}: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wire) != `{"values":{"abc":1}}` {
+		t.Fatalf("encoding/json alias-result map = %s", wire)
 	}
 }
 

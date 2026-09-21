@@ -40,6 +40,10 @@ type Node struct {
 type GenericAlias[T any] = []T
 type StringSliceAlias = GenericAlias[string]
 
+// Generic defined container types are represented as parameterized IR aliases.
+type GenericList[T ~string] []T
+type GenericLookup[T any] map[string]T
+
 // Alias of pointer to alias
 type PtrToAlias = *AliasLevel1
 
