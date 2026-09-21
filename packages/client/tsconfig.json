@@ -4,8 +4,8 @@
     "module": "ES2022",
     "lib": ["ES2022", "DOM"],
     "declaration": true,
-    "declarationMap": true,
-    "outDir": ".",
+    "declarationMap": false,
+    "outDir": "./dist",
     "rootDir": ".",
     "strict": true,
     "esModuleInterop": true,
@@ -15,5 +15,5 @@
     "resolveJsonModule": true
   },
   "include": ["runtime.ts"],
-  "exclude": ["node_modules", "**/*.test.ts", "runtime.js", "runtime.d.ts"]
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
