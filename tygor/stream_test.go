@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,6 +26,33 @@ type StreamEvent struct {
 	ID      int    `json:"id"`
 	Message string `json:"message"`
 }
+
+type panicJSONEvent struct{}
+
+func (panicJSONEvent) MarshalJSON() ([]byte, error) {
+	panic("private marshaler panic")
+}
+
+type streamRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+type flushCapablePanicErrorResponseWriter struct {
+	*panicErrorResponseWriter
+}
+
+func (*flushCapablePanicErrorResponseWriter) FlushError() error { return nil }
+
+func newStreamRecorder() *streamRecorder {
+	return &streamRecorder{ResponseRecorder: httptest.NewRecorder()}
+}
+
+func (w *streamRecorder) FlushError() error {
+	w.ResponseRecorder.Flush()
+	return nil
+}
+
+func (w *streamRecorder) SetWriteDeadline(time.Time) error { return nil }
 
 func TestStream_Metadata(t *testing.T) {
 	fn := func(ctx context.Context, req StreamRequest) iter.Seq2[StreamEvent, error] {
@@ -59,7 +88,7 @@ func TestStream_BasicEvents(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -102,7 +131,7 @@ func TestStream_ErrorMidStream(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -137,13 +166,38 @@ func TestStream_ValidationError(t *testing.T) {
 	body := `{}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
 	// Validation error should return before streaming starts
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestStream_RejectsTrailingJSONBeforeStarting(t *testing.T) {
+	called := false
+	fn := func(ctx context.Context, req StreamRequest) iter.Seq2[StreamEvent, error] {
+		called = true
+		return func(yield func(StreamEvent, error) bool) {}
+	}
+
+	app := NewApp()
+	app.Service("Feed").Register("Subscribe", streamIter2(fn))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader("{\"topic\":\"news\"}{\"topic\":\"other\"}"))
+	w := httptest.NewRecorder()
+
+	app.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatal("stream handler ran before the complete request body was validated")
+	}
+	if got := w.Header().Get("Content-Type"); got == "text/event-stream" {
+		t.Fatalf("streaming headers committed for invalid request: %q", got)
 	}
 }
 
@@ -165,7 +219,7 @@ func TestStream_UnaryInterceptor_Reject(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -212,7 +266,7 @@ func TestStream_StreamInterceptor(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -285,7 +339,7 @@ func TestStream_MethodNotAllowed(t *testing.T) {
 
 	// Try GET instead of POST
 	req := httptest.NewRequest("GET", "/Feed/Subscribe?topic=news", nil)
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -309,7 +363,7 @@ func TestStream_WithSkipValidation(t *testing.T) {
 	body := `{}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -369,7 +423,7 @@ func TestStreamEmit_BasicEvents(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -404,7 +458,7 @@ func TestStreamEmit_HandlerError(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -443,7 +497,7 @@ func TestStreamEmit_ErrStreamClosedNotSentToClient(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -590,7 +644,7 @@ func TestStreamEmit_WithOptions(t *testing.T) {
 	body := `{}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -615,7 +669,7 @@ func TestStreamEmit_LastEventID(t *testing.T) {
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Last-Event-ID", "42")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -646,7 +700,7 @@ func TestStreamEmit_SendWithID(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -706,7 +760,7 @@ func TestStreamEmit_WithMaxRequestBodySize(t *testing.T) {
 	body := `{"topic":"this is a very long topic that exceeds the limit"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -825,7 +879,7 @@ func TestStream_MultipleStreamInterceptors(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -872,16 +926,35 @@ func TestIsClientDisconnect(t *testing.T) {
 	}
 }
 
+func TestStreamPreservesWrappedDeadlineErrorForPolicy(t *testing.T) {
+	want := fmt.Errorf("query timed out: %w", context.DeadlineExceeded)
+	var got error
+	app := NewApp().WithStreamWriteTimeout(0).WithErrorTransformer(func(err error) *Error {
+		got = err
+		return DefaultErrorTransformer(err)
+	})
+	app.Service("Feed").Register("Subscribe", Stream(func(context.Context, StreamRequest, StreamWriter[StreamEvent]) error {
+		return want
+	}))
+	w := newStreamRecorder()
+	app.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`)))
+	if got != want {
+		t.Fatalf("error policy received %v, want original wrapped error %v", got, want)
+	}
+	if !strings.Contains(w.Body.String(), `"code":"deadline_exceeded"`) {
+		t.Fatalf("response = %q, want deadline_exceeded", w.Body.String())
+	}
+}
+
 func TestStreamEmit_SendWithID_EdgeCases(t *testing.T) {
 	tests := []struct {
-		name       string
-		id         string
-		shouldSend bool // whether the id should appear in response
+		name string
+		id   string
 	}{
-		{"empty id", "", false},          // Empty ID should not produce id: field
-		{"whitespace id", "   ", true},   // Whitespace is technically valid
-		{"special chars", "a:b:c", true}, // Colons in ID
-		{"unicode", "イベント-1", true},      // Unicode characters
+		{"empty id", ""},           // Empty ID resets the last-event-ID value.
+		{"whitespace id", "   "},   // Whitespace is technically valid.
+		{"special chars", "a:b:c"}, // Colons in ID.
+		{"unicode", "イベント-1"},      // Unicode characters.
 	}
 
 	for _, tt := range tests {
@@ -897,7 +970,7 @@ func TestStreamEmit_SendWithID_EdgeCases(t *testing.T) {
 			body := `{"topic":"news"}`
 			req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
+			w := newStreamRecorder()
 
 			app.Handler().ServeHTTP(w, req)
 
@@ -907,12 +980,8 @@ func TestStreamEmit_SendWithID_EdgeCases(t *testing.T) {
 
 			response := w.Body.String()
 			hasIDField := strings.Contains(response, "id: "+tt.id+"\n")
-
-			if tt.shouldSend && !hasIDField {
+			if !hasIDField {
 				t.Errorf("expected id: %q in response, got:\n%s", tt.id, response)
-			}
-			if !tt.shouldSend && strings.Contains(response, "id:") {
-				t.Errorf("expected no id field for empty id, got:\n%s", response)
 			}
 		})
 	}
@@ -934,7 +1003,7 @@ func TestStreamEmit_LastEventID_Missing(t *testing.T) {
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	// Intentionally NOT setting Last-Event-ID header
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -968,7 +1037,7 @@ func TestStreamEmit_ErrorAfterEvents(t *testing.T) {
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	w := newStreamRecorder()
 
 	app.Handler().ServeHTTP(w, req)
 
@@ -990,5 +1059,1031 @@ func TestStreamEmit_ErrorAfterEvents(t *testing.T) {
 	}
 	if !strings.Contains(response, "something went wrong") {
 		t.Errorf("expected error message in response, got:\n%s", response)
+	}
+}
+
+type blockingFlushWriter struct {
+	header http.Header
+
+	mu                sync.Mutex
+	body              bytes.Buffer
+	flushes           int
+	eventFlushStarted chan struct{}
+	releaseEventFlush chan struct{}
+	flushErr          error
+}
+
+func newBlockingFlushWriter(flushErr error) *blockingFlushWriter {
+	return &blockingFlushWriter{
+		header:            make(http.Header),
+		eventFlushStarted: make(chan struct{}),
+		releaseEventFlush: make(chan struct{}),
+		flushErr:          flushErr,
+	}
+}
+
+func (w *blockingFlushWriter) Header() http.Header { return w.header }
+func (w *blockingFlushWriter) WriteHeader(int)     {}
+
+func (w *blockingFlushWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(p)
+}
+
+func (w *blockingFlushWriter) FlushError() error {
+	w.mu.Lock()
+	w.flushes++
+	flushes := w.flushes
+	w.mu.Unlock()
+	if flushes == 2 {
+		close(w.eventFlushStarted)
+		<-w.releaseEventFlush
+		return w.flushErr
+	}
+	return nil
+}
+
+func (w *blockingFlushWriter) SetWriteDeadline(time.Time) error { return nil }
+
+type panicOnceWriter struct {
+	header     http.Header
+	panicValue any
+	writes     int
+}
+
+func (w *panicOnceWriter) Header() http.Header { return w.header }
+func (w *panicOnceWriter) WriteHeader(int)     {}
+
+func (w *panicOnceWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 {
+		panic(w.panicValue)
+	}
+	return len(p), nil
+}
+
+func (w *panicOnceWriter) FlushError() error                { return nil }
+func (w *panicOnceWriter) SetWriteDeadline(time.Time) error { return nil }
+
+type retryPoisonWriter struct {
+	header     http.Header
+	body       bytes.Buffer
+	writeErr   error
+	panicValue any
+	writes     int
+	flushes    int
+}
+
+func (w *retryPoisonWriter) Header() http.Header { return w.header }
+func (w *retryPoisonWriter) WriteHeader(int)     {}
+
+func (w *retryPoisonWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 && len(p) > 0 {
+		n, _ := w.body.Write(p[:1])
+		if w.panicValue != nil {
+			panic(w.panicValue)
+		}
+		return n, w.writeErr
+	}
+	return w.body.Write(p)
+}
+
+func (w *retryPoisonWriter) FlushError() error {
+	w.flushes++
+	return nil
+}
+
+func (w *retryPoisonWriter) SetWriteDeadline(time.Time) error { return nil }
+
+type failingCommittedWriter struct {
+	header  http.Header
+	writes  int
+	partial bool
+}
+
+func (w *failingCommittedWriter) Header() http.Header { return w.header }
+func (w *failingCommittedWriter) WriteHeader(int)     {}
+
+func (w *failingCommittedWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.partial && len(p) > 0 {
+		return 1, errors.New("partial transport write")
+	}
+	return 0, errors.New("terminal transport write failed")
+}
+
+func (w *failingCommittedWriter) FlushError() error                { return nil }
+func (w *failingCommittedWriter) SetWriteDeadline(time.Time) error { return nil }
+
+func TestStreamSendWaitsForFlushAndReturnsFailure(t *testing.T) {
+	w := newBlockingFlushWriter(timeoutError{})
+	sendResult := make(chan error, 1)
+	done := make(chan struct{})
+	handlerPanic := make(chan any, 1)
+
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		err := stream.Send(StreamEvent{ID: 1, Message: "event"})
+		sendResult <- err
+		return err
+	}
+	app := NewApp()
+	app.Service("Feed").Register("Subscribe", Stream(fn))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+
+	go func() {
+		defer func() {
+			handlerPanic <- recover()
+			close(done)
+		}()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	select {
+	case <-w.eventFlushStarted:
+	case <-time.After(time.Second):
+		t.Fatal("event flush did not start")
+	}
+	select {
+	case err := <-sendResult:
+		t.Fatalf("Send returned before flush completed: %v", err)
+	default:
+	}
+
+	close(w.releaseEventFlush)
+	select {
+	case err := <-sendResult:
+		if !errors.Is(err, ErrStreamClosed) {
+			t.Fatalf("Send error = %v, want ErrStreamClosed", err)
+		}
+		if !errors.Is(err, ErrWriteTimeout) {
+			t.Fatalf("Send error = %v, want ErrWriteTimeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Send did not return after flush failed")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream handler did not terminate after flush failed")
+	}
+	if recovered := <-handlerPanic; recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+}
+
+func TestStreamFailureWaitsForProducerAfterUnarySetup(t *testing.T) {
+	w := newBlockingFlushWriter(timeoutError{})
+	producerCleanupStarted := make(chan struct{})
+	releaseProducerCleanup := make(chan struct{})
+	producerDone := make(chan struct{})
+	interceptorExited := make(chan struct{})
+	handlerDone := make(chan struct{})
+	handlerPanic := make(chan any, 1)
+
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		defer close(producerDone)
+		err := stream.Send(StreamEvent{ID: 1, Message: "event"})
+		close(producerCleanupStarted)
+		<-releaseProducerCleanup
+		return err
+	}
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		result, err := handler(ctx, req)
+		close(interceptorExited)
+		return result, err
+	}
+	app := NewApp().WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(fn))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+
+	go func() {
+		defer func() {
+			handlerPanic <- recover()
+			close(handlerDone)
+		}()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	select {
+	case <-w.eventFlushStarted:
+	case <-time.After(time.Second):
+		t.Fatal("event flush did not start")
+	}
+	select {
+	case <-interceptorExited:
+	default:
+		t.Fatal("unary setup interceptor did not exit before streaming")
+	}
+	close(w.releaseEventFlush)
+	select {
+	case <-producerCleanupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("producer did not begin cleanup")
+	}
+	close(releaseProducerCleanup)
+	for name, ch := range map[string]<-chan struct{}{
+		"producer": producerDone,
+		"handler":  handlerDone,
+	} {
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not finish", name)
+		}
+	}
+	if recovered := <-handlerPanic; recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+}
+
+func TestStreamHeartbeatFailureCancelsProducerAfterUnarySetup(t *testing.T) {
+	w := newBlockingFlushWriter(timeoutError{})
+	producerCanceled := make(chan struct{})
+	releaseProducerCleanup := make(chan struct{})
+	producerDone := make(chan struct{})
+	interceptorExited := make(chan struct{})
+	handlerDone := make(chan struct{})
+	handlerPanic := make(chan any, 1)
+
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		defer close(producerDone)
+		<-ctx.Done()
+		close(producerCanceled)
+		<-releaseProducerCleanup
+		return ctx.Err()
+	}
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		result, err := handler(ctx, req)
+		close(interceptorExited)
+		return result, err
+	}
+	app := NewApp().WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(fn).WithHeartbeat(time.Millisecond))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+
+	go func() {
+		defer func() {
+			handlerPanic <- recover()
+			close(handlerDone)
+		}()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	select {
+	case <-w.eventFlushStarted:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat flush did not start")
+	}
+	select {
+	case <-interceptorExited:
+	default:
+		t.Fatal("unary setup interceptor did not exit before streaming")
+	}
+	close(w.releaseEventFlush)
+	select {
+	case <-producerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat failure did not cancel producer context")
+	}
+	close(releaseProducerCleanup)
+	for name, ch := range map[string]<-chan struct{}{
+		"producer": producerDone,
+		"handler":  handlerDone,
+	} {
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not finish", name)
+		}
+	}
+	if recovered := <-handlerPanic; recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+}
+
+func TestStreamTransportPanicIsNotConvertedToStreamError(t *testing.T) {
+	panicValue := &struct{}{}
+	w := &panicOnceWriter{header: make(http.Header), panicValue: panicValue}
+	producerDone := make(chan struct{})
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		defer close(producerDone)
+		return stream.Send(StreamEvent{ID: 1, Message: "event"})
+	}
+	app := NewApp().WithStreamWriteTimeout(time.Second)
+	app.Service("Feed").Register("Subscribe", Stream(fn))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+
+	recovered := func() (recovered any) {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+		return nil
+	}()
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %v, want original transport panic", recovered)
+	}
+	if w.writes != 1 {
+		t.Fatalf("writes = %d, want no terminal error write after panic", w.writes)
+	}
+	select {
+	case <-producerDone:
+	case <-time.After(time.Second):
+		t.Fatal("producer did not stop after transport panic")
+	}
+}
+
+func TestStreamUnaryErrorTransportPanicDoesNotRetryPolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		flush       bool
+		interceptor bool
+	}{
+		{name: "decode failure", body: `{`},
+		{name: "capability preflight failure", body: `{}`},
+		{name: "interceptor rejection", body: `{}`, flush: true, interceptor: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var transformerCalls atomic.Int32
+			var producerStarts atomic.Int32
+			app := NewApp().WithStreamWriteTimeout(0).WithErrorTransformer(func(error) *Error {
+				transformerCalls.Add(1)
+				panic("private transformer panic")
+			})
+			if tt.interceptor {
+				app.WithUnaryInterceptor(func(Context, any, HandlerFunc) (any, error) {
+					return nil, NewError(CodeUnavailable, "private interceptor rejection")
+				})
+			}
+			app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, _ StreamWriter[int]) error {
+				producerStarts.Add(1)
+				return nil
+			}))
+
+			baseWriter := &panicErrorResponseWriter{header: make(http.Header)}
+			var writer http.ResponseWriter = baseWriter
+			if tt.flush {
+				writer = &flushCapablePanicErrorResponseWriter{panicErrorResponseWriter: baseWriter}
+			}
+			req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				app.Handler().ServeHTTP(writer, req)
+			}()
+
+			if recovered != "transport panic" {
+				t.Fatalf("recovered = %v, want original transport panic", recovered)
+			}
+			if got := transformerCalls.Load(); got != 1 {
+				t.Fatalf("transformer calls = %d, want exactly 1", got)
+			}
+			if baseWriter.statusCalls != 1 || baseWriter.writes != 1 {
+				t.Fatalf("transport attempts = status:%d write:%d, want 1/1", baseWriter.statusCalls, baseWriter.writes)
+			}
+			if producerStarts.Load() != 0 {
+				t.Fatal("stream producer started before unary error response")
+			}
+		})
+	}
+}
+
+func TestStreamProducerPanicFailedTerminalWriteAbortsTransport(t *testing.T) {
+	app := NewApp().WithStreamWriteTimeout(0)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, _ StreamWriter[StreamEvent]) error {
+		panic("private producer panic")
+	}))
+	w := &failingCommittedWriter{header: make(http.Header)}
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+	if w.writes != 1 {
+		t.Fatalf("writes = %d, want one failed terminal frame", w.writes)
+	}
+}
+
+func TestStreamUnarySetupPanicDoesNotCommit(t *testing.T) {
+	panicValue := &struct{}{}
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		_, _ = handler(ctx, req)
+		panic(panicValue)
+	}
+	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+		return stream.Send(StreamEvent{ID: 1})
+	}))
+	w := newStreamRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if recovered != nil {
+		t.Fatalf("recovered = %v, want unary error handling", recovered)
+	}
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), `"code":"internal"`) {
+		t.Fatalf("response = %d %q, want unary internal error", w.Code, w.Body.String())
+	}
+}
+
+func TestStreamEventWriteFailureAbortsTransport(t *testing.T) {
+	app := NewApp().WithStreamWriteTimeout(0)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+		return stream.Send(StreamEvent{ID: 1})
+	}))
+	w := &failingCommittedWriter{header: make(http.Header), partial: true}
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+	if w.writes != 1 {
+		t.Fatalf("writes = %d, want one partial event write", w.writes)
+	}
+}
+
+func TestStreamHeartbeatWriteFailureAbortsTransport(t *testing.T) {
+	app := NewApp().WithStreamWriteTimeout(0)
+	app.Service("Feed").Register("Subscribe", Stream(func(ctx context.Context, _ Empty, _ StreamWriter[StreamEvent]) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}).WithHeartbeat(time.Millisecond))
+	w := &failingCommittedWriter{header: make(http.Header), partial: true}
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+	if w.writes != 1 {
+		t.Fatalf("writes = %d, want one partial heartbeat write", w.writes)
+	}
+}
+
+func TestStreamInterceptorCannotSuppressTransportFailure(t *testing.T) {
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		_, _ = handler(ctx, req)
+		return nil, nil
+	}
+	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+		return stream.Send(StreamEvent{ID: 1})
+	}))
+	w := &failingCommittedWriter{header: make(http.Header), partial: true}
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+}
+
+func TestStreamInterceptorCannotRecoverTransportPanic(t *testing.T) {
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (result any, err error) {
+		defer func() { _ = recover() }()
+		return handler(ctx, req)
+	}
+	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+		return stream.Send(StreamEvent{ID: 1})
+	}))
+	panicValue := &struct{}{}
+	w := &panicOnceWriter{header: make(http.Header), panicValue: panicValue}
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("recovered = %v, want original transport panic", recovered)
+	}
+}
+
+func TestStreamUnaryRetryDoesNotReplayTransportFailure(t *testing.T) {
+	setupCalls := 0
+	producerCalls := 0
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		setupCalls++
+		_, _ = handler(ctx, req)
+		setupCalls++
+		_, _ = handler(ctx, req)
+		return nil, nil
+	}
+	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+		producerCalls++
+		return stream.Send(StreamEvent{ID: 1})
+	}))
+	w := &retryPoisonWriter{header: make(http.Header), writeErr: errors.New("partial transport write")}
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if setupCalls != 2 || producerCalls != 1 {
+		t.Fatalf("setup calls = %d, producer calls = %d; want 2, 1", setupCalls, producerCalls)
+	}
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered = %v, want http.ErrAbortHandler", recovered)
+	}
+	if w.writes != 1 || w.flushes != 1 || w.body.String() != "d" {
+		t.Fatalf("transport operations after retry: writes=%d flushes=%d body=%q, want 1, 1, prefix only", w.writes, w.flushes, w.body.String())
+	}
+}
+
+func TestStreamUnaryRetryDoesNotReplayTransportPanic(t *testing.T) {
+	panicValue := &struct{}{}
+	setupCalls := 0
+	producerCalls := 0
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		setupCalls++
+		_, _ = handler(ctx, req)
+		setupCalls++
+		_, _ = handler(ctx, req)
+		return nil, nil
+	}
+	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+		producerCalls++
+		return stream.Send(StreamEvent{ID: 1})
+	}))
+	w := &retryPoisonWriter{header: make(http.Header), panicValue: panicValue}
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		app.Handler().ServeHTTP(w, req)
+	}()
+
+	if setupCalls != 2 || producerCalls != 1 {
+		t.Fatalf("setup calls = %d, producer calls = %d; want 2, 1", setupCalls, producerCalls)
+	}
+	if recovered != panicValue {
+		t.Fatalf("outer recovered = %v, want original transport panic", recovered)
+	}
+	if w.writes != 1 || w.flushes != 1 || w.body.String() != "d" {
+		t.Fatalf("transport operations after retry: writes=%d flushes=%d body=%q, want 1, 1, prefix only", w.writes, w.flushes, w.body.String())
+	}
+}
+
+func TestStreamInterceptorCannotSuppressMarshalPanic(t *testing.T) {
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (result any, err error) {
+		defer func() { _ = recover() }()
+		return handler(ctx, req)
+	}
+	app := NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[panicJSONEvent]) error {
+		return stream.Send(panicJSONEvent{})
+	}))
+	w := newStreamRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	app.Handler().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if strings.Count(body, "data: ") != 1 || !strings.Contains(body, `"code":"internal"`) {
+		t.Fatalf("suppressed marshaler panic did not produce one terminal SSE frame: %q", body)
+	}
+}
+
+func TestStreamInterceptorCannotSuppressProducerPanic(t *testing.T) {
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		_, _ = handler(ctx, req)
+		return nil, nil
+	}
+	app := NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+		if err := stream.Send(StreamEvent{ID: 1, Message: "before panic"}); err != nil {
+			return err
+		}
+		panic("private producer panic")
+	}))
+	w := newStreamRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
+
+	app.Handler().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if strings.Count(body, "data: ") != 2 || !strings.Contains(body, "before panic") || !strings.Contains(body, `"code":"internal"`) {
+		t.Fatalf("suppressed producer panic did not produce an event and terminal SSE frame: %q", body)
+	}
+	if strings.Contains(body, "private producer panic") {
+		t.Fatalf("producer panic leaked to SSE response: %q", body)
+	}
+}
+
+func TestStreamSendAllowsInterceptorToFilterEvent(t *testing.T) {
+	sendResult := make(chan error, 1)
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		err := stream.Send(StreamEvent{ID: 1, Message: "filtered"})
+		sendResult <- err
+		return err
+	}
+	filter := func(ctx Context, req any, handler StreamHandlerFunc) iter.Seq2[any, error] {
+		events := handler(ctx, req)
+		return func(yield func(any, error) bool) {
+			for range events {
+				// A filtered event was accepted by the pipeline but has no frame.
+			}
+		}
+	}
+
+	app := NewApp()
+	app.Service("Feed").Register("Subscribe", Stream(fn).WithStreamInterceptor(filter))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+	w := newStreamRecorder()
+	app.Handler().ServeHTTP(w, req)
+
+	if err := <-sendResult; err != nil {
+		t.Fatalf("Send error = %v, want nil for filtered event", err)
+	}
+	if strings.Contains(w.Body.String(), "data:") {
+		t.Fatalf("filtered event wrote a frame: %s", w.Body.String())
+	}
+}
+
+func TestStreamUnaryInterceptorsAreSetupOnly(t *testing.T) {
+	type ctxKey string
+	key := ctxKey("principal")
+	deadline := time.Now().Add(time.Minute)
+	callbackErr := make(chan error, 1)
+
+	outer := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		modified := req.(StreamRequest)
+		modified.Topic = "modified"
+		derived := context.WithValue(ctx, key, "alice")
+		derived, cancel := context.WithDeadline(derived, deadline)
+		defer cancel()
+		return handler(derived, modified)
+	}
+	inner := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		if ctx.Value(key) != "alice" {
+			return nil, errors.New("inner interceptor lost context value")
+		}
+		if got, ok := ctx.Deadline(); !ok || !got.Equal(deadline) {
+			return nil, errors.New("inner interceptor lost deadline")
+		}
+		return handler(ctx, req)
+	}
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		if req.Topic != "original" {
+			callbackErr <- fmt.Errorf("request topic = %q, want original", req.Topic)
+			return nil
+		}
+		if ctx.Value(key) != nil || ctx.Err() != nil {
+			callbackErr <- fmt.Errorf("callback inherited setup context value/error = %v/%v", ctx.Value(key), ctx.Err())
+			return nil
+		}
+		if got, ok := ctx.Deadline(); ok {
+			callbackErr <- fmt.Errorf("callback inherited setup deadline %v", got)
+			return nil
+		}
+		callbackErr <- nil
+		return stream.Send(StreamEvent{ID: 1})
+	}
+
+	app := NewApp().WithUnaryInterceptor(outer).WithUnaryInterceptor(inner)
+	app.Service("Feed").Register("Subscribe", Stream(fn))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"original"}`))
+	w := newStreamRecorder()
+	app.Handler().ServeHTTP(w, req)
+
+	if err := <-callbackErr; err != nil {
+		t.Fatal(err)
+	}
+	if events := parseSSEEvents(t, w.Body.String()); len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+}
+
+func TestStreamUnaryInterceptorDeadlineDoesNotGovernStreamLifetime(t *testing.T) {
+	interceptor := func(ctx Context, req any, handler HandlerFunc) (any, error) {
+		derived, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+		defer cancel()
+		return handler(derived, req)
+	}
+	producerCanceled := make(chan error, 1)
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		<-ctx.Done()
+		producerCanceled <- ctx.Err()
+		return ctx.Err()
+	}
+
+	app := NewApp().WithUnaryInterceptor(interceptor)
+	app.Service("Feed").Register("Subscribe", Stream(fn))
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`)).WithContext(requestCtx)
+	w := newStreamRecorder()
+	done := make(chan struct{})
+	go func() {
+		app.Handler().ServeHTTP(w, req)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-producerCanceled:
+		t.Fatalf("setup deadline terminated stream: %v", err)
+	default:
+	}
+	cancelRequest()
+	select {
+	case err := <-producerCanceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("producer cancellation = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request cancellation did not stop producer")
+	}
+	<-done
+}
+
+func TestStreamInterceptorContextAndRequestReachSource(t *testing.T) {
+	type ctxKey string
+	key := ctxKey("stream-value")
+	callbackErr := make(chan error, 1)
+
+	interceptor := func(ctx Context, req any, handler StreamHandlerFunc) iter.Seq2[any, error] {
+		modified := req.(StreamRequest)
+		modified.Topic = "modified"
+		return handler(context.WithValue(ctx, key, "present"), modified)
+	}
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		if req.Topic != "modified" || ctx.Value(key) != "present" {
+			callbackErr <- fmt.Errorf("source got topic/value %q/%v", req.Topic, ctx.Value(key))
+			return nil
+		}
+		callbackErr <- nil
+		return stream.Send(StreamEvent{ID: 1})
+	}
+
+	app := NewApp()
+	app.Service("Feed").Register("Subscribe", Stream(fn).WithStreamInterceptor(interceptor))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"original"}`))
+	w := newStreamRecorder()
+	app.Handler().ServeHTTP(w, req)
+
+	if err := <-callbackErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStreamErrorUsesConfiguredPolicyWithoutMutatingSource(t *testing.T) {
+	t.Run("custom transformer", func(t *testing.T) {
+		applicationErr := errors.New("private application failure")
+		fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+			return applicationErr
+		}
+		app := NewApp().WithErrorTransformer(func(err error) *Error {
+			if errors.Is(err, applicationErr) {
+				return NewError(CodeUnavailable, "safe transformed failure")
+			}
+			return nil
+		})
+		app.Service("Feed").Register("Subscribe", Stream(fn))
+		req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+		w := newStreamRecorder()
+		app.Handler().ServeHTTP(w, req)
+
+		body := w.Body.String()
+		if !strings.Contains(body, `"code":"unavailable"`) || !strings.Contains(body, "safe transformed failure") {
+			t.Fatalf("SSE error did not use custom transformer: %s", body)
+		}
+		if strings.Contains(body, applicationErr.Error()) {
+			t.Fatalf("SSE error leaked source error: %s", body)
+		}
+	})
+
+	t.Run("mask owns transformed error", func(t *testing.T) {
+		shared := NewError(CodeInternal, "private shared failure").WithDetail("source", "database")
+		fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+			return shared
+		}
+		app := NewApp().WithMaskInternalErrors()
+		app.Service("Feed").Register("Subscribe", Stream(fn))
+		req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+		w := newStreamRecorder()
+		app.Handler().ServeHTTP(w, req)
+
+		if shared.Message != "private shared failure" {
+			t.Fatalf("shared error message was mutated to %q", shared.Message)
+		}
+		body := w.Body.String()
+		if strings.Contains(body, shared.Message) || !strings.Contains(body, "internal server error") {
+			t.Fatalf("SSE error was not masked: %s", body)
+		}
+	})
+}
+
+func TestStreamErrorPolicyPanicFallsBackOverSSE(t *testing.T) {
+	tests := []struct {
+		name        string
+		transformer func(*atomic.Int32) ErrorTransformer
+	}{
+		{
+			name: "panicking transformer",
+			transformer: func(calls *atomic.Int32) ErrorTransformer {
+				return func(error) *Error {
+					calls.Add(1)
+					panic("private transformer panic")
+				}
+			},
+		},
+		{
+			name: "error envelope serialization panic",
+			transformer: func(calls *atomic.Int32) ErrorTransformer {
+				return func(error) *Error {
+					calls.Add(1)
+					return NewError(CodeUnavailable, "private transformed error").WithDetail("value", panicJSONDetail{})
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			app := NewApp().WithErrorTransformer(tt.transformer(&calls))
+			app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ StreamRequest, stream StreamWriter[StreamEvent]) error {
+				if err := stream.Send(StreamEvent{ID: 1, Message: "before error"}); err != nil {
+					return err
+				}
+				return errors.New("private terminal error")
+			}))
+			server := httptest.NewServer(app.Handler())
+			t.Cleanup(server.Close)
+
+			client := &http.Client{Timeout: 2 * time.Second}
+			resp, err := client.Post(server.URL+"/Feed/Subscribe", "application/json", strings.NewReader(`{"topic":"news"}`))
+			if err != nil {
+				t.Fatalf("POST error = %v, want framed SSE fallback", err)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/event-stream" {
+				t.Fatalf("response = %d %q, want committed SSE", resp.StatusCode, resp.Header.Get("Content-Type"))
+			}
+			if strings.Count(string(body), "data: ") != 2 || !strings.Contains(string(body), "before error") || !strings.HasSuffix(string(body), "data: {\"error\":{\"code\":\"internal\",\"message\":\"internal server error\"}}\n\n") {
+				t.Fatalf("SSE body = %q, want event plus constant framed fallback", body)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("transformer calls = %d, want exactly 1", got)
+			}
+		})
+	}
+}
+
+func TestStreamCallbackPanicUsesConfiguredErrorPolicy(t *testing.T) {
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		panic("private stream panic")
+	}
+	app := NewApp().WithErrorTransformer(func(err error) *Error {
+		var svcErr *Error
+		if errors.As(err, &svcErr) && svcErr.Code == CodeInternal {
+			return NewError(CodeUnavailable, "safe panic response")
+		}
+		return nil
+	})
+	app.Service("Feed").Register("Subscribe", Stream(fn))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+	w := newStreamRecorder()
+	app.Handler().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if strings.Contains(body, "private stream panic") {
+		t.Fatalf("panic value leaked to SSE response: %s", body)
+	}
+	if !strings.Contains(body, `"code":"unavailable"`) || !strings.Contains(body, "safe panic response") {
+		t.Fatalf("panic did not use configured error policy: %s", body)
+	}
+}
+
+func TestStreamMarshalPanicAfterCommitUsesSSEErrorPolicy(t *testing.T) {
+	app := NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).WithErrorTransformer(func(err error) *Error {
+		var svcErr *Error
+		if errors.As(err, &svcErr) && svcErr.Code == CodeInternal {
+			return NewError(CodeUnavailable, "safe marshaler panic")
+		}
+		return nil
+	})
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ StreamRequest, stream StreamWriter[panicJSONEvent]) error {
+		return stream.Send(panicJSONEvent{})
+	}))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+	w := newStreamRecorder()
+
+	app.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("response = %d %q, want committed SSE", w.Code, w.Header().Get("Content-Type"))
+	}
+	body := w.Body.String()
+	if strings.Count(body, "data: ") != 1 || !strings.HasPrefix(body, "data: ") || !strings.HasSuffix(body, "\n\n") {
+		t.Fatalf("panic response is not one complete SSE frame: %q", body)
+	}
+	if strings.Contains(body, "private marshaler panic") || !strings.Contains(body, `"code":"unavailable"`) || !strings.Contains(body, "safe marshaler panic") {
+		t.Fatalf("panic response did not use configured policy: %s", body)
+	}
+}
+
+func TestStreamSendWithEmptyIDEmitsResetField(t *testing.T) {
+	app := NewApp().WithStreamWriteTimeout(0)
+	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ StreamRequest, stream StreamWriter[StreamEvent]) error {
+		return stream.SendWithID("", StreamEvent{ID: 1})
+	}))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+	w := newStreamRecorder()
+
+	app.Handler().ServeHTTP(w, req)
+
+	if body := w.Body.String(); !strings.HasPrefix(body, "id: \ndata: ") {
+		t.Fatalf("empty event ID did not emit reset field: %q", body)
+	}
+}
+
+func TestStreamSendWithIDRejectsUnsafeFraming(t *testing.T) {
+	for _, id := range []string{"line\nnext", "line\rnext", "line\r\nnext", "nul\x00next"} {
+		t.Run(fmt.Sprintf("%q", id), func(t *testing.T) {
+			yielded := false
+			sender := &streamSender[StreamEvent]{
+				ctx: context.Background(),
+				yieldAny: func(any, error) bool {
+					yielded = true
+					return true
+				},
+			}
+			err := sender.SendWithID(id, StreamEvent{ID: 1})
+			if !errors.Is(err, ErrInvalidStreamEventID) {
+				t.Fatalf("SendWithID() error = %v, want ErrInvalidStreamEventID", err)
+			}
+			if yielded {
+				t.Fatal("unsafe ID reached the stream pipeline")
+			}
+			if _, err := marshalSSEEventFrame(sseEvent{id: id, event: StreamEvent{ID: 1}}); !errors.Is(err, ErrInvalidStreamEventID) {
+				t.Fatalf("marshalSSEEventFrame() error = %v, want ErrInvalidStreamEventID", err)
+			}
+		})
+	}
+}
+
+func TestStreamAcceptsRecorderWithoutDeadlineSupport(t *testing.T) {
+	producerStarted := false
+	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
+		producerStarted = true
+		return nil
+	}
+	app := NewApp()
+	app.Service("Feed").Register("Subscribe", Stream(fn))
+	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
+	w := httptest.NewRecorder()
+	app.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("response = %d %q, want successful SSE", w.Code, w.Header().Get("Content-Type"))
+	}
+	if !producerStarted {
+		t.Fatal("producer did not start with a flush-capable recorder")
 	}
 }
