@@ -221,15 +221,6 @@ func assertPrimitiveKind(t *testing.T, descriptor ir.TypeDescriptor, want ir.Pri
 	}
 }
 
-func assertArrayElementKind(t *testing.T, descriptor ir.TypeDescriptor, want ir.PrimitiveKind) {
-	t.Helper()
-	array, ok := descriptor.(*ir.ArrayDescriptor)
-	if !ok {
-		t.Fatalf("descriptor = %T, want array", descriptor)
-	}
-	assertPrimitiveKind(t, array.Element, want)
-}
-
 func assertStringEncodedPrimitive(t *testing.T, descriptor ir.TypeDescriptor, want ir.PrimitiveKind) {
 	t.Helper()
 	primitive, ok := descriptor.(*ir.PrimitiveDescriptor)

@@ -16,12 +16,6 @@ import json "encoding/json/v2"
 // Wire format: {"result": null}
 type Empty = *struct{}
 
-// response is the internal envelope type for successful responses.
-// This wraps the actual result in a {"result": ...} structure.
-type response struct {
-	Result any `json:"result"`
-}
-
 // errorResponse is the internal envelope type for error responses.
 // This wraps the error in an {"error": {...}} structure.
 type errorResponse struct {
