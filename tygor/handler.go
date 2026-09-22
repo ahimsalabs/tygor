@@ -2,7 +2,8 @@ package tygor
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -281,16 +282,19 @@ func (h *execHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 // decodeJSONBody decodes at most one JSON value. An empty body leaves dst at
 // its zero value; after a value, only JSON whitespace is allowed.
 func decodeJSONBody(body io.Reader, dst any) error {
-	decoder := json.NewDecoder(body)
-	if err := decoder.Decode(dst); err != nil {
+	decoder := jsontext.NewDecoder(body)
+	value, err := decoder.ReadValue()
+	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
 		return err
 	}
+	if err := json.Unmarshal(value, dst); err != nil {
+		return err
+	}
 
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != nil {
+	if _, err := decoder.ReadValue(); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil
 		}

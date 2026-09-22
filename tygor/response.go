@@ -1,6 +1,6 @@
 package tygor
 
-import "encoding/json"
+import json "encoding/json/v2"
 
 // Empty represents a void request or response.
 // Use this for operations that don't return meaningful data.

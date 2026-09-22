@@ -190,10 +190,16 @@ func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, 
 
 	// Get base schema from type, tracking nullability separately
 	// so we can apply validations before .nullable()
-	baseSchema, isNullable, err := f.typeToZodWithNullable(ctx, field.Type, field.StringEncoded)
+	baseSchema, _, err := f.typeToZodWithNullable(ctx, field.Type, field.StringEncoded)
 	if err != nil {
 		return fieldSchemaResult{}, err
 	}
+	wireSchema := ctx.Schema
+	if wireSchema == nil {
+		wireSchema = &ir.Schema{}
+	}
+	isOptional := wireSchema.FieldOptional(field)
+	isNullable := wireSchema.FieldNullableWhenPresent(field)
 	if hasDive {
 		array, ok := resolveValidationType(ctx, field.Type).(*ir.ArrayDescriptor)
 		if !ok {
@@ -233,10 +239,10 @@ func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, 
 	var schema string
 	if f.mini {
 		// Zod-mini: use .check() for validations, functional wrapping for optional/nullable
-		schema, err = f.emitFieldSchemaMini(ctx, baseSchema, rules, typeKind, isNullable, field.Optional, typeName, field.Name, field.Type, field.StringEncoded)
+		schema, err = f.emitFieldSchemaMini(ctx, baseSchema, rules, typeKind, isNullable, isOptional, typeName, field.Name, field.Type, field.StringEncoded)
 	} else {
 		// Regular Zod: use method chaining
-		schema, err = f.emitFieldSchemaRegular(ctx, baseSchema, rules, isString, isNullable, field.Optional, typeName, field.Name, field.Type, field.StringEncoded)
+		schema, err = f.emitFieldSchemaRegular(ctx, baseSchema, rules, isString, isNullable, isOptional, typeName, field.Name, field.Type, field.StringEncoded)
 	}
 	if err != nil {
 		return fieldSchemaResult{}, err
@@ -734,18 +740,6 @@ func (f *ZodFlavor) typeToZodWithNullable(ctx *EmitContext, typ ir.TypeDescripto
 	}
 
 resolved:
-	if array, ok := typ.(*ir.ArrayDescriptor); ok && array.IsSlice() {
-		inner, err := f.typeToZodBase(ctx, array, stringEncoded)
-		return inner, true, err
-	}
-	if _, ok := typ.(*ir.MapDescriptor); ok {
-		inner, err := f.typeToZodBase(ctx, typ, stringEncoded)
-		return inner, true, err
-	}
-	if primitive, ok := typ.(*ir.PrimitiveDescriptor); ok && primitive.PrimitiveKind == ir.PrimitiveBytes {
-		inner, err := f.typeToZodBase(ctx, typ, stringEncoded)
-		return inner, true, err
-	}
 	schema, err := f.typeToZodBase(ctx, typ, stringEncoded)
 	return schema, nullable, err
 }

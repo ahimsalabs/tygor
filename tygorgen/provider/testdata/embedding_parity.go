@@ -39,23 +39,12 @@ type PointerEmbedding struct {
 	*PointerBase
 }
 
-type OptionsOnlyEmbedding struct {
-	ConflictA `json:",omitempty"`
-}
-
 type TaggedEmbedding struct {
 	ConflictA `json:"nested"`
 }
 
-type EmbeddedString string
-
-type EmbeddedInterface interface {
-	Marker()
-}
-
-type ScalarEmbedding struct {
-	EmbeddedString
-	EmbeddedInterface
+type UnicodeJSONName struct {
+	Value string `json:"💡"`
 }
 
 type EscapedTag struct {

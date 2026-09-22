@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/packages"
 	"tygor.dev/tygorgen/ir"
@@ -81,7 +81,7 @@ func (p *SourceProvider) BuildSchema(ctx context.Context, opts SourceInputOption
 // BuildSchemaWithResolver analyzes source code and also returns a resolver
 // backed by the same loaded go/types packages. The resolver is used for
 // concrete generic endpoint arguments whose reflected spelling does not retain
-// enough information to determine encoding/json wire behavior.
+// enough information to determine encoding/json/v2 wire behavior.
 func (p *SourceProvider) BuildSchemaWithResolver(ctx context.Context, opts SourceInputOptions) (*ir.Schema, TypeExpressionResolver, error) {
 	builder, err := p.buildSchema(ctx, opts)
 	if err != nil {
@@ -190,13 +190,13 @@ type enumConstant struct {
 }
 
 type sourceJSONField struct {
-	field    *types.Var
-	tag      string
-	name     string
-	opts     []string
-	index    []int
-	tagged   bool
-	optional bool
+	field             *types.Var
+	tag               string
+	name              string
+	opts              []string
+	index             []int
+	tagged            bool
+	omitIfEmbeddedNil bool
 }
 
 func (b *schemaBuilder) resolveTypeExpression(expression, currentPackage string) (ir.TypeDescriptor, error) {
@@ -485,6 +485,9 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 	if !ok {
 		return nil
 	}
+	if tn.Pkg() != nil && normalizePkgPath(tn.Pkg()) == "time" && tn.Name() == "Duration" {
+		return fmt.Errorf("time.Duration has no default encoding/json/v2 representation")
+	}
 
 	// Check if already processed
 	key := b.typeKey(named)
@@ -493,8 +496,8 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 	}
 
 	hasCustomMarshaler := b.hasCustomMarshaler(named)
-	if !hasCustomMarshaler && genericSliceMayEncodeAsByteSlice(named) {
-		return fmt.Errorf("generic slice %s may encode as a base64 byte slice; generic byte-capable slice aliases are not supported", tn.Name())
+	if !hasCustomMarshaler && genericCollectionMayEncodeAsBytes(named) {
+		return fmt.Errorf("generic collection %s may use base64 byte encoding for exact byte instantiations; generic byte-capable collection aliases are not supported", tn.Name())
 	}
 
 	// Check for name collision (§3.5)
@@ -606,16 +609,21 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 	return nil
 }
 
-func genericSliceMayEncodeAsByteSlice(named *types.Named) bool {
-	slice, ok := named.Underlying().(*types.Slice)
+func genericCollectionMayEncodeAsBytes(named *types.Named) bool {
+	var element types.Type
+	switch collection := named.Underlying().(type) {
+	case *types.Slice:
+		element = collection.Elem()
+	case *types.Array:
+		element = collection.Elem()
+	default:
+		return false
+	}
+	typeParam, ok := types.Unalias(element).(*types.TypeParam)
 	if !ok {
 		return false
 	}
-	typeParam, ok := unresolvedSliceElementTypeParam(slice)
-	if !ok {
-		return false
-	}
-	return constraintMayAdmitUint8(typeParam.Constraint(), make(map[types.Type]bool))
+	return constraintMayAdmitUint8(typeParam.Constraint())
 }
 
 func unresolvedSliceElementTypeParam(slice *types.Slice) (*types.TypeParam, bool) {
@@ -623,41 +631,14 @@ func unresolvedSliceElementTypeParam(slice *types.Slice) (*types.TypeParam, bool
 	return typeParam, ok
 }
 
-// constraintMayAdmitUint8 deliberately ignores interface methods. A defined
-// uint8 type can implement unrelated methods while retaining byte-slice JSON
-// encoding, so only structural type-set restrictions can rule uint8 out.
-func constraintMayAdmitUint8(constraint types.Type, seen map[types.Type]bool) bool {
+// constraintMayAdmitUint8 reports whether the exact predeclared byte type can
+// satisfy a constraint. Defined uint8 types no longer trigger v2 byte encoding.
+func constraintMayAdmitUint8(constraint types.Type) bool {
 	if constraint == nil {
 		return true
 	}
-	constraint = types.Unalias(constraint)
-	if seen[constraint] {
-		return true
-	}
-	seen[constraint] = true
-	defer delete(seen, constraint)
-
-	switch underlying := constraint.Underlying().(type) {
-	case *types.Interface:
-		underlying.Complete()
-		for i := 0; i < underlying.NumEmbeddeds(); i++ {
-			if !constraintMayAdmitUint8(underlying.EmbeddedType(i), seen) {
-				return false
-			}
-		}
-		return true
-	case *types.Union:
-		for i := 0; i < underlying.Len(); i++ {
-			if constraintMayAdmitUint8(underlying.Term(i).Type(), seen) {
-				return true
-			}
-		}
-		return false
-	case *types.Basic:
-		return underlying.Kind() == types.Uint8
-	default:
-		return false
-	}
+	iface, ok := types.Unalias(constraint).Underlying().(*types.Interface)
+	return ok && types.Satisfies(types.Typ[types.Byte], iface.Complete())
 }
 
 func constraintOnlyAdmitsUint8(constraint types.Type) bool {
@@ -708,6 +689,10 @@ func (b *schemaBuilder) typeKey(named *types.Named) string {
 
 // convertType converts a Go type to an IR TypeDescriptor.
 func (b *schemaBuilder) convertType(t types.Type) (ir.TypeDescriptor, error) {
+	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj() != nil && named.Obj().Pkg() != nil &&
+		normalizePkgPath(named.Obj().Pkg()) == "time" && named.Obj().Name() == "Duration" {
+		return nil, fmt.Errorf("time.Duration has no default encoding/json/v2 representation")
+	}
 	// Handle special cases first
 	if desc := b.handleSpecialType(t); desc != nil {
 		return desc, nil
@@ -774,6 +759,12 @@ func (b *schemaBuilder) convertType(t types.Type) (ir.TypeDescriptor, error) {
 		return ir.Slice(elem), nil
 
 	case *types.Array:
+		if typeParam, ok := types.Unalias(typ.Elem()).(*types.TypeParam); ok && constraintOnlyAdmitsUint8(typeParam.Constraint()) {
+			return nil, fmt.Errorf("array of unresolved type parameter %s can encode as base64 for exact byte instantiations; generic byte arrays are not supported", typeParam.Obj().Name())
+		}
+		if isJSONByteArray(typ) {
+			return ir.ByteArray(int(typ.Len())), nil
+		}
 		elem, err := b.convertType(typ.Elem())
 		if err != nil {
 			return nil, err
@@ -836,7 +827,7 @@ type typePair struct {
 }
 
 // genericInstantiationChangesByteSliceWire reports whether substituting type
-// arguments turns a generic []T field into encoding/json's base64 byte-slice
+// arguments turns a generic []T or [N]T field into encoding/json/v2's base64 byte
 // representation. Generic structs such as Page[T any] are safe to describe,
 // but concrete byte-compatible applications do not satisfy that reusable
 // TypeScript contract and must be rejected.
@@ -861,7 +852,13 @@ func genericInstantiationChangesByteSliceWire(origin, instantiated types.Type, s
 		return genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
 	case *types.Array:
 		actual, ok := instantiated.(*types.Array)
-		return ok && genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
+		if !ok {
+			return false
+		}
+		if _, ok := types.Unalias(original.Elem()).(*types.TypeParam); ok && isJSONByteArray(actual) {
+			return true
+		}
+		return genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
 	case *types.Pointer:
 		actual, ok := instantiated.(*types.Pointer)
 		return ok && genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
@@ -1031,7 +1028,7 @@ func wirePrimitiveCategory(kind ir.PrimitiveKind) string {
 
 func (b *schemaBuilder) convertMapKeyType(t types.Type) (ir.TypeDescriptor, error) {
 	// json.Number values are numeric JSON tokens, but map keys are always JSON
-	// object member names and encoding/json accepts arbitrary Number key text.
+	// object member names and encoding/json/v2 accepts arbitrary Number key text.
 	if isJSONNumberType(t) {
 		return ir.String(), nil
 	}
@@ -1064,11 +1061,6 @@ func (b *schemaBuilder) handleSpecialType(t types.Type) ir.TypeDescriptor {
 		// time.Time
 		if pkgPath == "time" && name == "Time" {
 			return ir.Time()
-		}
-
-		// time.Duration
-		if pkgPath == "time" && name == "Duration" {
-			return ir.Duration()
 		}
 
 		// json.RawMessage
@@ -1104,11 +1096,74 @@ func hasCustomMarshalerMethod(receiver types.Type) bool {
 	methods := types.NewMethodSet(receiver)
 	for i := 0; i < methods.Len(); i++ {
 		method, ok := methods.At(i).Obj().(*types.Func)
-		if ok && (method.Name() == "MarshalJSON" || method.Name() == "MarshalText") && isBytesErrorMethod(method) {
-			return true
+		if !ok {
+			continue
+		}
+		switch method.Name() {
+		case "MarshalJSON", "MarshalText":
+			if isBytesErrorMethod(method) {
+				return true
+			}
+		case "AppendText":
+			if isAppendTextMethod(method) {
+				return true
+			}
+		case "MarshalJSONTo":
+			if isJSONTextCodecMethod(method, "Encoder") {
+				return true
+			}
+		case "UnmarshalJSON", "UnmarshalText":
+			if isBytesInputErrorMethod(method) {
+				return true
+			}
+		case "UnmarshalJSONFrom":
+			if isJSONTextCodecMethod(method, "Decoder") {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func isAppendTextMethod(method *types.Func) bool {
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Params().Len() != 1 || sig.Results().Len() != 2 {
+		return false
+	}
+	byteSlice := types.NewSlice(types.Typ[types.Byte])
+	return types.Identical(types.Unalias(sig.Params().At(0).Type()), byteSlice) &&
+		types.Identical(types.Unalias(sig.Results().At(0).Type()), byteSlice) &&
+		isErrorType(sig.Results().At(1).Type())
+}
+
+func isBytesInputErrorMethod(method *types.Func) bool {
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Params().Len() != 1 || sig.Results().Len() != 1 {
+		return false
+	}
+	byteSlice := types.NewSlice(types.Typ[types.Byte])
+	return types.Identical(types.Unalias(sig.Params().At(0).Type()), byteSlice) && isErrorType(sig.Results().At(0).Type())
+}
+
+func isJSONTextCodecMethod(method *types.Func, parameterName string) bool {
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Params().Len() != 1 || sig.Results().Len() != 1 || !isErrorType(sig.Results().At(0).Type()) {
+		return false
+	}
+	parameter, ok := types.Unalias(sig.Params().At(0).Type()).(*types.Pointer)
+	if !ok {
+		return false
+	}
+	named, ok := types.Unalias(parameter.Elem()).(*types.Named)
+	if !ok || named.Obj() == nil || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Name() == parameterName && normalizePkgPath(named.Obj().Pkg()) == "encoding/json/jsontext"
+}
+
+func isErrorType(t types.Type) bool {
+	return types.Identical(types.Unalias(t), types.Universe.Lookup("error").Type())
+
 }
 
 func isBytesErrorMethod(method *types.Func) bool {
@@ -1118,14 +1173,17 @@ func isBytesErrorMethod(method *types.Func) bool {
 	}
 	byteSlice := types.NewSlice(types.Typ[types.Byte])
 	return types.Identical(types.Unalias(sig.Results().At(0).Type()), byteSlice) &&
-		types.Identical(types.Unalias(sig.Results().At(1).Type()), types.Universe.Lookup("error").Type())
+		isErrorType(sig.Results().At(1).Type())
 }
 
-// isJSONByteSlice mirrors encoding/json's byte-slice selection. Defined uint8
-// elements are base64 encoded unless *Element has a JSON or text marshaler.
+// isJSONByteSlice mirrors encoding/json/v2's byte-slice selection. Only the
+// exact predeclared byte element type (including aliases) uses base64.
 func isJSONByteSlice(slice *types.Slice) bool {
-	basic, ok := slice.Elem().Underlying().(*types.Basic)
-	return ok && basic.Kind() == types.Uint8 && !hasCustomMarshalerMethod(types.NewPointer(slice.Elem()))
+	return types.Identical(types.Unalias(slice.Elem()), types.Typ[types.Byte])
+}
+
+func isJSONByteArray(array *types.Array) bool {
+	return types.Identical(types.Unalias(array.Elem()), types.Typ[types.Byte])
 }
 
 // isValidMapKey checks if a type is a valid JSON map key.
@@ -1133,9 +1191,10 @@ func (b *schemaBuilder) isValidMapKey(t types.Type) bool {
 	switch typ := t.(type) {
 	case *types.Basic:
 		kind := typ.Kind()
-		// String and integer types are valid
+		// V2 accepts string and numeric key types.
 		return kind == types.String ||
-			kind >= types.Int && kind <= types.Uintptr
+			kind >= types.Int && kind <= types.Uintptr ||
+			kind == types.Float32 || kind == types.Float64
 
 	case *types.Named:
 		// Check underlying type and TextMarshaler
@@ -1149,13 +1208,22 @@ func (b *schemaBuilder) isValidMapKey(t types.Type) bool {
 	}
 }
 
-// hasTextMarshaler checks if a type implements encoding.TextMarshaler.
+// hasTextMarshaler checks the v2 text encoding interfaces used for map keys.
 func (b *schemaBuilder) hasTextMarshaler(named *types.Named) bool {
 	methods := types.NewMethodSet(named)
 	for i := 0; i < methods.Len(); i++ {
 		method, ok := methods.At(i).Obj().(*types.Func)
-		if ok && method.Name() == "MarshalText" && isBytesErrorMethod(method) {
-			return true
+		if ok {
+			switch method.Name() {
+			case "MarshalText":
+				if isBytesErrorMethod(method) {
+					return true
+				}
+			case "AppendText":
+				if isAppendTextMethod(method) {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -1499,7 +1567,10 @@ func (b *schemaBuilder) buildStructDescriptor(named *types.Named, name string, d
 		Source:         src,
 	}
 
-	fields := b.sourceJSONFields(structType)
+	fields, err := b.sourceJSONFields(structType)
+	if err != nil {
+		return nil, err
+	}
 	for _, field := range fields {
 		fieldDesc, err := b.buildSourceFieldDescriptor(field, name, pkgPath)
 		if err != nil {
@@ -1511,12 +1582,12 @@ func (b *schemaBuilder) buildStructDescriptor(named *types.Named, name string, d
 	return descriptor, nil
 }
 
-func (b *schemaBuilder) sourceJSONFields(root *types.Struct) []sourceJSONField {
+func (b *schemaBuilder) sourceJSONFields(root *types.Struct) ([]sourceJSONField, error) {
 	type scan struct {
-		typ      types.Type
-		strct    *types.Struct
-		index    []int
-		optional bool
+		typ               types.Type
+		strct             *types.Struct
+		index             []int
+		omitIfEmbeddedNil bool
 	}
 
 	current := []scan(nil)
@@ -1534,6 +1605,7 @@ func (b *schemaBuilder) sourceJSONFields(root *types.Struct) []sourceJSONField {
 				continue
 			}
 			visited[parent.typ] = true
+			names := make(map[string]string)
 
 			for i := 0; i < parent.strct.NumFields(); i++ {
 				field := parent.strct.Field(i)
@@ -1552,24 +1624,44 @@ func (b *schemaBuilder) sourceJSONFields(root *types.Struct) []sourceJSONField {
 					continue
 				}
 				name, opts := b.parseJSONTag(tag)
-				if !isValidJSONTag(name) {
-					name = ""
+				if name != "" && !isValidJSONTag(name) {
+					return nil, fmt.Errorf("field %s has invalid encoding/json/v2 object name %q", field.Name(), name)
 				}
 				index := append(append([]int(nil), parent.index...), i)
+				for _, opt := range opts {
+					switch {
+					case opt == "embed":
+						return nil, fmt.Errorf("field %s: explicit encoding/json/v2 embed fields are not supported", field.Name())
+					case strings.HasPrefix(opt, "format:"):
+						return nil, fmt.Errorf("field %s: encoding/json/v2 does not support %q", field.Name(), opt)
+					}
+				}
+				if field.Embedded() && name == "" {
+					if !isEmbeddedStruct {
+						return nil, fmt.Errorf("embedded non-struct field %s must have an explicit JSON name under encoding/json/v2", field.Name())
+					}
+					if len(opts) > 0 {
+						return nil, fmt.Errorf("embedded field %s cannot have options without an explicit JSON name under encoding/json/v2", field.Name())
+					}
+				}
 
 				if name != "" || !field.Embedded() || !isEmbeddedStruct {
 					tagged := name != ""
 					if name == "" {
 						name = field.Name()
 					}
+					if previous, ok := names[name]; ok {
+						return nil, fmt.Errorf("fields %s and %s conflict over JSON object name %q under encoding/json/v2", previous, field.Name(), name)
+					}
+					names[name] = field.Name()
 					candidate := sourceJSONField{
-						field:    field,
-						tag:      tag,
-						name:     name,
-						opts:     opts,
-						index:    index,
-						tagged:   tagged,
-						optional: parent.optional,
+						field:             field,
+						tag:               tag,
+						name:              name,
+						opts:              opts,
+						index:             index,
+						tagged:            tagged,
+						omitIfEmbeddedNil: parent.omitIfEmbeddedNil,
 					}
 					fields = append(fields, candidate)
 					if count[parent.typ] > 1 {
@@ -1581,10 +1673,10 @@ func (b *schemaBuilder) sourceJSONFields(root *types.Struct) []sourceJSONField {
 				nextCount[embeddedType]++
 				if nextCount[embeddedType] == 1 {
 					next = append(next, scan{
-						typ:      embeddedType,
-						strct:    embeddedStruct,
-						index:    index,
-						optional: parent.optional || isSourcePointer(field.Type()),
+						typ:               embeddedType,
+						strct:             embeddedStruct,
+						index:             index,
+						omitIfEmbeddedNil: parent.omitIfEmbeddedNil || isSourcePointer(field.Type()),
 					})
 				}
 			}
@@ -1619,7 +1711,7 @@ func (b *schemaBuilder) sourceJSONFields(root *types.Struct) []sourceJSONField {
 	sort.Slice(out, func(i, j int) bool {
 		return compareFieldIndex(out[i].index, out[j].index) < 0
 	})
-	return out
+	return out, nil
 }
 
 func sourceEmbeddedStruct(t types.Type) (types.Type, *types.Struct, bool) {
@@ -1662,13 +1754,11 @@ func compareFieldIndex(a, b []int) int {
 }
 
 func isValidJSONTag(name string) bool {
-	if name == "" {
+	if name == "" || !utf8.ValidString(name) {
 		return false
 	}
 	for _, r := range name {
-		switch {
-		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", r):
-		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
+		if strings.ContainsRune(",\\'\"`", r) {
 			return false
 		}
 	}
@@ -1681,11 +1771,22 @@ func (b *schemaBuilder) buildSourceFieldDescriptor(field sourceJSONField, parent
 		return ir.FieldDescriptor{}, fmt.Errorf("failed to convert field %s: %w", field.field.Name(), err)
 	}
 
-	optional := field.optional
+	omitEmpty := false
+	omitZero := false
 	stringEncodingRequested := false
 	for _, opt := range field.opts {
-		optional = optional || opt == "omitempty" || opt == "omitzero"
-		stringEncodingRequested = stringEncodingRequested || opt == "string"
+		switch {
+		case opt == "omitempty":
+			omitEmpty = true
+		case opt == "omitzero":
+			omitZero = true
+		case opt == "string":
+			stringEncodingRequested = true
+		case opt == "embed":
+			return ir.FieldDescriptor{}, fmt.Errorf("field %s: explicit encoding/json/v2 embed fields are not supported", field.field.Name())
+		case strings.HasPrefix(opt, "format:"):
+			return ir.FieldDescriptor{}, fmt.Errorf("field %s: encoding/json/v2 does not support %q", field.field.Name(), opt)
+		}
 	}
 	if stringEncodingRequested {
 		if typeParam := unresolvedStringEncodingTypeParameter(field.field.Type()); typeParam != nil {
@@ -1694,23 +1795,32 @@ func (b *schemaBuilder) buildSourceFieldDescriptor(field sourceJSONField, parent
 				field.field.Name(), typeParam.Obj().Name(),
 			)
 		}
+		if !b.schema.StringEncodingApplies(fieldType) {
+			return ir.FieldDescriptor{}, fmt.Errorf("field %s: encoding/json/v2 option string only applies to numeric types", field.field.Name())
+		}
 	}
 
 	return ir.FieldDescriptor{
-		Name:          field.field.Name(),
-		Type:          fieldType,
-		JSONName:      field.name,
-		Optional:      optional,
-		StringEncoded: stringEncodingRequested && b.schema.StringEncodingApplies(fieldType),
-		ValidateTag:   b.extractTag(field.tag, "validate"),
-		RawTags:       b.parseAllTags(field.tag),
-		Documentation: b.extractFieldDocumentation(field.field, field.field.Pos()),
+		Name:              field.field.Name(),
+		Type:              fieldType,
+		JSONName:          field.name,
+		OmitEmpty:         omitEmpty,
+		OmitZero:          omitZero,
+		OmitIfEmbeddedNil: field.omitIfEmbeddedNil,
+		StringEncoded:     stringEncodingRequested,
+		ValidateTag:       b.extractTag(field.tag, "validate"),
+		RawTags:           b.parseAllTags(field.tag),
+		Documentation:     b.extractFieldDocumentation(field.field, field.field.Pos()),
 	}, nil
 }
 
 func unresolvedStringEncodingTypeParameter(t types.Type) *types.TypeParam {
-	t = types.Unalias(t)
-	if pointer, ok := t.(*types.Pointer); ok {
+	for {
+		t = types.Unalias(t)
+		pointer, ok := t.(*types.Pointer)
+		if !ok {
+			break
+		}
 		t = pointer.Elem()
 	}
 	t = types.Unalias(t)
@@ -1935,7 +2045,10 @@ func (b *schemaBuilder) handleAnonymousStruct(structType *types.Struct, parentNa
 		Fields: []ir.FieldDescriptor{},
 	}
 
-	fields := b.sourceJSONFields(structType)
+	fields, err := b.sourceJSONFields(structType)
+	if err != nil {
+		return nil, err
+	}
 	for _, field := range fields {
 		fieldDesc, err := b.buildSourceFieldDescriptor(field, syntheticName, pkgPath)
 		if err != nil {

@@ -3,7 +3,7 @@ package dev
 import (
 	"context"
 	_ "embed"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"net/http"
 	"os"

@@ -44,6 +44,10 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - **Resolver**: A component that resolves type references and dependencies
 - **Provider**: A component that extracts type information from Go code and produces IR
 
+### JSON Contract
+
+Tygor targets the default, strict `encoding/json/v2` behavior in Go 1.27. It does not apply v1 compatibility options. In particular, object names match exactly, duplicate names and invalid UTF-8 are rejected, nil slices and maps encode as `[]` and `{}`, and only numeric wire values support `json:",string"`. The public Go 1.27 API does not support `format:` struct-tag options, so providers MUST reject them rather than model behavior that the runtime cannot enable. Tygor also rejects explicit `json:",embed"` fields until the IR can represent v2 fallback maps; ordinary anonymous struct promotion remains supported.
+
 ### Type Descriptor Categories
 
 - **Named type descriptor**: A top-level type that appears in `Schema.Types`. Only three kinds: `StructDescriptor`, `AliasDescriptor`, and `EnumDescriptor`. These represent Go type declarations.
@@ -67,7 +71,7 @@ type User struct {
 export interface User {
     readonly id: string;
     readonly email: string;
-    readonly age?: number | null;
+    readonly age?: number;
 }
 ```
 
@@ -262,9 +266,10 @@ Both providers MUST satisfy the following requirements. Requirements specific to
 
 | Go Type | IR Representation | Notes |
 |---------|-------------------|-------|
-| `[]byte`, `[]uint8` | `PrimitiveBytes` | Matches `encoding/json` behavior |
+| `[]byte`, `[N]byte` | `PrimitiveBytes` | Base64; fixed arrays retain `ByteArrayLength` |
+| `[]T`, `[N]T` where `T` is a defined type with underlying `byte` | `ArrayDescriptor` | v2 only special-cases the exact predeclared `byte` type or an alias |
 | `time.Time` | `PrimitiveTime` | RFC 3339 format in JSON |
-| `time.Duration` | `PrimitiveDuration` | int64 nanoseconds in JSON |
+| `time.Duration` | error | No default v2 representation; use an explicit DTO wire type |
 | `interface{}`, `any` | `PrimitiveAny` | Empty interface |
 | `uintptr` | `PrimitiveUint` | Encoded as unsigned integer |
 | `json.Number` | `PrimitiveFloat` (64-bit) | Serializes as raw JSON number |
@@ -273,11 +278,11 @@ Both providers MUST satisfy the following requirements. Requirements specific to
 #### 3.3.3 Interface Handling
 
 1. For named interface types (e.g., `io.Reader`, custom interfaces), providers MUST emit `PrimitiveAny` and MUST emit a warning.
-2. For embedded interface types (e.g., `type Foo struct { io.Reader }`), providers MUST emit the embedded field as a regular field with the interface name as both Go name and JSON name, typed as `PrimitiveAny`. Providers SHOULD emit a warning, as embedded interfaces in API types usually indicate a design issue. Note: `encoding/json` does serialize embedded interfaces (as `"Reader":null` when nil).
+2. An anonymous non-struct field, including an embedded interface, MUST have an explicit JSON name. Providers MUST reject it otherwise, matching `encoding/json/v2`.
 
 #### 3.3.4 Field Visibility
 
-Providers MUST skip unexported struct fields. Unexported fields are not serializable by `encoding/json` and MUST NOT appear in `FieldDescriptor` output.
+Providers MUST skip unexported struct fields. Unexported fields are not serializable by `encoding/json/v2` and MUST NOT appear in `FieldDescriptor` output.
 
 #### 3.3.5 Enum Detection (Source Provider Only)
 
@@ -289,15 +294,15 @@ Constants of built-in types (e.g., `const X = 5` without a typed const) are NOT 
 
 #### 3.3.6 Custom Marshaler Handling
 
-1. For types implementing `json.Marshaler` or `encoding.TextMarshaler`, providers MUST emit `PrimitiveAny` and SHOULD emit a warning. The provider cannot statically determine the JSON output of custom marshal methods. Exception: well-known types like `time.Time` and `time.Duration` have dedicated primitive kinds.
-2. For types implementing `json.Unmarshaler` or `encoding.TextUnmarshaler` without a corresponding marshaler, providers SHOULD emit a warning noting that unmarshal-only custom handling will not affect the generated types.
+1. For types implementing `jsonv2.MarshalerTo`, `json.Marshaler`, `encoding.TextAppender`, or `encoding.TextMarshaler`, providers MUST emit `PrimitiveAny` and SHOULD emit a warning. The provider cannot statically determine the JSON output of custom codec methods. `time.Time` remains a dedicated primitive.
+2. Providers MUST also detect `jsonv2.UnmarshalerFrom`, `json.Unmarshaler`, and `encoding.TextUnmarshaler`; the direction-neutral IR cannot safely infer a wire contract for unmarshal-only customization.
 
 #### 3.3.7 Error Conditions
 
 Providers MUST return an error when encountering:
 
 1. **Unmarshalable types**: `chan T`, `complex64`, `complex128`, `func(...)`, and `unsafe.Pointer`. These types cause `json.Marshal` to return an `UnsupportedTypeError`.
-2. **Unsupported map key types**: Supported key types are `string`, integer types (`int`, `int8`..`int64`, `uint`, `uint8`..`uint64`), and types implementing `encoding.TextMarshaler`. Unsupported key types include `bool`, `float32`, `float64`, `complex64`, `complex128`, and structs without `TextMarshaler`. See Appendix A for the complete map key restrictions table.
+2. **Unsupported map key types**: V2 supports strings, integer and floating-point numbers, and types implementing `encoding.TextAppender` or `encoding.TextMarshaler`. Unsupported key types include `bool`, complex numbers, and structs without a text codec. See Appendix A for the complete map key restrictions table.
 
 ### 3.4 Generic Type Handling
 
@@ -403,7 +408,7 @@ type Outer struct {
 }
 ```
 
-With `encoding/json`, anonymous structs serialize as nested objects:
+With `encoding/json/v2`, anonymous structs serialize as nested objects:
 
 ```json
 {"inner": {"X": 0, "Y": ""}}
@@ -554,25 +559,21 @@ type FieldDescriptor struct {
     // Falls back to Name if json tag is absent.
     JSONName string
 
-    // Optional indicates the field can be absent from JSON output.
-    // This is true when json:",omitempty" or json:",omitzero" is set.
-    //
-    // For type generation, omitempty and omitzero have identical effects:
-    // both make a field optional (field?: T in TypeScript). The behavioral
-    // differences (omitempty omits empty collections while omitzero keeps them;
-    // omitzero omits zero structs while omitempty keeps them) are runtime
-    // concerns that don't affect the generated type signature.
-    //
-    // Providers MUST set Optional=true when either tag is present.
-    Optional bool
+    // OmitEmpty records json:",omitempty". In v2 it omits a value whose JSON
+    // representation is null, "", {}, or []. It does not omit numeric zero.
+    OmitEmpty bool
+
+    // OmitZero records json:",omitzero" and follows IsZero/Go-zero semantics.
+    OmitZero bool
+
+    // OmitIfEmbeddedNil records absence caused by promotion through a nil
+    // anonymous pointer field.
+    OmitIfEmbeddedNil bool
 
     // StringEncoded indicates json:",string" was set.
     // When true, the field is encoded as a JSON string on the wire.
-    // Only valid for string, integer, floating-point, or boolean types.
-    // Note: encoding/json silently ignores the ",string" option for other types
-    // (structs, slices, maps, etc.) - the field is encoded normally without error.
-    // Providers SHOULD only set StringEncoded=true when the field type is one of
-    // the supported types; for unsupported types, providers SHOULD emit a warning.
+    // Only valid for values represented as JSON numbers, through any pointer depth.
+    // Providers MUST return an error for other types.
     // Generators SHOULD emit the wire type (string) rather than the Go type,
     // since clients send and receive the string-encoded form.
     StringEncoded bool
@@ -607,7 +608,7 @@ type FieldDescriptor struct {
 
 **Embedding Rules:**
 
-Go providers MUST emit the effective `encoding/json` field set in `Fields`.
+Go providers MUST emit the effective `encoding/json/v2` field set in `Fields`.
 They leave `Extends` empty because target-language inheritance cannot represent
 Go's depth, tag-dominance, conflict, or nil embedded-pointer behavior exactly.
 `Extends` remains available to other IR producers that intentionally model
@@ -618,16 +619,24 @@ explicit inheritance.
 | `Bar` | none | Promote the dominant JSON-visible fields from `Bar` into `Fields` |
 | `*Bar` | none | Promote dominant fields and mark them optional |
 | `Bar` | `json:"bar"` | Add `Bar` as a regular field with `JSONName: "bar"` |
-| named scalar or interface | none | Add it as a regular field using the embedded type name |
+| named scalar or interface | none | Error: v2 requires an explicit JSON name |
+| named scalar or interface | `json:"value"` | Add it as a regular field with `JSONName: "value"` |
 | any embedded field | `json:"-"` | Skip it entirely |
 
 Providers MUST recursively extract named dependencies referenced by selected
 fields. An untagged embedded struct is not itself a wire dependency after its
 effective fields have been flattened.
 
+Implicitly embedded structs cannot carry tag options. Providers MUST reject
+forms where `Bar` has the tag `json:",omitempty"`. Tygor also rejects explicit
+`json:",embed"` until fallback-map embedding is represented in the IR. Direct
+fields in the same struct that resolve to the same JSON object name are a v2
+struct-definition error and MUST be rejected; ambiguity among promoted fields
+continues to use the dominance rules below.
+
 **Nil Embedded Pointers:**
 
-When an embedded pointer field is nil at runtime, `encoding/json` omits all fields from that embedded struct. For example:
+When an embedded pointer field is nil at runtime, `encoding/json/v2` omits all fields from that embedded struct. For example:
 
 ```go
 type Outer struct {
@@ -642,12 +651,12 @@ type Inner struct {
 // With Inner non-nil: {"field":"inner_value","own":"value"}
 ```
 
-Providers represent this behavior by setting `Optional=true` on every field
-promoted through a pointer-embedded path.
+Providers represent this behavior by setting `OmitIfEmbeddedNil=true` on every
+field promoted through a pointer-embedded path.
 
 **Embedded Field Name Conflicts:**
 
-When multiple embedded structs have fields with the same JSON name at the same nesting depth, `encoding/json` applies these rules:
+When multiple embedded structs have fields with the same JSON name at the same nesting depth, `encoding/json/v2` applies these rules:
 
 1. If any of the conflicting fields have explicit JSON tags, only tagged fields are considered
 2. If exactly one field remains after step 1, that field is used
@@ -660,7 +669,7 @@ type B struct { Field string `json:"x"` }
 type Outer struct { A; B }  // "x" is omitted due to ambiguity
 ```
 
-Providers MUST omit unresolved same-depth conflicts, matching `encoding/json`.
+Providers MUST omit unresolved same-depth conflicts, matching `encoding/json/v2`.
 
 **TypeScript Output Example:**
 
@@ -796,9 +805,9 @@ const (
     PrimitiveUint     // Unsigned integer (see BitSize)
     PrimitiveFloat    // Floating point (see BitSize)
     PrimitiveString
-    PrimitiveBytes    // []byte (base64-encoded in JSON)
+    PrimitiveBytes    // []byte or [N]byte (base64-encoded in JSON)
     PrimitiveTime     // time.Time (RFC 3339 string in JSON)
-    PrimitiveDuration // time.Duration (nanoseconds as int64 in JSON)
+    PrimitiveDuration // reserved; invalid under the default v2 contract
     PrimitiveAny      // interface{} / any
     PrimitiveEmpty    // struct{} (empty struct, serializes as {})
 )
@@ -824,21 +833,17 @@ type PrimitiveDescriptor struct {
     // - {PrimitiveKind: PrimitiveInt, BitSize: 64} -> TypeScript: number (⚠️), Rust: i64, Zod: z.number().int()
     // - {PrimitiveKind: PrimitiveFloat, BitSize: 64} -> TypeScript: number, Rust: f64, Zod: z.number()
     BitSize int
+
+    // ByteArrayLength is nil for []byte and points to N for [N]byte.
+    ByteArrayLength *int
 }
 
 func (d *PrimitiveDescriptor) Kind() DescriptorKind { return KindPrimitive }
 
 // ArrayDescriptor represents an ordered collection (slice or fixed-length array).
 //
-// Nullability: Go slices can be nil, which serializes to JSON null.
-// This is NOT represented with PtrDescriptor; instead, generators derive nullability
-// from context:
-// - If Optional=false: field: T[] | null (always present, can be null)
-// - If Optional=true: field?: T[] | null (optional and nullable are independent)
-// See §4.9 for the complete decision tree.
-//
-// Note: [N]byte fixed arrays serialize as JSON arrays of numbers, NOT base64.
-// Only []byte slices are base64-encoded (represented as PrimitiveBytes).
+// Under default v2 semantics, nil slices serialize as [] rather than null.
+// [N]byte uses PrimitiveBytes with ByteArrayLength and serializes as base64.
 type ArrayDescriptor struct {
     exprBase
     Element TypeDescriptor
@@ -856,12 +861,7 @@ func (d *ArrayDescriptor) Kind() DescriptorKind { return KindArray }
 
 // MapDescriptor represents a key-value mapping.
 //
-// Nullability: Go maps can be nil, which serializes to JSON null.
-// This is NOT represented with PtrDescriptor; instead, generators derive nullability
-// from context:
-// - If Optional=false: field: Record<K,V> | null (always present, can be null)
-// - If Optional=true: field?: Record<K,V> | null (optional and nullable are independent)
-// See §4.9 for the complete decision tree.
+// Under default v2 semantics, nil maps serialize as {} rather than null.
 type MapDescriptor struct {
     exprBase
     Key   TypeDescriptor
@@ -873,21 +873,22 @@ func (d *MapDescriptor) Kind() DescriptorKind { return KindMap }
 
 **Map Key Serialization:**
 
-Go's `encoding/json` marshals map keys to JSON object property names, which are always strings. The `MapDescriptor.Key` field preserves the original Go key type, but generators MUST understand that keys are serialized as strings on the wire.
+Go's `encoding/json/v2` marshals map keys to JSON object property names, which are always strings. The `MapDescriptor.Key` field preserves the original Go key type, but generators MUST understand that keys are serialized as strings on the wire.
 
 | Go Map Type | JSON Wire Format | TypeScript Output |
 |-------------|------------------|-------------------|
 | `map[string]T` | `{"key": value}` | `Record<string, T>` |
 | `map[int]T` | `{"123": value}` | `Record<string, T>` |
+| `map[float64]T` | `{"1.5": value}` | `Record<string, T>` |
 | `map[MyEnum]T` | `{"enumValue": value}` | `Record<string, T>` |
-| `map[K]T` where K implements `TextMarshaler` | `{"marshaledKey": value}` | `Record<string, T>` |
+| `map[K]T` where K implements `TextAppender` or `TextMarshaler` | `{"marshaledKey": value}` | `Record<string, T>` |
 
-For non-string key types, `encoding/json` converts keys as follows:
-- Integer types: decimal string representation
-- Types implementing `encoding.TextMarshaler`: result of `MarshalText()`
+For non-string key types, `encoding/json/v2` converts keys as follows:
+- Integer and floating-point types: their JSON-number representation
+- Types implementing `encoding.TextAppender` or `encoding.TextMarshaler`: text codec result
 - String-based types (e.g., `type MyKey string`): the underlying string value
 
-**Unsupported key types**: `bool` and other non-integer, non-string types that don't implement `TextMarshaler` will cause `json.Marshal` to return an error. Providers SHOULD reject or warn on such types.
+**Unsupported key types**: `bool`, complex numbers, and other non-string/non-numeric types that don't implement a text codec cause `json.Marshal` to return an error. Providers MUST reject such types.
 
 **Generator Key Type Handling:**
 
@@ -929,9 +930,9 @@ type ReferenceDescriptor struct {
 func (d *ReferenceDescriptor) Kind() DescriptorKind { return KindReference }
 
 // PtrDescriptor represents a Go pointer type (*T).
-// The TypeScript output depends on field context (see §4.9):
-// - If Optional=false: field: T | null (always present, can be null)
-// - If Optional=true: field?: T | null (optional and nullable are independent)
+// The TypeScript output depends on field omission context (see §4.9).
+// A pointer without omission is nullable. An omission tag may make the field
+// optional and non-null when present; nested pointers can still admit null.
 type PtrDescriptor struct {
     exprBase
     Element TypeDescriptor
@@ -1348,14 +1349,14 @@ This means:
 
 ### 4.9 Nullable and Optional Field Mapping
 
-Go's `encoding/json` accepts and produces JSON based on field type and struct tags. TypeScript types MUST represent all valid JSON values for bidirectional contracts (both request bodies and response parsing). The default mapping follows directly from Go semantics. Generators MAY provide configuration options to override this behavior for compatibility with existing codebases.
+Go's `encoding/json/v2` accepts and produces JSON based on field type and struct tags. TypeScript types MUST represent the default v2 wire contract used by Tygor.
 
 **Decision Tree:**
 
 For each field, determine two independent boolean properties:
 
-1. **Optional** (`?:`): True if `FieldDescriptor.Optional` is true (i.e., `omitempty` or `omitzero` tag is present)
-2. **Nullable** (`| null`): True for pointers, slices (`ArrayDescriptor.IsSlice()`), maps, and `PrimitiveBytes` (`[]byte`); fixed arrays are not nullable
+1. **Optional** (`?:`): True when a field may be absent because `omitempty`, `omitzero`, or promotion through a nil anonymous pointer actually applies to its type.
+2. **Nullable when present** (`| null`): True when a present pointer value can encode as null after considering omission. Nil slices, maps, and byte sequences encode as non-null empty values.
 
 Then emit the field according to this table:
 
@@ -1366,7 +1367,7 @@ Then emit the field according to this table:
 | false | true | `field: T \| null` |
 | true | true | `field?: T \| null` |
 
-**Rationale:** While Go's *output* with `omitempty` will never produce `null` (nil values are omitted), Go's *input* accepts `null` for any pointer/slice/map field. Since generated types serve bidirectional contracts (request bodies and responses), types must represent all valid inputs, not just possible outputs.
+The generated contract models canonical server output. The decoder may accept additional merge inputs such as `null`, but those are not emitted as client value types when the server normalizes them to `[]`, `{}`, or omission.
 
 **Complete Mapping Table:**
 
@@ -1375,39 +1376,39 @@ Then emit the field according to this table:
 | `Field string` | false | false | `field: string` |
 | `Field *string` | false | true | `field: string \| null` |
 | `Field string ,omitempty` | true | false | `field?: string` |
-| `Field *string ,omitempty` | true | true | `field?: string \| null` |
-| `Field []T` | false | true | `field: T[] \| null` |
-| `Field []T ,omitempty` | true | true | `field?: T[] \| null` |
+| `Field int ,omitempty` | false | false | `field: number` |
+| `Field int ,omitzero` | true | false | `field?: number` |
+| `Field *string ,omitempty` | true | false | `field?: string` |
+| `Field []T` | false | false | `field: T[]` |
+| `Field []T ,omitempty` | true | false | `field?: T[]` |
 | `Field *[]T` | false | true | `field: T[] \| null` |
-| `Field *[]T ,omitempty` | true | true | `field?: T[] \| null` |
-| `Field map[K]V` | false | true | `field: Record<K,V> \| null` |
-| `Field map[K]V ,omitempty` | true | true | `field?: Record<K,V> \| null` |
+| `Field *[]T ,omitempty` | true | false | `field?: T[]` |
+| `Field map[K]V` | false | false | `field: Record<K,V>` |
+| `Field map[K]V ,omitempty` | true | false | `field?: Record<K,V>` |
 | `Field *map[K]V` | false | true | `field: Record<K,V> \| null` |
-| `Field *map[K]V ,omitempty` | true | true | `field?: Record<K,V> \| null` |
+| `Field *map[K]V ,omitempty` | true | false | `field?: Record<K,V>` |
 | `Field Struct` | false | false | `field: Struct` |
-| `Field Struct ,omitempty` | true | false | `field?: Struct` |
 | `Field *Struct` | false | true | `field: Struct \| null` |
-| `Field *Struct ,omitempty` | true | true | `field?: Struct \| null` |
+| `Field *Struct ,omitempty` | true | false | `field?: Struct` |
+| `Field **Struct ,omitzero` | true | true | `field?: Struct \| null` |
 
-**Key Insight:** Any Go type that can hold `nil` (pointers, slices, maps) produces `| null` in TypeScript. The `omitempty`/`omitzero` tag independently controls whether the field can be absent (`?:`). These are orthogonal concerns:
-- `| null` = "Go accepts/produces `null` for this field"
-- `?:` = "Go accepts/produces absence for this field"
+**Key Insight:** Go nilability no longer directly implies JSON nullability. Default v2 normalizes nil slices, maps, and byte sequences to non-null empties. Omission tags can also remove the only pointer state that would have encoded as null.
 
 **Nested Pointers:** Go allows nested pointers (`**T`, `***T`, etc.), but `encoding/json` marshals all nil pointer indirections identically—they all serialize to `null`. A non-nil outer pointer to a nil inner pointer also serializes to `null`. Generators MUST flatten nested pointers to a single `| null` in the output type (i.e., `**string` becomes `string | null`, not `string | null | null`).
 
 **Note on `omitempty` vs `omitzero` runtime behavior:**
 
-While both tags set `Optional=true` in the IR, they have different runtime semantics:
+The IR preserves both tags because they have different presence semantics:
 
 | Field Type | `omitempty` | `omitzero` |
 |------------|-------------|------------|
-| `[]T` nil | Omitted | Omitted |
+| `[]T` nil | Omitted (`[]` is empty JSON) | Omitted (Go zero) |
 | `[]T` empty (`[]T{}`) | Omitted | **Present** (`[]`) |
 | `map[K]V` nil | Omitted | Omitted |
 | `map[K]V` empty | Omitted | **Present** (`{}`) |
 | `Struct` zero | **Present** | Omitted |
 
-These differences are runtime concerns that don't affect type generation. Both result in `Optional=true` because in both cases the field can be absent from JSON output.
+These differences affect whether a field is optional and are derived by `Schema.FieldOptional`.
 
 ## 5. Generator Interface
 
@@ -1819,8 +1820,9 @@ type TypeMatcher struct {
 | `float64` | `{PrimitiveKind: PrimitiveFloat, BitSize: 64}` |
 | `string` | `{PrimitiveKind: PrimitiveString}` |
 | `[]byte` | `{PrimitiveKind: PrimitiveBytes}` |
+| `[N]byte` | `{PrimitiveKind: PrimitiveBytes, ByteArrayLength: &N}` |
 | `time.Time` | `{PrimitiveKind: PrimitiveTime}` |
-| `time.Duration` | `{PrimitiveKind: PrimitiveDuration}` |
+| `time.Duration` | provider error (no default v2 representation) |
 | `any` / `interface{}` | `{PrimitiveKind: PrimitiveAny}` |
 | `struct{}` | `{PrimitiveKind: PrimitiveEmpty}` |
 
@@ -1844,7 +1846,7 @@ type TypeMatcher struct {
 | `PrimitiveString` | — | `string` | `z.string()` | `string` | `String` |
 | `PrimitiveBytes` | — | `string` | `z.string()` | `string` (format: byte) | `Vec<u8>` ‡ |
 | `PrimitiveTime` | — | `string` | `z.string().datetime()` | `string` (format: date-time) | `DateTime<Utc>` |
-| `PrimitiveDuration` | — | `number` | `z.number().int()` | `integer` | `i64` § |
+| `PrimitiveDuration` | — | invalid in a v2 schema | invalid | invalid | invalid |
 | `PrimitiveAny` | — | `unknown` | `z.unknown()` | `{}` | `serde_json::Value` |
 | `PrimitiveEmpty` | — | `Record<string, never>` | `z.object({})` | `object` | `()` |
 
@@ -1855,59 +1857,56 @@ type TypeMatcher struct {
 | `json.Number` | `number` | `z.number()` | `number` (see note) |
 | `json.RawMessage` | `unknown` | `z.unknown()` | `{}` |
 | `map[string]T` | `Record<string, T>` | `z.record(z.string(), T)` | `object` |
-| `[]T` | `T[]` (or `T[] \| null`, see §4.9) | `z.array(T)` | `array` |
+| `[]T` | `T[]` | `z.array(T)` | `array` |
 | `[N]T` | `T[]` (or tuple) | `z.array(T).length(N)` | `array` |
-| `[N]byte` | `number[]` | `z.array(z.number()).length(N)` | `array` (NOT base64) |
+| `[N]byte` | `string` | `z.string()` | `string` (base64 with decoded length N) |
 | `*T` | `T \| null` (or `T` with `?`, see §4.9) | `T.nullable()` | nullable |
 
 **Notes:**
 
 **Rust-specific notes:**
 - † Go's `int`/`uint` (BitSize: 0) are platform-dependent (32 or 64 bits on the server). For JSON APIs, Rust generators SHOULD use `i64`/`u64` as the conservative upper bound, since the wire format is determined by the server architecture, not the client. Using `isize`/`usize` would incorrectly tie interpretation to the client's platform.
-- ‡ Go's `[]byte` is base64-encoded by `encoding/json`. Rust generators MUST apply serde's base64 encoding, e.g., `#[serde(with = "base64")]` using the `base64` crate's serde support, or a wrapper type. Without this attribute, serde would expect a JSON array of numbers.
-- § Go's `time.Duration` serializes as an `int64` representing nanoseconds and can be negative. Rust generators SHOULD use `i64` (possibly as a newtype for type safety). Neither `std::time::Duration` (unsigned only) nor `chrono::Duration` (different representation) directly match Go's semantics.
+- ‡ Go's exact `[]byte` and `[N]byte` forms are base64-encoded by `encoding/json/v2`. Rust generators MUST apply matching base64 handling. A defined `type Octet byte` used as an element does not receive this special case.
 
 **General notes:**
-- `time.Duration` serializes as an integer representing nanoseconds. Values up to ~104 days fit within JavaScript's `Number.MAX_SAFE_INTEGER` (2^53-1). Beyond that, sub-microsecond precision is lost, which is rarely a concern at such timescales. Generators MAY emit a branded type (e.g., `type Duration = number & { __brand: "Duration" }`) for additional type safety.
+- `time.Duration` has no default v2 representation. API DTOs MUST choose an explicit numeric or string wire field instead.
 - `json.Number` serializes as a raw JSON number, so generators model its wire value as a number. JavaScript consumers can still lose precision or range when parsing values beyond IEEE-754; APIs requiring lexical preservation should use an explicitly string-encoded type.
-- `uintptr` is encoded identically to other unsigned integers by `encoding/json`.
+- `uintptr` is encoded identically to other unsigned integers by `encoding/json/v2`.
 - `json.RawMessage` is a `[]byte` type that embeds raw JSON content directly without encoding. It is treated as `PrimitiveAny` in the IR.
-- `struct{}` (empty struct) serializes as `{}` (empty JSON object). With `omitzero`, empty struct fields are omitted; with `omitempty`, they are NOT omitted (structs are never considered "empty" for `omitempty` purposes).
+- `struct{}` serializes as `{}` and is omitted by v2 `omitempty` because its encoded JSON object is empty. `omitzero` follows Go zero/`IsZero` semantics.
 - **Void responses (`*struct{}`)**: For endpoints returning `tygor.Empty` (`*struct{}`), use `&PtrDescriptor{Elem: &PrimitiveDescriptor{PrimitiveKind: PrimitiveEmpty}}`. This serializes to `null` on the wire. Do not confuse with bare `PrimitiveEmpty` which represents `struct{}` (serializes to `{}`). See §4.8 Protocol Integration.
 
-**Float Special Values:** `encoding/json` returns `UnsupportedValueError` when marshaling `NaN`, `+Inf`, or `-Inf` float values. These values have no JSON representation. Providers encountering these values at analysis time (e.g., in const declarations) SHOULD emit a warning. This is primarily a runtime concern rather than a type generation concern.
+**Float Special Values:** `encoding/json/v2` returns an error when marshaling `NaN`, `+Inf`, or `-Inf` float values. These values have no JSON representation. Providers encountering these values at analysis time (e.g., in const declarations) SHOULD emit a warning. This is primarily a runtime concern rather than a type generation concern.
 
 **Large Integer Warning:** Go's `int64` and `uint64` can represent values larger than JavaScript's `Number.MAX_SAFE_INTEGER` (2^53-1 = 9,007,199,254,740,991). Values exceeding this limit will lose precision when parsed by JavaScript. TypeScript generators SHOULD emit a warning when encountering `int64` or `uint64` fields without the `,string` struct tag. For APIs requiring large integers, consider using the `,string` struct tag to encode as JSON strings, or use a string-based ID type.
 
 **String Escaping and UTF-8 Handling:**
 
-`encoding/json` applies the following transformations when marshaling strings:
+`encoding/json/v2` applies the following transformations when marshaling strings:
 
 | Input | Output | Notes |
 |-------|--------|-------|
-| Invalid UTF-8 bytes | `\ufffd` | Replaced with Unicode replacement character |
+| Invalid UTF-8 bytes | error | Rejected by default |
 | `"` | `\"` | Escaped |
 | `\` | `\\` | Escaped |
 | Control chars (< 0x20) | `\n`, `\r`, `\t`, `\b`, `\f`, or `\uXXXX` | Escaped |
-| `<`, `>`, `&` | `\u003c`, `\u003e`, `\u0026` | HTML-escaped by default |
+| `<`, `>`, `&` | Preserved | Not HTML-escaped by default |
 | U+2028 (Line Separator) | `\u2028` | Escaped for JavaScript safety |
 | U+2029 (Paragraph Separator) | `\u2029` | Escaped for JavaScript safety |
 | Valid UTF-8 (including emoji) | Preserved | No transformation |
 
-The HTML escaping (`<`, `>`, `&`) can be disabled at runtime via `json.Encoder.SetEscapeHTML(false)`, but `json.Marshal` always escapes these characters. This is transparent to type generation.
-
 **Map Key Restrictions:**
 
-`encoding/json` only supports certain types as map keys:
+`encoding/json/v2` supports these map key types:
 
 | Key Type | Supported | Serialization |
 |----------|-----------|---------------|
 | `string` | ✓ | Used directly |
 | `int`, `int8`..`int64` | ✓ | Decimal string (e.g., `"42"`) |
 | `uint`, `uint8`..`uint64` | ✓ | Decimal string (e.g., `"123"`) |
-| Types with `encoding.TextMarshaler` | ✓ | Result of `MarshalText()` |
+| `float32`, `float64` | ✓ | JSON-number spelling as an object name |
+| Types with `encoding.TextAppender` or `encoding.TextMarshaler` | ✓ | Text codec result |
 | `bool` | ✗ | Error: `unsupported type: map[bool]T` |
-| `float32`, `float64` | ✗ | Error: `unsupported type: map[float64]T` |
 | `complex64`, `complex128` | ✗ | Error |
 | Structs (without TextMarshaler) | ✗ | Error |
 
@@ -1992,10 +1991,7 @@ The IR models Go's type system directly rather than being a universal abstractio
 
 ### Deterministic Nullable/Optional Mapping
 
-Field optionality (`field?:`) and nullability (`| null`) follow directly from Go semantics—not configurable. The mapping table in §4.9 is derived from `encoding/json` behavior:
-- `omitempty`/`omitzero` → optional field
-- Pointer/slice/map without omit tag → nullable (can be `null`, always present)
-- Both → rare `field?: T | null` case
+Field optionality (`field?:`) and present-value nullability (`| null`) follow the default v2 wire semantics—not Go nilability alone. `Schema.FieldOptional` and `Schema.FieldNullableWhenPresent` are the single source of truth used by TypeScript and Zod emitters.
 
 **Tradeoff**: Less flexibility, but generated types always match actual JSON output.
 

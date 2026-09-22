@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"reflect"
 	"sort"
@@ -18,8 +19,13 @@ import (
 
 // marshalerInterfaces holds reflect.Type values for interface checks.
 var (
-	jsonMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
-	textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+	jsonMarshalerType       = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	jsonUnmarshalerType     = reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
+	jsonMarshalerToType     = reflect.TypeOf((*jsonv2.MarshalerTo)(nil)).Elem()
+	jsonUnmarshalerFromType = reflect.TypeOf((*jsonv2.UnmarshalerFrom)(nil)).Elem()
+	textMarshalerType       = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+	textAppenderType        = reflect.TypeOf((*encoding.TextAppender)(nil)).Elem()
+	textUnmarshalerType     = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 )
 
 func isJSONNumberReflectType(t reflect.Type) bool {
@@ -79,6 +85,17 @@ func (b *reflectionSchemaBuilder) extractType(ctx context.Context, t reflect.Typ
 	// Check context cancellation
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	seenPointers := make(map[reflect.Type]bool)
+	for base := t; !seenPointers[base]; {
+		seenPointers[base] = true
+		if base == reflect.TypeFor[time.Duration]() {
+			return fmt.Errorf("time.Duration has no default encoding/json/v2 representation")
+		}
+		if base.Kind() != reflect.Pointer {
+			break
+		}
+		base = base.Elem()
 	}
 
 	// Check whether the pointer type itself is named before dereferencing.
@@ -207,14 +224,18 @@ func (b *reflectionSchemaBuilder) extractStruct(ctx context.Context, t reflect.T
 	}
 	b.typeNames[fullName] = true
 
+	jsonFields, err := reflectionJSONFields(t)
+	if err != nil {
+		return err
+	}
 	var fields []ir.FieldDescriptor
-	for _, field := range reflectionJSONFields(t) {
+	for _, field := range jsonFields {
 		fd, err := b.buildFieldDescriptor(ctx, field.field, name, pkg)
 		if err != nil {
 			return fmt.Errorf("field %s.%s: %w", name, field.field.Name, err)
 		}
 		fd.JSONName = field.name
-		fd.Optional = fd.Optional || field.optional
+		fd.OmitIfEmbeddedNil = field.omitIfEmbeddedNil
 		fields = append(fields, fd)
 	}
 
@@ -230,18 +251,18 @@ func (b *reflectionSchemaBuilder) extractStruct(ctx context.Context, t reflect.T
 }
 
 type reflectionJSONField struct {
-	field    reflect.StructField
-	name     string
-	index    []int
-	tagged   bool
-	optional bool
+	field             reflect.StructField
+	name              string
+	index             []int
+	tagged            bool
+	omitIfEmbeddedNil bool
 }
 
-func reflectionJSONFields(root reflect.Type) []reflectionJSONField {
+func reflectionJSONFields(root reflect.Type) ([]reflectionJSONField, error) {
 	type scan struct {
-		typ      reflect.Type
-		index    []int
-		optional bool
+		typ               reflect.Type
+		index             []int
+		omitIfEmbeddedNil bool
 	}
 
 	current := []scan(nil)
@@ -259,6 +280,7 @@ func reflectionJSONFields(root reflect.Type) []reflectionJSONField {
 				continue
 			}
 			visited[parent.typ] = true
+			names := make(map[string]string)
 
 			for i := 0; i < parent.typ.NumField(); i++ {
 				field := parent.typ.Field(i)
@@ -278,14 +300,32 @@ func reflectionJSONFields(root reflect.Type) []reflectionJSONField {
 				if tag == "-" {
 					continue
 				}
-				name := strings.Split(tag, ",")[0]
-				if !isValidJSONTag(name) {
-					name = ""
+				parts := strings.Split(tag, ",")
+				name := parts[0]
+				if name != "" && !isValidJSONTag(name) {
+					return nil, fmt.Errorf("field %s has invalid encoding/json/v2 object name %q", field.Name, name)
 				}
+				opts := parts[1:]
 				index := append(append([]int(nil), parent.index...), i)
 				fieldType := field.Type
 				if fieldType.Name() == "" && fieldType.Kind() == reflect.Pointer {
 					fieldType = fieldType.Elem()
+				}
+				for _, opt := range opts {
+					switch {
+					case opt == "embed":
+						return nil, fmt.Errorf("field %s: explicit encoding/json/v2 embed fields are not supported", field.Name)
+					case strings.HasPrefix(opt, "format:"):
+						return nil, fmt.Errorf("field %s: encoding/json/v2 does not support %q", field.Name, opt)
+					}
+				}
+				if field.Anonymous && name == "" {
+					if fieldType.Kind() != reflect.Struct {
+						return nil, fmt.Errorf("embedded non-struct field %s must have an explicit JSON name under encoding/json/v2", field.Name)
+					}
+					if len(opts) > 0 {
+						return nil, fmt.Errorf("embedded field %s cannot have options without an explicit JSON name under encoding/json/v2", field.Name)
+					}
 				}
 
 				if name != "" || !field.Anonymous || fieldType.Kind() != reflect.Struct {
@@ -293,12 +333,16 @@ func reflectionJSONFields(root reflect.Type) []reflectionJSONField {
 					if name == "" {
 						name = field.Name
 					}
+					if previous, ok := names[name]; ok {
+						return nil, fmt.Errorf("fields %s and %s conflict over JSON object name %q under encoding/json/v2", previous, field.Name, name)
+					}
+					names[name] = field.Name
 					candidate := reflectionJSONField{
-						field:    field,
-						name:     name,
-						index:    index,
-						tagged:   tagged,
-						optional: parent.optional,
+						field:             field,
+						name:              name,
+						index:             index,
+						tagged:            tagged,
+						omitIfEmbeddedNil: parent.omitIfEmbeddedNil,
 					}
 					fields = append(fields, candidate)
 					if count[parent.typ] > 1 {
@@ -310,9 +354,9 @@ func reflectionJSONFields(root reflect.Type) []reflectionJSONField {
 				nextCount[fieldType]++
 				if nextCount[fieldType] == 1 {
 					next = append(next, scan{
-						typ:      fieldType,
-						index:    index,
-						optional: parent.optional || field.Type.Kind() == reflect.Pointer,
+						typ:               fieldType,
+						index:             index,
+						omitIfEmbeddedNil: parent.omitIfEmbeddedNil || field.Type.Kind() == reflect.Pointer,
 					})
 				}
 			}
@@ -347,7 +391,7 @@ func reflectionJSONFields(root reflect.Type) []reflectionJSONField {
 	sort.Slice(out, func(i, j int) bool {
 		return compareFieldIndex(out[i].index, out[j].index) < 0
 	})
-	return out
+	return out, nil
 }
 
 func isKnownReflectionType(t reflect.Type) bool {
@@ -415,6 +459,9 @@ func (b *reflectionSchemaBuilder) extractAlias(ctx context.Context, t reflect.Ty
 // typeToDescriptorForAlias converts a type to a descriptor for use in an alias,
 // without creating references to the alias itself (which would be circular).
 func (b *reflectionSchemaBuilder) typeToDescriptorForAlias(ctx context.Context, t reflect.Type) (ir.TypeDescriptor, error) {
+	if t == reflect.TypeFor[time.Duration]() {
+		return nil, fmt.Errorf("time.Duration has no default encoding/json/v2 representation")
+	}
 	// Check for special types first
 	if desc := b.checkSpecialType(t); desc != nil {
 		return desc, nil
@@ -523,13 +570,22 @@ func (b *reflectionSchemaBuilder) typeToDescriptorForAlias(ctx context.Context, 
 // parentPkg is the package path of the containing struct type.
 func (b *reflectionSchemaBuilder) buildFieldDescriptor(ctx context.Context, field reflect.StructField, parentStructName, parentPkg string) (ir.FieldDescriptor, error) {
 	jsonTag := field.Tag.Get("json")
-	jsonName, optional, skip, stringEncoded := parseJSONTag(jsonTag, field.Name)
+	jsonName, omitEmpty, omitZero, skip, stringEncoded, unsupported := parseJSONTag(jsonTag, field.Name)
+	if unsupported == "embed" {
+		return ir.FieldDescriptor{}, fmt.Errorf("explicit encoding/json/v2 embed fields are not supported")
+	}
+	if unsupported != "" {
+		return ir.FieldDescriptor{}, fmt.Errorf("encoding/json/v2 does not support %q", unsupported)
+	}
 
 	// Build type descriptor - use parentStructName + "_" + field.Name for anonymous struct naming
 	syntheticName := parentStructName + "_" + field.Name
 	fieldType, err := b.typeToDescriptor(ctx, field.Type, syntheticName, parentPkg)
 	if err != nil {
 		return ir.FieldDescriptor{}, err
+	}
+	if stringEncoded && !b.schema.StringEncodingApplies(fieldType) {
+		return ir.FieldDescriptor{}, fmt.Errorf("encoding/json/v2 option string only applies to numeric types")
 	}
 
 	// Build RawTags map
@@ -544,8 +600,9 @@ func (b *reflectionSchemaBuilder) buildFieldDescriptor(ctx context.Context, fiel
 		Name:          field.Name,
 		Type:          fieldType,
 		JSONName:      jsonName,
-		Optional:      optional,
-		StringEncoded: stringEncoded && b.schema.StringEncodingApplies(fieldType),
+		OmitEmpty:     omitEmpty,
+		OmitZero:      omitZero,
+		StringEncoded: stringEncoded,
 		Skip:          skip,
 		ValidateTag:   field.Tag.Get("validate"),
 		RawTags:       rawTags,
@@ -556,12 +613,15 @@ func (b *reflectionSchemaBuilder) buildFieldDescriptor(ctx context.Context, fiel
 // parentName is used for generating synthetic names for anonymous structs.
 // parentPkg is the package path of the containing type, used for anonymous struct references.
 func (b *reflectionSchemaBuilder) typeToDescriptor(ctx context.Context, t reflect.Type, parentName, parentPkg string) (ir.TypeDescriptor, error) {
+	if t.PkgPath() == "time" && t.Name() == "Duration" {
+		return nil, fmt.Errorf("time.Duration has no default encoding/json/v2 representation")
+	}
 	// Check for special types first
 	if desc := b.checkSpecialType(t); desc != nil {
 		return desc, nil
 	}
 	// Preserve defined pointers as references so aliases and nullability remain
-	// available when classifying encoding/json's json:",string" behavior.
+	// available when classifying encoding/json/v2's json:",string" behavior.
 	if t.Kind() == reflect.Ptr && t.Name() != "" && t.PkgPath() != "" {
 		if err := b.extractType(ctx, t); err != nil {
 			return nil, err
@@ -671,6 +731,9 @@ func (b *reflectionSchemaBuilder) typeToDescriptor(ctx context.Context, t reflec
 		return ir.Slice(elem), nil
 
 	case reflect.Array:
+		if isJSONByteArrayReflect(t) {
+			return ir.ByteArray(t.Len()), nil
+		}
 		// Check if this is a named array type first (e.g., type Hash [32]byte)
 		if t.Name() != "" && t.PkgPath() != "" {
 			if err := b.extractType(ctx, t); err != nil {
@@ -740,7 +803,7 @@ func (b *reflectionSchemaBuilder) typeToDescriptor(ctx context.Context, t reflec
 
 func (b *reflectionSchemaBuilder) mapKeyToDescriptor(ctx context.Context, t reflect.Type) (ir.TypeDescriptor, error) {
 	// json.Number values are numeric JSON tokens, but map keys are always JSON
-	// object member names and encoding/json accepts arbitrary Number key text.
+	// object member names and encoding/json/v2 accepts arbitrary Number key text.
 	if isJSONNumberReflectType(t) {
 		return ir.String(), nil
 	}
@@ -752,11 +815,6 @@ func (b *reflectionSchemaBuilder) checkSpecialType(t reflect.Type) ir.TypeDescri
 	// Check for time.Time
 	if t.PkgPath() == "time" && t.Name() == "Time" {
 		return ir.Time()
-	}
-
-	// Check for time.Duration
-	if t.PkgPath() == "time" && t.Name() == "Duration" {
-		return ir.Duration()
 	}
 
 	// json.Number emits an unquoted numeric token. Float64 is the closest
@@ -795,39 +853,39 @@ func (b *reflectionSchemaBuilder) checkSpecialType(t reflect.Type) ir.TypeDescri
 	if isJSONByteSliceReflect(t) {
 		return ir.Bytes()
 	}
+	if isJSONByteArrayReflect(t) {
+		return ir.ByteArray(t.Len())
+	}
 
 	return nil
 }
 
-// isJSONByteSliceReflect mirrors encoding/json's byte-slice selection.
+// isJSONByteSliceReflect mirrors encoding/json/v2's byte-slice selection.
 func isJSONByteSliceReflect(t reflect.Type) bool {
-	if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8 {
-		return false
-	}
-	elemPointer := reflect.PointerTo(t.Elem())
-	return !elemPointer.Implements(jsonMarshalerType) && !elemPointer.Implements(textMarshalerType)
+	return t.Kind() == reflect.Slice && t.Elem() == reflect.TypeFor[byte]()
 }
 
-// hasCustomMarshaler checks if a type implements json.Marshaler or encoding.TextMarshaler.
-// Both the type and pointer-to-type are checked since marshaler methods may have
-// either value or pointer receivers.
+func isJSONByteArrayReflect(t reflect.Type) bool {
+	return t.Kind() == reflect.Array && t.Elem() == reflect.TypeFor[byte]()
+}
+
+// hasCustomMarshaler checks every codec interface that can alter the v2 wire
+// representation. Both value and pointer method sets matter.
 func (b *reflectionSchemaBuilder) hasCustomMarshaler(t reflect.Type) bool {
-	// Check if the type or *type implements json.Marshaler
-	if t.Implements(jsonMarshalerType) {
-		return true
+	interfaces := []reflect.Type{
+		jsonMarshalerToType,
+		jsonMarshalerType,
+		textAppenderType,
+		textMarshalerType,
+		jsonUnmarshalerFromType,
+		jsonUnmarshalerType,
+		textUnmarshalerType,
 	}
-	if t.Kind() != reflect.Ptr && reflect.PointerTo(t).Implements(jsonMarshalerType) {
-		return true
+	for _, iface := range interfaces {
+		if t.Implements(iface) || (t.Kind() != reflect.Ptr && reflect.PointerTo(t).Implements(iface)) {
+			return true
+		}
 	}
-
-	// Check if the type or *type implements encoding.TextMarshaler
-	if t.Implements(textMarshalerType) {
-		return true
-	}
-	if t.Kind() != reflect.Ptr && reflect.PointerTo(t).Implements(textMarshalerType) {
-		return true
-	}
-
 	return false
 }
 
@@ -860,12 +918,11 @@ func (b *reflectionSchemaBuilder) validateMapKeyType(t reflect.Type) error {
 	case reflect.Bool:
 		return fmt.Errorf("unsupported map key type: bool")
 	case reflect.Float32, reflect.Float64:
-		return fmt.Errorf("unsupported map key type: %s", t.Kind())
+		return nil
 	case reflect.Complex64, reflect.Complex128:
 		return fmt.Errorf("unsupported map key type: %s", t.Kind())
 	case reflect.Struct:
-		// Check if it implements encoding.TextMarshaler
-		if t.Implements(reflect.TypeOf((*interface{ MarshalText() ([]byte, error) })(nil)).Elem()) {
+		if t.Implements(textAppenderType) || t.Implements(textMarshalerType) {
 			return nil
 		}
 		return fmt.Errorf("unsupported map key type: struct without TextMarshaler")
@@ -916,14 +973,18 @@ func (b *reflectionSchemaBuilder) extractAnonymousStruct(ctx context.Context, t 
 	fullName := pkg + "." + syntheticName
 	b.typeNames[fullName] = true
 
+	jsonFields, err := reflectionJSONFields(t)
+	if err != nil {
+		return err
+	}
 	var fields []ir.FieldDescriptor
-	for _, field := range reflectionJSONFields(t) {
+	for _, field := range jsonFields {
 		fd, err := b.buildFieldDescriptor(ctx, field.field, syntheticName, pkg)
 		if err != nil {
 			return fmt.Errorf("field %s.%s: %w", syntheticName, field.field.Name, err)
 		}
 		fd.JSONName = field.name
-		fd.Optional = fd.Optional || field.optional
+		fd.OmitIfEmbeddedNil = field.omitIfEmbeddedNil
 		fields = append(fields, fd)
 	}
 
@@ -966,9 +1027,9 @@ func (b *reflectionSchemaBuilder) generateSyntheticName(name string) string {
 }
 
 // parseJSONTag parses a json struct tag and returns the JSON name and flags.
-func parseJSONTag(tag, fieldName string) (jsonName string, optional, skip, stringEncoded bool) {
+func parseJSONTag(tag, fieldName string) (jsonName string, omitEmpty, omitZero, skip, stringEncoded bool, unsupported string) {
 	if tag == "" {
-		return fieldName, false, false, false
+		return fieldName, false, false, false, false, ""
 	}
 
 	parts := strings.Split(tag, ",")
@@ -976,7 +1037,7 @@ func parseJSONTag(tag, fieldName string) (jsonName string, optional, skip, strin
 
 	// If name is exactly "-" and there are no options, skip the field
 	if jsonName == "-" && len(parts) == 1 {
-		return "", false, true, false
+		return "", false, false, true, false, ""
 	}
 
 	// If name is empty string (e.g., ",omitempty"), use field name
@@ -994,14 +1055,22 @@ func parseJSONTag(tag, fieldName string) (jsonName string, optional, skip, strin
 	// Parse options
 	for i := 1; i < len(parts); i++ {
 		switch parts[i] {
-		case "omitempty", "omitzero":
-			optional = true
+		case "omitempty":
+			omitEmpty = true
+		case "omitzero":
+			omitZero = true
 		case "string":
 			stringEncoded = true
+		case "embed":
+			unsupported = "embed"
+		default:
+			if strings.HasPrefix(parts[i], "format:") {
+				unsupported = parts[i]
+			}
 		}
 	}
 
-	return jsonName, optional, false, stringEncoded
+	return jsonName, omitEmpty, omitZero, false, stringEncoded, unsupported
 }
 
 // addWarning adds a warning to the schema.

@@ -1,6 +1,7 @@
 package tygor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -181,6 +182,53 @@ func TestHandler_ServeHTTP_POST_RejectsTrailingJSON(t *testing.T) {
 				t.Fatalf("handler called = %v, want %v", called, tt.wantStatus == http.StatusOK)
 			}
 		})
+	}
+}
+
+func TestDecodeJSONBody_UsesStrictV2Semantics(t *testing.T) {
+	type request struct {
+		Value string `json:"Value"`
+	}
+
+	t.Run("field names are exact", func(t *testing.T) {
+		var got request
+		if err := decodeJSONBody(strings.NewReader(`{"value":"ignored"}`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Value != "" {
+			t.Fatalf("Value = %q, want unmatched lowercase name ignored", got.Value)
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "duplicate name", body: []byte(`{"Value":"first","Value":"second"}`)},
+		{name: "invalid UTF-8", body: []byte{'{', '"', 'V', 'a', 'l', 'u', 'e', '"', ':', '"', 0xff, '"', '}'}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got request
+			if err := decodeJSONBody(bytes.NewReader(tt.body), &got); err == nil {
+				t.Fatal("decode succeeded, want strict v2 rejection")
+			}
+		})
+	}
+}
+
+func TestMarshalResponse_UsesStrictV2Semantics(t *testing.T) {
+	type result struct {
+		Items []int          `json:"items"`
+		Index map[string]int `json:"index"`
+		Hash  [3]byte        `json:"hash"`
+	}
+
+	got, err := marshalResponse(result{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "{\"result\":{\"items\":[],\"index\":{},\"hash\":\"AAAA\"}}\n"; string(got) != want {
+		t.Fatalf("marshalResponse() = %s, want %s", got, want)
 	}
 }
 

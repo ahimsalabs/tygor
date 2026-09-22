@@ -2,6 +2,8 @@ package testdata
 
 import (
 	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
 )
 
 // CustomJSONType implements json.Marshaler
@@ -61,6 +63,18 @@ func (*AliasTextPointer) MarshalText() (MarshalerBytes, error) {
 	return MarshalerBytes("text-pointer"), nil
 }
 
+type V2JSONValue int
+
+func (V2JSONValue) MarshalJSONTo(*jsontext.Encoder) error {
+	return errors.ErrUnsupported
+}
+
+type AppendedTextValue int
+
+func (AppendedTextValue) AppendText(dst []byte) ([]byte, error) {
+	return append(dst, "appended"...), nil
+}
+
 type AliasResultTextMapKey struct {
 	ID string
 }
@@ -70,10 +84,12 @@ func (k AliasResultTextMapKey) MarshalText() (MarshalerBytes, MarshalerError) {
 }
 
 type AliasResultMarshalers struct {
-	JSONValue   AliasJSONValue    `json:"json_value"`
-	JSONPointer AliasJSONPointer  `json:"json_pointer"`
-	TextValue   AliasTextValue    `json:"text_value"`
-	TextPointer *AliasTextPointer `json:"text_pointer"`
+	JSONValue    AliasJSONValue    `json:"json_value"`
+	JSONPointer  AliasJSONPointer  `json:"json_pointer"`
+	TextValue    AliasTextValue    `json:"text_value"`
+	TextPointer  *AliasTextPointer `json:"text_pointer"`
+	V2JSON       V2JSONValue       `json:"v2_json"`
+	AppendedText AppendedTextValue `json:"appended_text"`
 }
 
 type AliasResultTextMap struct {

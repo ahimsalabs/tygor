@@ -21,8 +21,10 @@ type PackageInfo struct {
 
 // Warning represents a non-fatal issue during schema generation.
 type Warning struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code     string          `json:"Code"`
+	Message  string          `json:"Message"`
+	Source   *SourceLocation `json:"Source,omitempty"`
+	TypeName string          `json:"TypeName,omitempty"`
 }
 
 // ServiceDescriptor describes a service and its endpoints.
@@ -60,18 +62,19 @@ type TypeDescriptor struct {
 // TypeRef is a reference to a type (used in fields, requests, responses).
 // Uses kind discriminator for the various type expression forms.
 type TypeRef struct {
-	Kind          string    `json:"kind"`                    // "primitive", "reference", "array", "map", "ptr", "union", "typeParameter"
-	PrimitiveKind string    `json:"primitiveKind,omitempty"` // for primitive
-	BitSize       int       `json:"bitSize,omitempty"`       // for numeric primitives
-	Name          string    `json:"name,omitempty"`          // for reference
-	Package       string    `json:"package,omitempty"`       // for reference
-	Element       *TypeRef  `json:"element,omitempty"`       // for array, ptr
-	Length        int       `json:"length,omitempty"`        // for array (0 = slice)
-	Key           *TypeRef  `json:"key,omitempty"`           // for map
-	Value         *TypeRef  `json:"value,omitempty"`         // for map
-	Types         []TypeRef `json:"types,omitempty"`         // for union
-	ParamName     string    `json:"paramName,omitempty"`     // for typeParameter
-	Constraint    *TypeRef  `json:"constraint,omitempty"`    // for typeParameter
+	Kind            string    `json:"kind"`                      // "primitive", "reference", "array", "map", "ptr", "union", "typeParameter"
+	PrimitiveKind   string    `json:"primitiveKind,omitempty"`   // for primitive
+	BitSize         int       `json:"bitSize,omitempty"`         // for numeric primitives
+	ByteArrayLength *int      `json:"byteArrayLength,omitempty"` // for fixed byte arrays
+	Name            string    `json:"name,omitempty"`            // for reference
+	Package         string    `json:"package,omitempty"`         // for reference
+	Element         *TypeRef  `json:"element,omitempty"`         // for array, ptr
+	Length          int       `json:"length,omitempty"`          // for array (0 = slice)
+	Key             *TypeRef  `json:"key,omitempty"`             // for map
+	Value           *TypeRef  `json:"value,omitempty"`           // for map
+	Types           []TypeRef `json:"types,omitempty"`           // for union
+	ParamName       string    `json:"paramName,omitempty"`       // for typeParameter
+	Constraint      *TypeRef  `json:"constraint,omitempty"`      // for typeParameter
 }
 
 // GoIdentifier is a fully-qualified Go type name.
@@ -82,14 +85,16 @@ type GoIdentifier struct {
 
 // FieldDescriptor describes a struct field.
 type FieldDescriptor struct {
-	Name          string  `json:"name"`
-	Type          TypeRef `json:"type"`
-	JSONName      string  `json:"jsonName"`
-	Optional      bool    `json:"optional,omitempty"`
-	StringEncoded bool    `json:"stringEncoded,omitempty"`
-	Skip          bool    `json:"skip,omitempty"`
-	ValidateTag   string  `json:"validateTag,omitempty"`
-	Doc           string  `json:"doc,omitempty"`
+	Name              string  `json:"name"`
+	Type              TypeRef `json:"type"`
+	JSONName          string  `json:"jsonName"`
+	OmitEmpty         bool    `json:"omitEmpty,omitempty"`
+	OmitZero          bool    `json:"omitZero,omitempty"`
+	OmitIfEmbeddedNil bool    `json:"omitIfEmbeddedNil,omitempty"`
+	StringEncoded     bool    `json:"stringEncoded,omitempty"`
+	Skip              bool    `json:"skip,omitempty"`
+	ValidateTag       string  `json:"validateTag,omitempty"`
+	Doc               string  `json:"doc,omitempty"`
 }
 
 // EnumMember describes a single enum constant.

@@ -6,7 +6,7 @@
  */
 export interface AppStatus {
   status: string;
-  port?: number /* int */;
+  port: number /* int */;
   error?: string;
   phase?: string;
 }
@@ -16,9 +16,9 @@ export interface AppStatus {
  */
 export interface DiscoverySchema {
   Package: PackageInfo;
-  Types: TypeDescriptor[] | null;
-  Services: ServiceDescriptor[] | null;
-  Warnings?: Warning[] | null;
+  Types: TypeDescriptor[];
+  Services: ServiceDescriptor[];
+  Warnings?: Warning[];
 }
 /**
  * Documentation holds doc comments.
@@ -27,7 +27,7 @@ export interface DiscoverySchema {
 export interface Documentation {
   Summary?: string;
   Body?: string;
-  Deprecated?: string | null;
+  Deprecated?: string;
 }
 /**
  * EndpointDescriptor describes an RPC endpoint.
@@ -38,8 +38,8 @@ export interface EndpointDescriptor {
   fullName: string;
   primitive: string;
   path: string;
-  request?: TypeRef | null;
-  response?: TypeRef | null;
+  request?: TypeRef;
+  response?: TypeRef;
   doc?: string;
 }
 /**
@@ -59,9 +59,11 @@ export interface FieldDescriptor {
   name: string;
   "type": TypeRef;
   jsonName: string;
-  optional?: boolean;
-  stringEncoded?: boolean;
-  skip?: boolean;
+  omitEmpty: boolean;
+  omitZero: boolean;
+  omitIfEmbeddedNil: boolean;
+  stringEncoded: boolean;
+  skip: boolean;
   validateTag?: string;
   doc?: string;
 }
@@ -85,8 +87,8 @@ export interface GetDiscoveryResponse {
  */
 export interface GetSourceRequest {
   file: string;
-  line?: number /* int */;
-  context?: number /* int */;
+  line: number /* int */;
+  context: number /* int */;
 }
 /**
  * GetSourceResponse returns source code with context.
@@ -95,7 +97,7 @@ export interface GetSourceRequest {
 export interface GetSourceResponse {
   file: string;
   language: string;
-  lines: SourceLine[] | null;
+  lines: SourceLine[];
   context: number /* int */;
 }
 /**
@@ -111,13 +113,13 @@ export interface GetStatusRequest {
  */
 export interface GetStatusResponse {
   status: string;
-  port?: number /* int */;
+  port: number /* int */;
   error?: string;
   phase?: string;
   command: string | null;
   cwd?: string;
   exitCode: number /* int */ | null;
-  rawrData?: string[] | null;
+  rawrData?: string[];
 }
 /**
  * GoIdentifier is a fully-qualified Go type name.
@@ -141,7 +143,7 @@ export interface PackageInfo {
  * @see tygor.dev/cmd/tygor/internal/dev/dev.go#ReloadRequest
  */
 export interface ReloadRequest {
-  files?: string[] | null;
+  files?: string[];
   reason?: string;
 }
 /**
@@ -156,7 +158,7 @@ export interface ReloadResponse {
  */
 export interface ServiceDescriptor {
   name: string;
-  endpoints: EndpointDescriptor[] | null;
+  endpoints: EndpointDescriptor[];
   doc?: string;
 }
 /**
@@ -166,7 +168,7 @@ export interface ServiceDescriptor {
 export interface SourceLine {
   num: number /* int */;
   content: string;
-  highlight?: boolean;
+  highlight: boolean;
 }
 /**
  * SourceLocation points to a position in source code.
@@ -185,13 +187,13 @@ export interface SourceLocation {
 export interface TypeDescriptor {
   kind: string;
   Name: GoIdentifier;
-  TypeParameters?: TypeParameter[] | null;
-  Fields?: FieldDescriptor[] | null;
-  Members?: EnumMember[] | null;
-  Underlying?: TypeRef | null;
-  Extends?: GoIdentifier[] | null;
-  Documentation?: Documentation | null;
-  Source?: SourceLocation | null;
+  TypeParameters?: TypeParameter[];
+  Fields?: FieldDescriptor[];
+  Members?: EnumMember[];
+  Underlying?: TypeRef;
+  Extends?: GoIdentifier[];
+  Documentation?: Documentation;
+  Source?: SourceLocation;
 }
 /**
  * TypeParameter describes a generic type parameter.
@@ -200,7 +202,7 @@ export interface TypeDescriptor {
 export interface TypeParameter {
   kind: string;
   paramName: string;
-  constraint?: TypeRef | null;
+  constraint?: TypeRef;
 }
 /**
  * TypeRef is a reference to a type (used in fields, requests, responses).
@@ -210,16 +212,17 @@ export interface TypeParameter {
 export interface TypeRef {
   kind: string;
   primitiveKind?: string;
-  bitSize?: number /* int */;
+  bitSize: number /* int */;
+  byteArrayLength?: number /* int */;
   name?: string;
   "package"?: string;
-  element?: TypeRef | null;
-  length?: number /* int */;
-  key?: TypeRef | null;
-  value?: TypeRef | null;
-  types?: TypeRef[] | null;
+  element?: TypeRef;
+  length: number /* int */;
+  key?: TypeRef;
+  value?: TypeRef;
+  types?: TypeRef[];
   paramName?: string;
-  constraint?: TypeRef | null;
+  constraint?: TypeRef;
 }
 /**
  * UpdateStatusRequest is sent by vite plugin to update app status.
@@ -239,6 +242,8 @@ export interface UpdateStatusResponse {
  * @see tygor.dev/cmd/tygor/internal/dev/schema.go#Warning
  */
 export interface Warning {
-  code: string;
-  message: string;
+  Code: string;
+  Message: string;
+  Source?: SourceLocation;
+  TypeName?: string;
 }

@@ -137,7 +137,7 @@ func (s *Schema) Validate() []error {
 				if !isNilTypeDescriptor(field.Type) && field.StringEncoded && !s.StringEncodingApplies(field.Type) {
 					errors = append(errors, &ValidationError{
 						Code:    "invalid_string_encoded",
-						Message: "StringEncoded set on incompatible type for field " + d.Name.Name + "." + field.Name + ": only string, integer, float, boolean, and duration types at encoding/json's supported pointer depth use json:\",string\"",
+						Message: "StringEncoded set on incompatible type for field " + d.Name.Name + "." + field.Name + ": encoding/json/v2 only permits json:\",string\" on values represented as JSON numbers",
 					})
 				}
 			}
@@ -347,6 +347,25 @@ func validateTypeDescriptorPath(td TypeDescriptor, typeNames map[GoIdentifier]bo
 			errors = append(errors, validateTypeDescriptorPath(d.Constraint, typeNames, typeArities, typeParameters, context+" constraint", active)...)
 		}
 	case *PrimitiveDescriptor:
+		if d.PrimitiveKind == PrimitiveDuration {
+			errors = append(errors, &ValidationError{
+				Code:    "unsupported_duration",
+				Message: context + " uses time.Duration, which has no default encoding/json/v2 representation",
+			})
+		}
+		if d.ByteArrayLength != nil {
+			if d.PrimitiveKind != PrimitiveBytes {
+				errors = append(errors, &ValidationError{
+					Code:    "invalid_byte_array_length",
+					Message: context + " sets ByteArrayLength on a non-bytes primitive",
+				})
+			} else if *d.ByteArrayLength < 0 {
+				errors = append(errors, &ValidationError{
+					Code:    "invalid_byte_array_length",
+					Message: context + " has a negative byte array length",
+				})
+			}
+		}
 	default:
 		errors = append(errors, &ValidationError{
 			Code:    "invalid_nested_type",
@@ -379,25 +398,19 @@ func validateTypeParameters(parameters []TypeParameterDescriptor, context string
 	return declared, errors
 }
 
-// StringEncodingApplies reports whether encoding/json applies a field's
-// json:",string" option to td. encoding/json dereferences at most one pointer,
-// including a defined pointer, before checking the field kind. A second pointer
-// does not use string encoding.
+// StringEncodingApplies reports whether encoding/json/v2 applies a field's
+// json:",string" option to td. V2 permits it only for values whose ordinary
+// representation is a JSON number and follows any pointer depth.
 func (s *Schema) StringEncodingApplies(td TypeDescriptor) bool {
-	pointerSeen := false
 	visited := make(map[TypeDescriptor]bool)
 	for !isNilTypeDescriptor(td) && !visited[td] {
 		visited[td] = true
 		switch d := td.(type) {
 		case *PtrDescriptor:
-			if pointerSeen {
-				return false
-			}
-			pointerSeen = true
 			td = d.Element
 		case *PrimitiveDescriptor:
 			switch d.PrimitiveKind {
-			case PrimitiveString, PrimitiveBool, PrimitiveInt, PrimitiveUint, PrimitiveFloat, PrimitiveDuration:
+			case PrimitiveInt, PrimitiveUint, PrimitiveFloat:
 				return true
 			}
 			return false
@@ -410,7 +423,9 @@ func (s *Schema) StringEncodingApplies(td TypeDescriptor) bool {
 				return false
 			}
 			for _, member := range d.Members {
-				if !isValidEnumValueType(member.Value) {
+				switch member.Value.(type) {
+				case int64, float64:
+				default:
 					return false
 				}
 			}
@@ -420,6 +435,97 @@ func (s *Schema) StringEncodingApplies(td TypeDescriptor) bool {
 		}
 	}
 	return false
+}
+
+// FieldOptional reports whether a field can be absent from a marshaled v2
+// object. It derives wire presence from the independent omission causes.
+func (s *Schema) FieldOptional(field FieldDescriptor) bool {
+	return field.OmitIfEmbeddedNil || field.OmitZero || field.OmitEmpty && s.canEncodeJSONEmpty(field.Type, make(map[TypeDescriptor]bool))
+}
+
+// FieldNullableWhenPresent reports whether a present field can encode as null
+// under default v2 semantics. Nil slices, maps, and byte sequences encode as
+// non-null empty values; pointer nulls may be removed by omission tags.
+func (s *Schema) FieldNullableWhenPresent(field FieldDescriptor) bool {
+	depth := s.leadingPointerDepth(field.Type)
+	if depth == 0 {
+		return false
+	}
+	if field.OmitEmpty {
+		return false
+	}
+	if field.OmitZero {
+		return depth > 1
+	}
+	return true
+}
+
+func (s *Schema) leadingPointerDepth(td TypeDescriptor) int {
+	depth := 0
+	seen := make(map[TypeDescriptor]bool)
+	for !isNilTypeDescriptor(td) && !seen[td] {
+		seen[td] = true
+		switch d := td.(type) {
+		case *PtrDescriptor:
+			depth++
+			td = d.Element
+		case *ReferenceDescriptor:
+			td = s.FindType(d.Target)
+		case *AliasDescriptor:
+			td = d.Underlying
+		default:
+			return depth
+		}
+	}
+	return depth
+}
+
+func (s *Schema) canEncodeJSONEmpty(td TypeDescriptor, seen map[TypeDescriptor]bool) bool {
+	if isNilTypeDescriptor(td) || seen[td] {
+		return false
+	}
+	seen[td] = true
+	defer delete(seen, td)
+
+	switch d := td.(type) {
+	case *PtrDescriptor:
+		return true
+	case *ArrayDescriptor:
+		return d.IsSlice() || d.Length == 0
+	case *MapDescriptor:
+		return true
+	case *PrimitiveDescriptor:
+		switch d.PrimitiveKind {
+		case PrimitiveString, PrimitiveAny, PrimitiveEmpty:
+			return true
+		case PrimitiveBytes:
+			return d.ByteArrayLength == nil || *d.ByteArrayLength == 0
+		default:
+			return false
+		}
+	case *ReferenceDescriptor:
+		return s.canEncodeJSONEmpty(s.FindType(d.Target), seen)
+	case *AliasDescriptor:
+		return s.canEncodeJSONEmpty(d.Underlying, seen)
+	case *StructDescriptor:
+		for _, field := range d.Fields {
+			if !field.Skip && !s.FieldOptional(field) {
+				return false
+			}
+		}
+		return true
+	case *EnumDescriptor:
+		for _, member := range d.Members {
+			if _, ok := member.Value.(string); ok {
+				return true
+			}
+		}
+		return false
+	case *TypeParameterDescriptor, *UnionDescriptor:
+		return true
+	default:
+		return false
+	}
 }
 
 // HasPointerOnlyAliasCycle reports whether resolving alias through only aliases

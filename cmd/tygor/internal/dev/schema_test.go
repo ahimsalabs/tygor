@@ -1,9 +1,11 @@
 package dev
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"os"
 	"testing"
+
+	"tygor.dev/tygorgen/ir"
 )
 
 // TestDiscoverySchemaRoundTrip verifies that our schema types can round-trip
@@ -98,5 +100,51 @@ func TestDiscoverySchemaTypes(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestDiscoverySchemaPreservesV2Metadata(t *testing.T) {
+	pkg := "example.com/model"
+	schema := &ir.Schema{
+		Package: ir.PackageInfo{Path: pkg, Name: "model"},
+		Types: []ir.TypeDescriptor{&ir.StructDescriptor{
+			Name: ir.GoIdentifier{Name: "Payload", Package: pkg},
+			Fields: []ir.FieldDescriptor{
+				{Name: "Empty", JSONName: "empty", Type: ir.ByteArray(0), OmitEmpty: true},
+				{Name: "Zero", JSONName: "zero", Type: ir.ByteArray(3), OmitZero: true},
+				{Name: "Promoted", JSONName: "promoted", Type: ir.String(), OmitIfEmbeddedNil: true},
+			},
+		}},
+		Warnings: []ir.Warning{{
+			Code:     "V2_WARNING",
+			Message:  "preserve me",
+			Source:   &ir.Source{File: "model.go", Line: 7, Column: 3},
+			TypeName: "Payload",
+		}},
+	}
+
+	data, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got DiscoverySchema
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Types) != 1 || len(got.Types[0].Fields) != 3 {
+		t.Fatalf("discovery fields = %#v", got.Types)
+	}
+	fields := got.Types[0].Fields
+	if !fields[0].OmitEmpty || fields[0].Type.ByteArrayLength == nil || *fields[0].Type.ByteArrayLength != 0 {
+		t.Fatalf("empty fixed bytes metadata = %#v", fields[0])
+	}
+	if !fields[1].OmitZero || fields[1].Type.ByteArrayLength == nil || *fields[1].Type.ByteArrayLength != 3 {
+		t.Fatalf("fixed bytes metadata = %#v", fields[1])
+	}
+	if !fields[2].OmitIfEmbeddedNil {
+		t.Fatalf("embedded omission metadata = %#v", fields[2])
+	}
+	if len(got.Warnings) != 1 || got.Warnings[0].Code != "V2_WARNING" || got.Warnings[0].Message != "preserve me" || got.Warnings[0].Source == nil || got.Warnings[0].TypeName != "Payload" {
+		t.Fatalf("warning metadata = %#v", got.Warnings)
 	}
 }

@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,8 +78,8 @@ func TestSourceProvider_BasicTypes(t *testing.T) {
 			t.Errorf("Field %s: expected JSON name %q, got %q", fieldName, expected.jsonName, field.JSONName)
 		}
 
-		if field.Optional != expected.optional {
-			t.Errorf("Field %s: expected Optional=%v, got %v", fieldName, expected.optional, field.Optional)
+		if schema.FieldOptional(*field) != expected.optional {
+			t.Errorf("Field %s: expected optional=%v, got %v", fieldName, expected.optional, schema.FieldOptional(*field))
 		}
 	}
 
@@ -248,13 +249,14 @@ func TestSourceProvider_SliceAndArrayTypes(t *testing.T) {
 		t.Errorf("ByteSlice should be PrimitiveBytes, got %v", primDesc.PrimitiveKind)
 	}
 
-	// Check ByteArray field (should be array of bytes, NOT PrimitiveBytes)
+	// Check ByteArray field (v2 base64 with a fixed decoded length).
 	byteArrayField := findFieldByName(sliceStruct.Fields, "ByteArray")
 	if byteArrayField == nil {
 		t.Fatal("ByteArray field not found")
 	}
-	if byteArrayField.Type.Kind() != ir.KindArray {
-		t.Errorf("ByteArray should be KindArray, got %v", byteArrayField.Type.Kind())
+	byteArray, ok := byteArrayField.Type.(*ir.PrimitiveDescriptor)
+	if !ok || byteArray.PrimitiveKind != ir.PrimitiveBytes || byteArray.ByteArrayLength == nil || *byteArray.ByteArrayLength != 16 {
+		t.Errorf("ByteArray should be a 16-byte primitive, got %#v", byteArrayField.Type)
 	}
 }
 
@@ -327,7 +329,7 @@ func TestSourceProvider_PointerTypes(t *testing.T) {
 	if requiredPtrField.Type.Kind() != ir.KindPtr {
 		t.Errorf("RequiredPtr should be KindPtr, got %v", requiredPtrField.Type.Kind())
 	}
-	if requiredPtrField.Optional {
+	if schema.FieldOptional(*requiredPtrField) {
 		t.Error("RequiredPtr should not be optional")
 	}
 
@@ -336,7 +338,7 @@ func TestSourceProvider_PointerTypes(t *testing.T) {
 	if optionalPtrField == nil {
 		t.Fatal("OptionalPtr field not found")
 	}
-	if !optionalPtrField.Optional {
+	if !schema.FieldOptional(*optionalPtrField) {
 		t.Error("OptionalPtr should be optional")
 	}
 
@@ -467,7 +469,7 @@ func TestSourceProvider_TaggedFields(t *testing.T) {
 	if omitZeroField == nil {
 		t.Fatal("OmitZero field not found")
 	}
-	if !omitZeroField.Optional {
+	if !omitZeroField.OmitZero {
 		t.Error("OmitZero field should be Optional")
 	}
 
@@ -910,7 +912,7 @@ func TestSourceProvider_JSONSpecialTypes(t *testing.T) {
 	}{
 		// json.Number emits numeric JSON tokens.
 		{"Number", "number", false, ir.PrimitiveFloat, 64, false},
-		{"OptionalNumber", "optional_number", true, ir.PrimitiveFloat, 64, false},
+		{"OptionalNumber", "optional_number", false, ir.PrimitiveFloat, 64, false},
 		{"NumberAsString", "number_as_string", false, ir.PrimitiveFloat, 64, false},
 		{"NumberAlias", "number_alias", false, ir.PrimitiveFloat, 64, false},
 
@@ -938,8 +940,8 @@ func TestSourceProvider_JSONSpecialTypes(t *testing.T) {
 			}
 
 			// Verify optional flag
-			if field.Optional != tc.optional {
-				t.Errorf("Field %s: expected Optional=%v, got %v", tc.fieldName, tc.optional, field.Optional)
+			if schema.FieldOptional(*field) != tc.optional {
+				t.Errorf("Field %s: expected optional=%v, got %v", tc.fieldName, tc.optional, schema.FieldOptional(*field))
 			}
 
 			// Check if it's a pointer type
@@ -1475,9 +1477,8 @@ func TestSourceProvider_JSONEmbeddingParity(t *testing.T) {
 	}{
 		{root: "EqualDepthConflict", wantFields: []string{"A", "B", "Own"}, absent: []string{"Clash"}},
 		{root: "TaggedDominance", wantFields: []string{"Tagged"}, absent: []string{"Same"}},
-		{root: "OptionsOnlyEmbedding", wantFields: []string{"Clash", "A"}},
 		{root: "TaggedEmbedding", wantFields: []string{"ConflictA"}},
-		{root: "ScalarEmbedding", wantFields: []string{"EmbeddedString", "EmbeddedInterface"}},
+		{root: "UnicodeJSONName", wantFields: []string{"Value"}},
 	}
 
 	provider := &SourceProvider{}
@@ -1510,6 +1511,39 @@ func TestSourceProvider_JSONEmbeddingParity(t *testing.T) {
 		})
 	}
 
+	for _, tt := range []struct {
+		root    string
+		wantErr string
+	}{
+		{root: "OptionsOnlyEmbedding", wantErr: "cannot have options without an explicit JSON name"},
+		{root: "ScalarEmbedding", wantErr: "embedded non-struct field"},
+		{root: "DirectNameConflict", wantErr: "conflict over JSON object name"},
+	} {
+		t.Run(tt.root+" rejected", func(t *testing.T) {
+			_, err := provider.BuildSchema(context.Background(), SourceInputOptions{
+				Packages:  []string{"tygor.dev/tygorgen/provider/testdata/jsonv2invalid"},
+				RootTypes: []RootType{{Package: "tygor.dev/tygorgen/provider/testdata/jsonv2invalid", Name: tt.root}},
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("BuildSchema error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("Unicode JSON name", func(t *testing.T) {
+		schema, err := provider.BuildSchema(context.Background(), SourceInputOptions{
+			Packages:  []string{"tygor.dev/tygorgen/provider/testdata"},
+			RootTypes: rootTypes("UnicodeJSONName"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		field := findFieldByName(findType(schema, "UnicodeJSONName").(*ir.StructDescriptor).Fields, "Value")
+		if field == nil || field.JSONName != "💡" {
+			t.Fatalf("Unicode field = %#v, want JSON name 💡", field)
+		}
+	})
+
 	t.Run("pointer promotion is optional", func(t *testing.T) {
 		schema, err := provider.BuildSchema(context.Background(), SourceInputOptions{
 			Packages:  []string{"tygor.dev/tygorgen/provider/testdata"},
@@ -1519,7 +1553,7 @@ func TestSourceProvider_JSONEmbeddingParity(t *testing.T) {
 			t.Fatal(err)
 		}
 		field := findFieldByName(findType(schema, "PointerEmbedding").(*ir.StructDescriptor).Fields, "FromPointer")
-		if field == nil || !field.Optional {
+		if field == nil || !schema.FieldOptional(*field) {
 			t.Fatalf("promoted pointer field = %#v, want optional", field)
 		}
 	})
@@ -1542,8 +1576,8 @@ func TestSourceProvider_WireTypeEdgeCases(t *testing.T) {
 	}
 
 	escaped := findFieldByName(findType(schema, "EscapedTag").(*ir.StructDescriptor).Fields, "Escaped")
-	if escaped.JSONName != "foo" || !escaped.Optional {
-		t.Errorf("escaped tag = (%q, optional=%v), want (foo, true)", escaped.JSONName, escaped.Optional)
+	if escaped.JSONName != "foo" || !schema.FieldOptional(*escaped) {
+		t.Errorf("escaped tag = (%q, optional=%v), want (foo, true)", escaped.JSONName, schema.FieldOptional(*escaped))
 	}
 
 	marshaled, ok := findType(schema, "MarshaledEnum").(*ir.AliasDescriptor)
@@ -1581,6 +1615,38 @@ func TestSourceProvider_JSONWireClassification(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertJSONWireClassification(t, schema)
+}
+
+func TestSourceProvider_RejectsUnsupportedV2Representations(t *testing.T) {
+	for _, tt := range []struct {
+		root string
+		want string
+	}{
+		{root: "Duration", want: "no default encoding/json/v2 representation"},
+		{root: "BoolString", want: "option string only applies to numeric types"},
+		{root: "Format", want: `encoding/json/v2 does not support "format:base64"`},
+		{root: "Embed", want: "explicit encoding/json/v2 embed fields are not supported"},
+	} {
+		t.Run(tt.root, func(t *testing.T) {
+			_, err := (&SourceProvider{}).BuildSchema(context.Background(), SourceInputOptions{
+				Packages:  []string{"tygor.dev/tygorgen/provider/testdata/jsonv2invalid"},
+				RootTypes: []RootType{{Package: "tygor.dev/tygorgen/provider/testdata/jsonv2invalid", Name: tt.root}},
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("BuildSchema() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestSourceProvider_RejectsDurationRoot(t *testing.T) {
+	_, err := (&SourceProvider{}).BuildSchema(context.Background(), SourceInputOptions{
+		Packages:  []string{"time"},
+		RootTypes: []RootType{{Package: "time", Name: "Duration"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no default encoding/json/v2 representation") {
+		t.Fatalf("BuildSchema(time.Duration) error = %v", err)
+	}
 }
 
 func TestSourceProvider_RejectsWireTypesIncompatibleWithGenericConstraints(t *testing.T) {
@@ -1665,29 +1731,17 @@ func TestSourceProvider_RejectsStringEncodingOnUnresolvedTypeParameter(t *testin
 		t.Fatalf("generic pointer-alias string-encoding error = %v", err)
 	}
 
-	pointer := &value
-	wire, err = json.Marshal(genericstring.GenericDoublePointerStringEncoded[int]{Value: &pointer})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(wire) != `{"value":7}` {
-		t.Fatalf("Go double-pointer JSON wire = %s, want unquoted generic integer", wire)
-	}
-	schema, err := (&SourceProvider{}).BuildSchema(context.Background(), SourceInputOptions{
+	_, err = (&SourceProvider{}).BuildSchema(context.Background(), SourceInputOptions{
 		Packages:  []string{"tygor.dev/tygorgen/provider/testdata/genericstring"},
 		RootTypes: rootTypes("GenericDoublePointerStringEncoded"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	field := findFieldByName(findType(schema, "GenericDoublePointerStringEncoded").(*ir.StructDescriptor).Fields, "Value")
-	if field.StringEncoded {
-		t.Fatal("encoding/json-ignored ,string option was applied through two pointer levels")
+	if err == nil || !strings.Contains(err.Error(), `json:",string" on unresolved type parameter T is not supported`) {
+		t.Fatalf("generic double-pointer string-encoding error = %v", err)
 	}
 }
 
 func TestSourceProvider_RejectsPotentiallyByteEncodedGenericSlice(t *testing.T) {
-	wire, err := json.Marshal(genericbytes.Payload{
+	wire, err := jsonv2.Marshal(genericbytes.Payload{
 		Data: genericbytes.GenericBytes[uint8]{1, 2},
 	})
 	if err != nil {
@@ -1697,16 +1751,16 @@ func TestSourceProvider_RejectsPotentiallyByteEncodedGenericSlice(t *testing.T) 
 		t.Fatalf("Go JSON wire = %s, want base64 byte-slice encoding", wire)
 	}
 
-	methodWire, err := json.Marshal(genericbytes.MethodPayload{
+	methodWire, err := jsonv2.Marshal(genericbytes.MethodPayload{
 		Data: genericbytes.MethodBytes[genericbytes.Octet]{1, 2},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(methodWire) != `{"data":"AQI="}` {
-		t.Fatalf("method-constrained Go JSON wire = %s, want base64 byte-slice encoding", methodWire)
+	if string(methodWire) != `{"data":[1,2]}` {
+		t.Fatalf("method-constrained Go JSON wire = %s, want numeric array", methodWire)
 	}
-	structWire, err := json.Marshal(genericbytes.ConcreteStructPayload{
+	structWire, err := jsonv2.Marshal(genericbytes.ConcreteStructPayload{
 		Value: genericbytes.StructPayload[uint8]{Data: []uint8{1, 2}},
 	})
 	if err != nil {
@@ -1715,7 +1769,7 @@ func TestSourceProvider_RejectsPotentiallyByteEncodedGenericSlice(t *testing.T) 
 	if string(structWire) != `{"value":{"data":"AQI="}}` {
 		t.Fatalf("generic struct Go JSON wire = %s, want nested base64 byte-slice encoding", structWire)
 	}
-	mixedWire, err := json.Marshal(genericbytes.MixedResponse{
+	mixedWire, err := jsonv2.Marshal(genericbytes.MixedResponse{
 		Value: genericbytes.MixedContainer[uint8, []uint8]{Values: []uint8{1, 2}},
 	})
 	if err != nil {
@@ -1726,7 +1780,7 @@ func TestSourceProvider_RejectsPotentiallyByteEncodedGenericSlice(t *testing.T) 
 	}
 
 	for _, root := range []string{
-		"GenericBytes", "Payload", "AnyList", "MethodPayload",
+		"GenericBytes", "Payload", "AnyList",
 		"StructPayload", "ConcreteStructPayload", "NestedPayload", "ConcreteAnyStructPayload",
 	} {
 		t.Run(root, func(t *testing.T) {
@@ -1753,7 +1807,7 @@ func TestSourceProvider_RejectsPotentiallyByteEncodedGenericSlice(t *testing.T) 
 		}
 	})
 
-	for _, root := range []string{"StringList", "CustomSlice"} {
+	for _, root := range []string{"StringList", "MethodPayload", "CustomSlice"} {
 		t.Run(root+" remains supported", func(t *testing.T) {
 			schema, err := (&SourceProvider{}).BuildSchema(context.Background(), SourceInputOptions{
 				Packages:  []string{"tygor.dev/tygorgen/provider/testdata/genericbytes"},
@@ -1808,22 +1862,17 @@ func assertJSONWireClassification(t *testing.T, schema *ir.Schema) {
 
 	depths := findType(schema, "StringEncodingDepths").(*ir.StructDescriptor)
 	for name, want := range map[string]bool{
-		"Direct": true, "Single": true, "Double": false,
-		"Triple": false, "Duration": true, "Defined": true,
+		"Direct": true, "Single": true, "Double": true,
+		"Triple": true, "Defined": true,
 	} {
 		field := findFieldByName(depths.Fields, name)
 		if field == nil || field.StringEncoded != want {
 			t.Errorf("StringEncodingDepths.%s StringEncoded = %v, want %v", name, field != nil && field.StringEncoded, want)
 		}
 	}
-	if field := findFieldByName(depths.Fields, "Double"); field.RawTags["json"] != "double,string" {
-		t.Fatalf("ignored ,string option was not preserved in RawTags: %#v", field.RawTags)
-	}
-
 	bytesField := findFieldByName(findType(schema, "DefinedByteSlices").(*ir.StructDescriptor).Fields, "Data")
-	primitive, ok := bytesField.Type.(*ir.PrimitiveDescriptor)
-	if !ok || primitive.PrimitiveKind != ir.PrimitiveBytes {
-		t.Fatalf("[]Octet descriptor = %#v, want PrimitiveBytes", bytesField.Type)
+	if _, ok := bytesField.Type.(*ir.ArrayDescriptor); !ok {
+		t.Fatalf("[]Octet descriptor = %#v, want an array descriptor", bytesField.Type)
 	}
 	customField := findFieldByName(findType(schema, "CustomElementByteSlice").(*ir.StructDescriptor).Fields, "Data")
 	if _, ok := customField.Type.(*ir.ArrayDescriptor); !ok {
@@ -1831,7 +1880,7 @@ func assertJSONWireClassification(t *testing.T, schema *ir.Schema) {
 	}
 
 	marshalers := findType(schema, "AliasResultMarshalers").(*ir.StructDescriptor)
-	for _, name := range []string{"JSONValue", "JSONPointer", "TextValue", "TextPointer"} {
+	for _, name := range []string{"JSONValue", "JSONPointer", "TextValue", "TextPointer", "V2JSON", "AppendedText"} {
 		field := findFieldByName(marshalers.Fields, name)
 		fieldType := field.Type
 		if pointer, ok := fieldType.(*ir.PtrDescriptor); ok {

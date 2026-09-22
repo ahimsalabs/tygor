@@ -1,9 +1,9 @@
 package tygor
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"iter"
@@ -27,10 +27,10 @@ var ErrLiveValueClosed = errors.New("livevalue closed")
 // receive the latest value, and intermediate updates may be skipped if
 // a subscriber is slow.
 //
-// LiveValue owns its state as JSON. Values must round-trip through encoding/json.
+// LiveValue owns its state as JSON. Values must round-trip through encoding/json/v2.
 // Get and Subscribe decode fresh snapshots, so callers may safely mutate returned
 // values. Go state that JSON does not represent, such as unexported fields and
-// pointer identity, is not preserved, and interface values use encoding/json's
+// pointer identity, is not preserved, and interface values use encoding/json/v2's
 // default decoded types. Custom JSON codecs must decode deterministically. Inputs
 // may be mutated after NewLiveValue, Set, or Update returns, but not concurrently
 // while that operation is encoding them.
@@ -54,14 +54,14 @@ var ErrLiveValueClosed = errors.New("livevalue closed")
 //	svc.LiveValue("Status", status)
 type LiveValue[T any] struct {
 	mu          sync.RWMutex
-	bytes       json.RawMessage
-	subscribers map[int64]chan json.RawMessage
+	bytes       jsontext.Value
+	subscribers map[int64]chan jsontext.Value
 	nextSubID   int64
 	closed      bool
 }
 
 // NewLiveValue creates a LiveValue whose initial state is an owned JSON snapshot.
-// It returns an error if initial cannot round-trip through encoding/json.
+// It returns an error if initial cannot round-trip through encoding/json/v2.
 func NewLiveValue[T any](initial T) (*LiveValue[T], error) {
 	data, err := encodeLiveValue(initial)
 	if err != nil {
@@ -70,7 +70,7 @@ func NewLiveValue[T any](initial T) (*LiveValue[T], error) {
 
 	return &LiveValue[T]{
 		bytes:       data,
-		subscribers: make(map[int64]chan json.RawMessage),
+		subscribers: make(map[int64]chan jsontext.Value),
 	}, nil
 }
 
@@ -84,7 +84,7 @@ func (a *LiveValue[T]) Get() T {
 
 // Set updates the value and broadcasts to all subscribers.
 // The update is rejected without changing state if value cannot round-trip
-// through encoding/json. It returns ErrLiveValueClosed after Close.
+// through encoding/json/v2. It returns ErrLiveValueClosed after Close.
 func (a *LiveValue[T]) Set(value T) error {
 	data, err := encodeLiveValue(value)
 	if err != nil {
@@ -168,7 +168,7 @@ func (a *LiveValue[T]) isClosed() bool {
 
 // registerSubscriber atomically captures the initial state and registers for
 // every later state. The caller must remove a successful registration.
-func (a *LiveValue[T]) registerSubscriber() (int64, json.RawMessage, <-chan json.RawMessage, bool) {
+func (a *LiveValue[T]) registerSubscriber() (int64, jsontext.Value, <-chan jsontext.Value, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -176,7 +176,7 @@ func (a *LiveValue[T]) registerSubscriber() (int64, json.RawMessage, <-chan json
 		return 0, nil, nil, false
 	}
 
-	ch := make(chan json.RawMessage, 1)
+	ch := make(chan jsontext.Value, 1)
 	id := a.nextSubID
 	a.nextSubID++
 	a.subscribers[id] = ch
@@ -193,7 +193,7 @@ func (a *LiveValue[T]) removeSubscriber(id int64) {
 // commitLocked replaces the current state and queues it for every subscriber.
 // a.mu must be held by the caller. Queue capacity is one: when full, the older
 // pending state is replaced so slow subscribers eventually observe the latest.
-func (a *LiveValue[T]) commitLocked(data json.RawMessage) {
+func (a *LiveValue[T]) commitLocked(data jsontext.Value) {
 	a.bytes = data
 	for _, ch := range a.subscribers {
 		select {
@@ -231,7 +231,7 @@ func (a *LiveValue[T]) Close() {
 	}
 }
 
-func encodeLiveValue[T any](value T) (json.RawMessage, error) {
+func encodeLiveValue[T any](value T) (jsontext.Value, error) {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return nil, fmt.Errorf("marshal JSON snapshot: %w", err)
@@ -242,15 +242,15 @@ func encodeLiveValue[T any](value T) (json.RawMessage, error) {
 	return data, nil
 }
 
-func decodeLiveValue[T any](data json.RawMessage) (T, error) {
+func decodeLiveValue[T any](data jsontext.Value) (T, error) {
 	var value T
-	if err := json.Unmarshal(bytes.Clone(data), &value); err != nil {
+	if err := json.Unmarshal(data.Clone(), &value); err != nil {
 		return value, err
 	}
 	return value, nil
 }
 
-func mustDecodeLiveValue[T any](data json.RawMessage) T {
+func mustDecodeLiveValue[T any](data jsontext.Value) T {
 	value, err := decodeLiveValue[T](data)
 	if err != nil {
 		// Every stored snapshot was already decoded successfully. A later failure
@@ -405,7 +405,7 @@ func (h *liveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 	}
 }
 
-func liveValueSSEFrame(data json.RawMessage) []byte {
+func liveValueSSEFrame(data jsontext.Value) []byte {
 	frame := make([]byte, 0, len(data)+len("data: {\"result\":}\n\n"))
 	frame = append(frame, "data: {\"result\":"...)
 	frame = append(frame, data...)

@@ -52,7 +52,7 @@ func TestStructDescriptor_Full(t *testing.T) {
 				Name:          "Name",
 				JSONName:      "name",
 				Type:          String(),
-				Optional:      true,
+				OmitZero:      true,
 				StringEncoded: false,
 				ValidateTag:   "required,min=1",
 				RawTags:       map[string]string{"json": "name,omitempty"},
@@ -81,7 +81,6 @@ func TestFieldDescriptor(t *testing.T) {
 		Name:          "Email",
 		Type:          String(),
 		JSONName:      "email",
-		Optional:      false,
 		StringEncoded: false,
 		Skip:          false,
 		ValidateTag:   "required,email",
@@ -98,8 +97,8 @@ func TestFieldDescriptor(t *testing.T) {
 	if f.JSONName != "email" {
 		t.Errorf("FieldDescriptor.JSONName = %q, want email", f.JSONName)
 	}
-	if f.Optional {
-		t.Error("FieldDescriptor.Optional should be false")
+	if f.OmitEmpty || f.OmitZero || f.OmitIfEmbeddedNil {
+		t.Error("FieldDescriptor omission flags should be false")
 	}
 	if f.Skip {
 		t.Error("FieldDescriptor.Skip should be false")

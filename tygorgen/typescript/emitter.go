@@ -205,7 +205,7 @@ func (e *Emitter) emitStruct(buf *bytes.Buffer, s *ir.StructDescriptor) ([]ir.Wa
 		// Emit type
 		// For pointer fields, unwrap ALL nested pointers before emitting since
 		// emitPtr adds | null and we handle nullability/optionality separately
-		// at field level. Go's encoding/json flattens multiple pointer levels,
+		// at field level. Go's encoding/json/v2 flattens multiple pointer levels,
 		// so **string behaves like *string in JSON serialization.
 		fieldType := field.Type
 		for {
@@ -225,6 +225,9 @@ func (e *Emitter) emitStruct(buf *bytes.Buffer, s *ir.StructDescriptor) ([]ir.Wa
 			typeExpr, err = e.emitTypeExpr(fieldType, false)
 			if err != nil {
 				return nil, fmt.Errorf("failed to emit field %s type: %w", field.Name, err)
+			}
+			if !nullable && e.schema.FieldNullableWhenPresent(ir.FieldDescriptor{Type: fieldType}) {
+				typeExpr = "Exclude<" + typeExpr + ", null>"
 			}
 		}
 		buf.WriteString(typeExpr)
@@ -307,7 +310,10 @@ func (e *Emitter) emitAlias(buf *bytes.Buffer, a *ir.AliasDescriptor) ([]ir.Warn
 			}
 			key = "key in " + keyType
 		}
-		underlying = fmt.Sprintf("({ [%s]: %s } | null)", key, valueType)
+		underlying = fmt.Sprintf("{ [%s]: %s }", key, valueType)
+		if pointerDepth(a.Underlying) > 0 {
+			underlying = "(" + underlying + " | null)"
+		}
 	} else {
 		var err error
 		underlying, err = e.EmitTypeExpr(a.Underlying)
@@ -328,6 +334,18 @@ func unwrapPointers(typ ir.TypeDescriptor) ir.TypeDescriptor {
 			return typ
 		}
 		typ = pointer.Element
+	}
+}
+
+func pointerDepth(typ ir.TypeDescriptor) int {
+	depth := 0
+	for {
+		ptr, ok := typ.(*ir.PtrDescriptor)
+		if !ok {
+			return depth
+		}
+		depth++
+		typ = ptr.Element
 	}
 }
 
@@ -475,11 +493,7 @@ func (e *Emitter) emitTypeExpr(typ ir.TypeDescriptor, includeSelfNullability boo
 	}
 	switch t := typ.(type) {
 	case *ir.PrimitiveDescriptor:
-		result := e.emitPrimitive(t)
-		if includeSelfNullability && t.PrimitiveKind == ir.PrimitiveBytes {
-			return "(" + result + " | null)", nil
-		}
-		return result, nil
+		return e.emitPrimitive(t), nil
 	case *ir.ArrayDescriptor:
 		return e.emitArray(t, includeSelfNullability)
 	case *ir.MapDescriptor:
@@ -587,9 +601,6 @@ func (e *Emitter) emitArray(a *ir.ArrayDescriptor, includeSelfNullability bool) 
 	} else {
 		result = elemType + "[]"
 	}
-	if includeSelfNullability && a.IsSlice() {
-		return "(" + result + " | null)", nil
-	}
 	return result, nil
 }
 
@@ -611,9 +622,6 @@ func (e *Emitter) emitMap(m *ir.MapDescriptor, includeSelfNullability bool) (str
 		result = fmt.Sprintf("Record<%s, %s>", keyType, valueType)
 	} else {
 		result = fmt.Sprintf("Record<string, %s>", valueType)
-	}
-	if includeSelfNullability {
-		return "(" + result + " | null)", nil
 	}
 	return result, nil
 }
@@ -696,28 +704,10 @@ func (e *Emitter) emitTypeParameters(params []ir.TypeParameterDescriptor) (strin
 
 // determineOptionalNullable determines if a field should be optional and/or nullable.
 // Implements the decision tree from §4.9. Optional and nullable are independent:
-// - Optional (`?:`) is true when omitempty/omitzero is set
-// - Nullable (`| null`) is true when the underlying type can be nil (pointer, slice, map)
+// Both properties are derived from encoding/json/v2's omission and nil rules.
 func (e *Emitter) determineOptionalNullable(field ir.FieldDescriptor) (optional, nullable bool, err error) {
-	// Optional is determined by the omitempty/omitzero tag
-	optional = field.Optional
-
-	// Nullable is determined by whether the type can hold nil
-	// Check for pointer, slice, or map (unwrapping pointers to get to the base)
-	fieldType := field.Type
-	if field.StringEncoded {
-		fieldType = e.resolveStringEncodedFieldType(fieldType)
-	}
-	switch t := fieldType.(type) {
-	case *ir.PtrDescriptor:
-		nullable = true
-	case *ir.ArrayDescriptor:
-		nullable = t.IsSlice()
-	case *ir.MapDescriptor:
-		nullable = true
-	case *ir.PrimitiveDescriptor:
-		nullable = t.PrimitiveKind == ir.PrimitiveBytes
-	}
+	optional = e.schema.FieldOptional(field)
+	nullable = e.schema.FieldNullableWhenPresent(field)
 
 	// Apply OptionalType override if configured
 	switch e.tsConfig.OptionalType {
@@ -735,32 +725,6 @@ func (e *Emitter) determineOptionalNullable(field ir.FieldDescriptor) (optional,
 	// default: use the independent optional/nullable values as computed
 
 	return optional, nullable, nil
-}
-
-func (e *Emitter) resolveStringEncodedFieldType(typ ir.TypeDescriptor) ir.TypeDescriptor {
-	seen := make(map[ir.GoIdentifier]bool)
-	for {
-		switch t := typ.(type) {
-		case *ir.ReferenceDescriptor:
-			if e.schema == nil || seen[t.Target] {
-				return typ
-			}
-			alias, ok := e.schema.FindType(t.Target).(*ir.AliasDescriptor)
-			if !ok {
-				return typ
-			}
-			seen[t.Target] = true
-			typ = alias.Underlying
-		case *ir.AliasDescriptor:
-			if seen[t.Name] {
-				return typ
-			}
-			seen[t.Name] = true
-			typ = t.Underlying
-		default:
-			return typ
-		}
-	}
 }
 
 // getPropertyName returns the property name for a field.

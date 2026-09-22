@@ -6,7 +6,8 @@ package tygortest
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -143,8 +144,8 @@ func AssertStatus(t *testing.T, w *httptest.ResponseRecorder, expectedStatus int
 
 // responseEnvelope is the expected response format with result/error discrimination.
 type responseEnvelope struct {
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *ErrorResponse  `json:"error,omitempty"`
+	Result jsontext.Value `json:"result,omitempty"`
+	Error  *ErrorResponse `json:"error,omitempty"`
 }
 
 // AssertJSONResponse decodes the response body and compares it with expected value.
@@ -174,8 +175,8 @@ func AssertJSONResponse(t *testing.T, w *httptest.ResponseRecorder, expected any
 	json.Unmarshal(expectedJSON, &expectedData)
 	json.Unmarshal(envelope.Result, &actualData)
 
-	expectedStr, _ := json.MarshalIndent(expectedData, "", "  ")
-	actualStr, _ := json.MarshalIndent(actualData, "", "  ")
+	expectedStr, _ := json.Marshal(expectedData, json.Deterministic(true), jsontext.WithIndent("  "))
+	actualStr, _ := json.Marshal(actualData, json.Deterministic(true), jsontext.WithIndent("  "))
 
 	if string(expectedStr) != string(actualStr) {
 		t.Errorf("response mismatch:\nExpected:\n%s\nActual:\n%s", expectedStr, actualStr)
@@ -222,7 +223,7 @@ func AssertHeader(t *testing.T, w *httptest.ResponseRecorder, key, expectedValue
 // DecodeJSON decodes the response body into the provided value.
 func DecodeJSON(t *testing.T, w *httptest.ResponseRecorder, v any) {
 	t.Helper()
-	if err := json.NewDecoder(w.Body).Decode(v); err != nil {
+	if err := json.Unmarshal(w.Body.Bytes(), v); err != nil {
 		t.Fatalf("failed to decode response: %v\nBody: %s", err, w.Body.String())
 	}
 }

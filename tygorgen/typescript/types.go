@@ -108,8 +108,8 @@ type TypeScriptConfig struct {
 
 	// OptionalType overrides the default §4.9 behavior for optional/nullable fields.
 	// ""/"default" - §4.9 spec behavior: optional (?:) and nullable (| null) are independent
-	//                omitempty/omitzero → optional (?:), pointers/slices/maps → nullable (| null)
-	//                Both can apply: *T,omitempty → field?: T | null
+	//                omission tags may produce ?:; pointer states may produce | null
+	//                v2 nil slices/maps encode as non-null empty collections
 	// "null"       - force all optional/nullable fields to use | null only (no ?:)
 	// "undefined"  - force all optional/nullable fields to use ?: only (no | null)
 	OptionalType string

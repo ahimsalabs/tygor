@@ -48,19 +48,20 @@ type FieldDescriptor struct {
 	// Falls back to Name if json tag is absent.
 	JSONName string
 
-	// Optional indicates the field can be absent from JSON output.
-	// This is true when json:",omitempty" or json:",omitzero" is set.
-	//
-	// For type generation, omitempty and omitzero have identical effects:
-	// both make a field optional (field?: T in TypeScript). The behavioral
-	// differences (omitempty omits empty collections while omitzero keeps them;
-	// omitzero omits zero structs while omitempty keeps them) are runtime
-	// concerns that don't affect the generated type signature.
-	Optional bool
+	// OmitEmpty indicates json:",omitempty" is set. Under encoding/json/v2,
+	// this omits values that encode as null, "", {}, or [].
+	OmitEmpty bool
 
-	// StringEncoded indicates encoding/json applies json:",string" to this field.
-	// The raw tag remains available in RawTags even when encoding/json ignores
-	// the option because the field type or pointer depth is ineligible.
+	// OmitZero indicates json:",omitzero" is set. This omits values for which
+	// IsZero reports true, or the Go zero value when no IsZero method exists.
+	OmitZero bool
+
+	// OmitIfEmbeddedNil indicates this promoted field is absent when an
+	// enclosing anonymous pointer field is nil.
+	OmitIfEmbeddedNil bool
+
+	// StringEncoded indicates encoding/json/v2 applies json:",string" to this
+	// field. Providers reject the tag when the field does not encode as a number.
 	StringEncoded bool
 
 	// Skip indicates json:"-" was set.

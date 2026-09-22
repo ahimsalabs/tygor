@@ -231,7 +231,7 @@ func TestTypeScriptGenerator_Generate_MapWithPrimitiveKey(t *testing.T) {
 	content := string(memSink.Get("types.ts"))
 
 	// Int keys should be mapped to string in JSON
-	want := "intMap: Record<string, string> | null;"
+	want := "intMap: Record<string, string>;"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}
