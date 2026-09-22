@@ -64,7 +64,7 @@ func TestStream_Metadata(t *testing.T) {
 		t.Fatal("expected non-nil handler")
 	}
 
-	meta := handler.Metadata()
+	meta := handler.metadata()
 	if meta.Primitive != "stream" {
 		t.Errorf("expected Primitive stream, got %s", meta.Primitive)
 	}
@@ -83,7 +83,7 @@ func TestStream_BasicEvents(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -126,7 +126,7 @@ func TestStream_ErrorMidStream(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -160,7 +160,7 @@ func TestStream_ValidationError(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	// Missing required "topic" field
 	body := `{}`
@@ -184,7 +184,7 @@ func TestStream_RejectsTrailingJSONBeforeStarting(t *testing.T) {
 	}
 
 	app := NewApp()
-	app.Service("Feed").Register("Subscribe", streamIter2(fn))
+	app.Service("Feed").register("Subscribe", streamIter2(fn))
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader("{\"topic\":\"news\"}{\"topic\":\"other\"}"))
 	w := httptest.NewRecorder()
 
@@ -212,9 +212,9 @@ func TestStream_UnaryInterceptor_Reject(t *testing.T) {
 		return nil, NewError(CodeUnauthenticated, "not logged in")
 	}
 
-	app := NewApp().WithUnaryInterceptor(authInterceptor)
+	app := NewApp(WithUnaryInterceptors(authInterceptor))
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -261,7 +261,7 @@ func TestStream_StreamInterceptor(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn).WithStreamInterceptor(transformInterceptor))
+	svc.register("Subscribe", streamIter2(fn, WithStreamInterceptors(transformInterceptor)))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -293,7 +293,7 @@ func TestStream_ClientDisconnect(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -335,7 +335,7 @@ func TestStream_MethodNotAllowed(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn))
+	svc.register("Subscribe", streamIter2(fn))
 
 	// Try GET instead of POST
 	req := httptest.NewRequest("GET", "/Feed/Subscribe?topic=news", nil)
@@ -357,7 +357,7 @@ func TestStream_WithSkipValidation(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn).WithSkipValidation())
+	svc.register("Subscribe", streamIter2(fn, WithoutValidation()))
 
 	// Missing required field, but validation is skipped
 	body := `{}`
@@ -418,7 +418,7 @@ func TestStreamEmit_BasicEvents(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -453,7 +453,7 @@ func TestStreamEmit_HandlerError(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -492,7 +492,7 @@ func TestStreamEmit_ErrStreamClosedNotSentToClient(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -531,7 +531,7 @@ func TestStreamEmit_ContextCancellation(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -582,7 +582,7 @@ func TestStreamEmit_SendChecksContext(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -635,10 +635,11 @@ func TestStreamEmit_WithOptions(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn).
-		WithUnaryInterceptor(authInterceptor).
-		WithWriteTimeout(10*time.Second).
-		WithSkipValidation())
+	svc.Stream("Subscribe", fn,
+		WithUnaryInterceptors(authInterceptor),
+		WithStreamWriteTimeout(10*time.Second),
+		WithoutValidation(),
+	)
 
 	// Missing required field, but validation is skipped
 	body := `{}`
@@ -663,7 +664,7 @@ func TestStreamEmit_LastEventID(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -695,7 +696,7 @@ func TestStreamEmit_SendWithID(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -754,7 +755,7 @@ func TestStreamEmit_WithMaxRequestBodySize(t *testing.T) {
 	app := NewApp()
 	svc := app.Service("Feed")
 	// Set a very small body size limit (10 bytes)
-	svc.Register("Subscribe", Stream(fn).WithMaxRequestBodySize(10))
+	svc.Stream("Subscribe", fn, WithMaxRequestBodySize(10))
 
 	// Send a body larger than the limit
 	body := `{"topic":"this is a very long topic that exceeds the limit"}`
@@ -790,7 +791,7 @@ func TestStreamEmit_WithHeartbeat(t *testing.T) {
 	app := NewApp()
 	svc := app.Service("Feed")
 	// Set heartbeat to 50ms for fast test
-	svc.Register("Subscribe", Stream(fn).WithHeartbeat(50*time.Millisecond))
+	svc.Stream("Subscribe", fn, WithStreamHeartbeat(50*time.Millisecond))
 
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
@@ -872,9 +873,7 @@ func TestStream_MultipleStreamInterceptors(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", streamIter2(fn).
-		WithStreamInterceptor(interceptorA).
-		WithStreamInterceptor(interceptorB))
+	svc.register("Subscribe", streamIter2(fn, WithStreamInterceptors(interceptorA, interceptorB)))
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -929,13 +928,13 @@ func TestIsClientDisconnect(t *testing.T) {
 func TestStreamPreservesWrappedDeadlineErrorForPolicy(t *testing.T) {
 	want := fmt.Errorf("query timed out: %w", context.DeadlineExceeded)
 	var got error
-	app := NewApp().WithStreamWriteTimeout(0).WithErrorTransformer(func(err error) *Error {
+	app := NewApp(WithStreamWriteTimeout(0), WithErrorTransformer(func(err error) *Error {
 		got = err
 		return DefaultErrorTransformer(err)
-	})
-	app.Service("Feed").Register("Subscribe", Stream(func(context.Context, StreamRequest, StreamWriter[StreamEvent]) error {
-		return want
 	}))
+	app.Service("Feed").Stream("Subscribe", func(context.Context, StreamRequest, StreamWriter[StreamEvent]) error {
+		return want
+	})
 	w := newStreamRecorder()
 	app.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`)))
 	if got != want {
@@ -965,7 +964,7 @@ func TestStreamEmit_SendWithID_EdgeCases(t *testing.T) {
 
 			app := NewApp()
 			svc := app.Service("Feed")
-			svc.Register("Subscribe", Stream(fn))
+			svc.Stream("Subscribe", fn)
 
 			body := `{"topic":"news"}`
 			req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -997,7 +996,7 @@ func TestStreamEmit_LastEventID_Missing(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -1032,7 +1031,7 @@ func TestStreamEmit_ErrorAfterEvents(t *testing.T) {
 
 	app := NewApp()
 	svc := app.Service("Feed")
-	svc.Register("Subscribe", Stream(fn))
+	svc.Stream("Subscribe", fn)
 
 	body := `{"topic":"news"}`
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(body))
@@ -1189,7 +1188,7 @@ func TestStreamSendWaitsForFlushAndReturnsFailure(t *testing.T) {
 		return err
 	}
 	app := NewApp()
-	app.Service("Feed").Register("Subscribe", Stream(fn))
+	app.Service("Feed").Stream("Subscribe", fn)
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 
 	go func() {
@@ -1254,8 +1253,8 @@ func TestStreamFailureWaitsForProducerAfterUnarySetup(t *testing.T) {
 		close(interceptorExited)
 		return result, err
 	}
-	app := NewApp().WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(fn))
+	app := NewApp(WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", fn)
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 
 	go func() {
@@ -1319,8 +1318,8 @@ func TestStreamHeartbeatFailureCancelsProducerAfterUnarySetup(t *testing.T) {
 		close(interceptorExited)
 		return result, err
 	}
-	app := NewApp().WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(fn).WithHeartbeat(time.Millisecond))
+	app := NewApp(WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", fn, WithStreamHeartbeat(time.Millisecond))
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 
 	go func() {
@@ -1371,8 +1370,8 @@ func TestStreamTransportPanicIsNotConvertedToStreamError(t *testing.T) {
 		defer close(producerDone)
 		return stream.Send(StreamEvent{ID: 1, Message: "event"})
 	}
-	app := NewApp().WithStreamWriteTimeout(time.Second)
-	app.Service("Feed").Register("Subscribe", Stream(fn))
+	app := NewApp(WithStreamWriteTimeout(time.Second))
+	app.Service("Feed").Stream("Subscribe", fn)
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 
 	recovered := func() (recovered any) {
@@ -1409,19 +1408,20 @@ func TestStreamUnaryErrorTransportPanicDoesNotRetryPolicy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var transformerCalls atomic.Int32
 			var producerStarts atomic.Int32
-			app := NewApp().WithStreamWriteTimeout(0).WithErrorTransformer(func(error) *Error {
+			options := []AppOption{WithStreamWriteTimeout(0), WithErrorTransformer(func(error) *Error {
 				transformerCalls.Add(1)
 				panic("private transformer panic")
-			})
+			})}
 			if tt.interceptor {
-				app.WithUnaryInterceptor(func(Context, any, HandlerFunc) (any, error) {
+				options = append(options, WithUnaryInterceptors(func(Context, any, HandlerFunc) (any, error) {
 					return nil, NewError(CodeUnavailable, "private interceptor rejection")
-				})
+				}))
 			}
-			app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, _ StreamWriter[int]) error {
+			app := NewApp(options...)
+			app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, _ StreamWriter[int]) error {
 				producerStarts.Add(1)
 				return nil
-			}))
+			})
 
 			baseWriter := &panicErrorResponseWriter{header: make(http.Header)}
 			var writer http.ResponseWriter = baseWriter
@@ -1454,10 +1454,10 @@ func TestStreamUnaryErrorTransportPanicDoesNotRetryPolicy(t *testing.T) {
 }
 
 func TestStreamProducerPanicFailedTerminalWriteAbortsTransport(t *testing.T) {
-	app := NewApp().WithStreamWriteTimeout(0)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, _ StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, _ StreamWriter[StreamEvent]) error {
 		panic("private producer panic")
-	}))
+	})
 	w := &failingCommittedWriter{header: make(http.Header)}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1481,10 +1481,10 @@ func TestStreamUnarySetupPanicDoesNotCommit(t *testing.T) {
 		_, _ = handler(ctx, req)
 		panic(panicValue)
 	}
-	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0), WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
 		return stream.Send(StreamEvent{ID: 1})
-	}))
+	})
 	w := newStreamRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1503,10 +1503,10 @@ func TestStreamUnarySetupPanicDoesNotCommit(t *testing.T) {
 }
 
 func TestStreamEventWriteFailureAbortsTransport(t *testing.T) {
-	app := NewApp().WithStreamWriteTimeout(0)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
 		return stream.Send(StreamEvent{ID: 1})
-	}))
+	})
 	w := &failingCommittedWriter{header: make(http.Header), partial: true}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1525,11 +1525,11 @@ func TestStreamEventWriteFailureAbortsTransport(t *testing.T) {
 }
 
 func TestStreamHeartbeatWriteFailureAbortsTransport(t *testing.T) {
-	app := NewApp().WithStreamWriteTimeout(0)
-	app.Service("Feed").Register("Subscribe", Stream(func(ctx context.Context, _ Empty, _ StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0))
+	app.Service("Feed").Stream("Subscribe", func(ctx context.Context, _ Empty, _ StreamWriter[StreamEvent]) error {
 		<-ctx.Done()
 		return ctx.Err()
-	}).WithHeartbeat(time.Millisecond))
+	}, WithStreamHeartbeat(time.Millisecond))
 	w := &failingCommittedWriter{header: make(http.Header), partial: true}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1552,10 +1552,10 @@ func TestStreamInterceptorCannotSuppressTransportFailure(t *testing.T) {
 		_, _ = handler(ctx, req)
 		return nil, nil
 	}
-	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0), WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
 		return stream.Send(StreamEvent{ID: 1})
-	}))
+	})
 	w := &failingCommittedWriter{header: make(http.Header), partial: true}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1575,10 +1575,10 @@ func TestStreamInterceptorCannotRecoverTransportPanic(t *testing.T) {
 		defer func() { _ = recover() }()
 		return handler(ctx, req)
 	}
-	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0), WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
 		return stream.Send(StreamEvent{ID: 1})
-	}))
+	})
 	panicValue := &struct{}{}
 	w := &panicOnceWriter{header: make(http.Header), panicValue: panicValue}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
@@ -1604,11 +1604,11 @@ func TestStreamUnaryRetryDoesNotReplayTransportFailure(t *testing.T) {
 		_, _ = handler(ctx, req)
 		return nil, nil
 	}
-	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0), WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
 		producerCalls++
 		return stream.Send(StreamEvent{ID: 1})
-	}))
+	})
 	w := &retryPoisonWriter{header: make(http.Header), writeErr: errors.New("partial transport write")}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1640,11 +1640,11 @@ func TestStreamUnaryRetryDoesNotReplayTransportPanic(t *testing.T) {
 		_, _ = handler(ctx, req)
 		return nil, nil
 	}
-	app := NewApp().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0), WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
 		producerCalls++
 		return stream.Send(StreamEvent{ID: 1})
-	}))
+	})
 	w := &retryPoisonWriter{header: make(http.Header), panicValue: panicValue}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1670,10 +1670,10 @@ func TestStreamInterceptorCannotSuppressMarshalPanic(t *testing.T) {
 		defer func() { _ = recover() }()
 		return handler(ctx, req)
 	}
-	app := NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[panicJSONEvent]) error {
+	app := NewApp(WithMaskInternalErrors(), WithStreamWriteTimeout(0), WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[panicJSONEvent]) error {
 		return stream.Send(panicJSONEvent{})
-	}))
+	})
 	w := newStreamRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1690,13 +1690,13 @@ func TestStreamInterceptorCannotSuppressProducerPanic(t *testing.T) {
 		_, _ = handler(ctx, req)
 		return nil, nil
 	}
-	app := NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithMaskInternalErrors(), WithStreamWriteTimeout(0), WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[StreamEvent]) error {
 		if err := stream.Send(StreamEvent{ID: 1, Message: "before panic"}); err != nil {
 			return err
 		}
 		panic("private producer panic")
-	}))
+	})
 	w := newStreamRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", nil)
 
@@ -1728,7 +1728,7 @@ func TestStreamSendAllowsInterceptorToFilterEvent(t *testing.T) {
 	}
 
 	app := NewApp()
-	app.Service("Feed").Register("Subscribe", Stream(fn).WithStreamInterceptor(filter))
+	app.Service("Feed").Stream("Subscribe", fn, WithStreamInterceptors(filter))
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 	w := newStreamRecorder()
 	app.Handler().ServeHTTP(w, req)
@@ -1781,8 +1781,8 @@ func TestStreamUnaryInterceptorsAreSetupOnly(t *testing.T) {
 		return stream.Send(StreamEvent{ID: 1})
 	}
 
-	app := NewApp().WithUnaryInterceptor(outer).WithUnaryInterceptor(inner)
-	app.Service("Feed").Register("Subscribe", Stream(fn))
+	app := NewApp(WithUnaryInterceptors(outer), WithUnaryInterceptors(inner))
+	app.Service("Feed").Stream("Subscribe", fn)
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"original"}`))
 	w := newStreamRecorder()
 	app.Handler().ServeHTTP(w, req)
@@ -1808,8 +1808,8 @@ func TestStreamUnaryInterceptorDeadlineDoesNotGovernStreamLifetime(t *testing.T)
 		return ctx.Err()
 	}
 
-	app := NewApp().WithUnaryInterceptor(interceptor)
-	app.Service("Feed").Register("Subscribe", Stream(fn))
+	app := NewApp(WithUnaryInterceptors(interceptor))
+	app.Service("Feed").Stream("Subscribe", fn)
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`)).WithContext(requestCtx)
 	w := newStreamRecorder()
@@ -1857,7 +1857,7 @@ func TestStreamInterceptorContextAndRequestReachSource(t *testing.T) {
 	}
 
 	app := NewApp()
-	app.Service("Feed").Register("Subscribe", Stream(fn).WithStreamInterceptor(interceptor))
+	app.Service("Feed").Stream("Subscribe", fn, WithStreamInterceptors(interceptor))
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"original"}`))
 	w := newStreamRecorder()
 	app.Handler().ServeHTTP(w, req)
@@ -1873,13 +1873,13 @@ func TestStreamErrorUsesConfiguredPolicyWithoutMutatingSource(t *testing.T) {
 		fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
 			return applicationErr
 		}
-		app := NewApp().WithErrorTransformer(func(err error) *Error {
+		app := NewApp(WithErrorTransformer(func(err error) *Error {
 			if errors.Is(err, applicationErr) {
 				return NewError(CodeUnavailable, "safe transformed failure")
 			}
 			return nil
-		})
-		app.Service("Feed").Register("Subscribe", Stream(fn))
+		}))
+		app.Service("Feed").Stream("Subscribe", fn)
 		req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 		w := newStreamRecorder()
 		app.Handler().ServeHTTP(w, req)
@@ -1898,8 +1898,8 @@ func TestStreamErrorUsesConfiguredPolicyWithoutMutatingSource(t *testing.T) {
 		fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
 			return shared
 		}
-		app := NewApp().WithMaskInternalErrors()
-		app.Service("Feed").Register("Subscribe", Stream(fn))
+		app := NewApp(WithMaskInternalErrors())
+		app.Service("Feed").Stream("Subscribe", fn)
 		req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 		w := newStreamRecorder()
 		app.Handler().ServeHTTP(w, req)
@@ -1942,13 +1942,13 @@ func TestStreamErrorPolicyPanicFallsBackOverSSE(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var calls atomic.Int32
-			app := NewApp().WithErrorTransformer(tt.transformer(&calls))
-			app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ StreamRequest, stream StreamWriter[StreamEvent]) error {
+			app := NewApp(WithErrorTransformer(tt.transformer(&calls)))
+			app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ StreamRequest, stream StreamWriter[StreamEvent]) error {
 				if err := stream.Send(StreamEvent{ID: 1, Message: "before error"}); err != nil {
 					return err
 				}
 				return errors.New("private terminal error")
-			}))
+			})
 			server := httptest.NewServer(app.Handler())
 			t.Cleanup(server.Close)
 
@@ -1979,14 +1979,14 @@ func TestStreamCallbackPanicUsesConfiguredErrorPolicy(t *testing.T) {
 	fn := func(ctx context.Context, req StreamRequest, stream StreamWriter[StreamEvent]) error {
 		panic("private stream panic")
 	}
-	app := NewApp().WithErrorTransformer(func(err error) *Error {
+	app := NewApp(WithErrorTransformer(func(err error) *Error {
 		var svcErr *Error
 		if errors.As(err, &svcErr) && svcErr.Code == CodeInternal {
 			return NewError(CodeUnavailable, "safe panic response")
 		}
 		return nil
-	})
-	app.Service("Feed").Register("Subscribe", Stream(fn))
+	}))
+	app.Service("Feed").Stream("Subscribe", fn)
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 	w := newStreamRecorder()
 	app.Handler().ServeHTTP(w, req)
@@ -2001,16 +2001,16 @@ func TestStreamCallbackPanicUsesConfiguredErrorPolicy(t *testing.T) {
 }
 
 func TestStreamMarshalPanicAfterCommitUsesSSEErrorPolicy(t *testing.T) {
-	app := NewApp().WithMaskInternalErrors().WithStreamWriteTimeout(0).WithErrorTransformer(func(err error) *Error {
+	app := NewApp(WithMaskInternalErrors(), WithStreamWriteTimeout(0), WithErrorTransformer(func(err error) *Error {
 		var svcErr *Error
 		if errors.As(err, &svcErr) && svcErr.Code == CodeInternal {
 			return NewError(CodeUnavailable, "safe marshaler panic")
 		}
 		return nil
-	})
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ StreamRequest, stream StreamWriter[panicJSONEvent]) error {
-		return stream.Send(panicJSONEvent{})
 	}))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ StreamRequest, stream StreamWriter[panicJSONEvent]) error {
+		return stream.Send(panicJSONEvent{})
+	})
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 	w := newStreamRecorder()
 
@@ -2029,10 +2029,10 @@ func TestStreamMarshalPanicAfterCommitUsesSSEErrorPolicy(t *testing.T) {
 }
 
 func TestStreamSendWithEmptyIDEmitsResetField(t *testing.T) {
-	app := NewApp().WithStreamWriteTimeout(0)
-	app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ StreamRequest, stream StreamWriter[StreamEvent]) error {
+	app := NewApp(WithStreamWriteTimeout(0))
+	app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ StreamRequest, stream StreamWriter[StreamEvent]) error {
 		return stream.SendWithID("", StreamEvent{ID: 1})
-	}))
+	})
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 	w := newStreamRecorder()
 
@@ -2075,7 +2075,7 @@ func TestStreamAcceptsRecorderWithoutDeadlineSupport(t *testing.T) {
 		return nil
 	}
 	app := NewApp()
-	app.Service("Feed").Register("Subscribe", Stream(fn))
+	app.Service("Feed").Stream("Subscribe", fn)
 	req := httptest.NewRequest("POST", "/Feed/Subscribe", strings.NewReader(`{"topic":"news"}`))
 	w := httptest.NewRecorder()
 	app.Handler().ServeHTTP(w, req)

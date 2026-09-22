@@ -198,92 +198,37 @@ func (s *streamSender[T]) LastEventID() string {
 	return s.lastEventID
 }
 
-// StreamHandler implements Endpoint for SSE streaming responses.
-//
-// Stream handlers send events to the client with a StreamWriter. The connection
-// stays open until the handler returns, an error occurs, or the client disconnects.
-//
-// Example:
-//
-//	func SubscribeToFeed(ctx context.Context, req *SubscribeRequest, stream tygor.StreamWriter[*FeedEvent]) error {
-//	    ticker := time.NewTicker(time.Second)
-//	    defer ticker.Stop()
-//	    for {
-//	        select {
-//	        case <-ctx.Done():
-//	            return ctx.Err()
-//	        case <-ticker.C:
-//	            if err := stream.Send(&FeedEvent{Time: time.Now()}); err != nil {
-//	                return err
-//	            }
-//	        }
-//	    }
-//	}
-//
-//	feed.Register("Subscribe", tygor.Stream(SubscribeToFeed))
-type StreamHandler[Req any, Res any] struct {
+type streamHandler[Req any, Res any] struct {
 	fn                 func(context.Context, Req) iter.Seq2[Res, error]
 	fnAny              func(context.Context, Req) iter.Seq2[any, error] // for StreamEmit with event IDs
 	unaryInterceptors  []UnaryInterceptor
 	streamInterceptors []StreamInterceptor
 	skipValidation     bool
 	maxRequestBodySize *uint64
-	writeTimeout       time.Duration
-	writeTimeoutIsSet  bool
-	heartbeatInterval  time.Duration
+	writeTimeout       *time.Duration
+	heartbeatInterval  *time.Duration
 }
 
 // streamIter2 creates a new SSE streaming handler from an iterator function.
 // This is an internal API preserved for potential future use with iterator composition.
-// For public use, prefer [Stream] which provides a simpler callback-based API.
-func streamIter2[Req any, Res any](fn func(context.Context, Req) iter.Seq2[Res, error]) *StreamHandler[Req, Res] {
-	return &StreamHandler[Req, Res]{
-		fn: fn,
+// The public [Service.Stream] method provides a simpler callback-based API.
+func streamIter2[Req any, Res any](fn func(context.Context, Req) iter.Seq2[Res, error], options ...StreamOption) *streamHandler[Req, Res] {
+	config := streamConfig{}
+	for _, option := range options {
+		option.applyStream(&config)
+	}
+	return &streamHandler[Req, Res]{
+		fn:                 fn,
+		unaryInterceptors:  config.unaryInterceptors,
+		streamInterceptors: config.streamInterceptors,
+		skipValidation:     config.skipValidation,
+		maxRequestBodySize: config.maxRequestBodySize,
+		writeTimeout:       config.writeTimeout,
+		heartbeatInterval:  config.heartbeatInterval,
 	}
 }
 
-// Stream creates a new SSE streaming handler from a callback function.
-//
-// The handler receives a [StreamWriter] to send events to the client.
-// StreamWriter.Send returns an error when the stream should stop:
-//   - Client disconnects
-//   - Context is canceled or times out
-//   - A synchronously forwarded event fails serialization, writing, or flushing
-//
-// All disconnect-related errors satisfy errors.Is(err, [ErrStreamClosed]).
-// For finer distinction, you can also check errors.Is(err, context.Canceled)
-// or errors.Is(err, context.DeadlineExceeded).
-//
-// Handlers should return when Send returns an error. Any error returned
-// by the handler (except [ErrStreamClosed]) is sent to the client as a final error event.
-//
-// Example:
-//
-//	func Subscribe(ctx context.Context, req *SubscribeRequest, stream tygor.StreamWriter[*FeedEvent]) error {
-//	    // Check for reconnection
-//	    if lastID := stream.LastEventID(); lastID != "" {
-//	        // Resume from lastID
-//	    }
-//
-//	    sub := broker.Subscribe(req.Topic)
-//	    defer sub.Close()
-//
-//	    for {
-//	        select {
-//	        case <-ctx.Done():
-//	            return nil
-//	        case event := <-sub.Events():
-//	            if err := stream.Send(event); err != nil {
-//	                return err
-//	            }
-//	            // Or with event ID for reconnection support:
-//	            // if err := stream.SendWithID(event.ID, event); err != nil { ... }
-//	        }
-//	    }
-//	}
-//
-//	feed.Register("Subscribe", tygor.Stream(Subscribe))
-func Stream[Req any, Res any](fn func(context.Context, Req, StreamWriter[Res]) error) *StreamHandler[Req, Res] {
+func makeStreamHandler[Req any, Res any](fn func(context.Context, Req, StreamWriter[Res]) error, config streamConfig) *streamHandler[Req, Res] {
 	// Use fnAny to allow yielding sseEvent wrappers with event IDs
 	iterFn := func(ctx context.Context, req Req) iter.Seq2[any, error] {
 		return func(yield func(any, error) bool) {
@@ -302,65 +247,19 @@ func Stream[Req any, Res any](fn func(context.Context, Req, StreamWriter[Res]) e
 			}
 		}
 	}
-	return &StreamHandler[Req, Res]{
-		fnAny: iterFn,
+	return &streamHandler[Req, Res]{
+		fnAny:              iterFn,
+		unaryInterceptors:  config.unaryInterceptors,
+		streamInterceptors: config.streamInterceptors,
+		skipValidation:     config.skipValidation,
+		maxRequestBodySize: config.maxRequestBodySize,
+		writeTimeout:       config.writeTimeout,
+		heartbeatInterval:  config.heartbeatInterval,
 	}
 }
 
-// WithUnaryInterceptor adds an interceptor for stream setup. Interceptors may
-// inspect or reject the request, but their context deadlines and retry behavior
-// do not govern or replay the committed stream. Use
-// [StreamHandler.WithStreamInterceptor] to observe the stream lifetime.
-func (h *StreamHandler[Req, Res]) WithUnaryInterceptor(i UnaryInterceptor) *StreamHandler[Req, Res] {
-	h.unaryInterceptors = append(h.unaryInterceptors, i)
-	return h
-}
-
-// WithStreamInterceptor adds an interceptor that wraps the event stream.
-// Stream interceptors can transform, filter, or observe events.
-func (h *StreamHandler[Req, Res]) WithStreamInterceptor(i StreamInterceptor) *StreamHandler[Req, Res] {
-	h.streamInterceptors = append(h.streamInterceptors, i)
-	return h
-}
-
-// WithSkipValidation disables request validation for this handler.
-func (h *StreamHandler[Req, Res]) WithSkipValidation() *StreamHandler[Req, Res] {
-	h.skipValidation = true
-	return h
-}
-
-// WithMaxRequestBodySize sets the maximum request body size for this handler.
-func (h *StreamHandler[Req, Res]) WithMaxRequestBodySize(size uint64) *StreamHandler[Req, Res] {
-	h.maxRequestBodySize = &size
-	return h
-}
-
-// WithWriteTimeout sets the timeout for writing each event to the client.
-// If a write takes longer than this duration, the stream is closed and
-// an affected [StreamWriter.Send] returns [ErrWriteTimeout].
-//
-// A zero duration explicitly disables the timeout. Without this option, the
-// app-level timeout applies (30 seconds by default).
-func (h *StreamHandler[Req, Res]) WithWriteTimeout(d time.Duration) *StreamHandler[Req, Res] {
-	h.writeTimeout = d
-	h.writeTimeoutIsSet = true
-	return h
-}
-
-// WithHeartbeat sets the interval for sending SSE heartbeat comments.
-// This keeps connections alive through proxies with idle timeouts.
-//
-// Heartbeats are sent as SSE comments (": heartbeat\n\n") which are ignored
-// by the EventSource API but reset idle timers on proxies.
-//
-// Default is 30 seconds. Use 0 to disable heartbeats.
-func (h *StreamHandler[Req, Res]) WithHeartbeat(d time.Duration) *StreamHandler[Req, Res] {
-	h.heartbeatInterval = d
-	return h
-}
-
-// Metadata implements [Endpoint].
-func (h *StreamHandler[Req, Res]) Metadata() *internal.MethodMetadata {
+// metadata returns the runtime metadata for the stream handler.
+func (h *streamHandler[Req, Res]) metadata() *internal.MethodMetadata {
 	var req Req
 	var res Res
 	return &internal.MethodMetadata{
@@ -370,13 +269,8 @@ func (h *StreamHandler[Req, Res]) Metadata() *internal.MethodMetadata {
 	}
 }
 
-// metadata returns the runtime metadata for the stream handler.
-func (h *StreamHandler[Req, Res]) metadata() *internal.MethodMetadata {
-	return h.Metadata()
-}
-
 // serveHTTP implements the SSE streaming handler.
-func (h *StreamHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
+func (h *streamHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 	state := &streamResponseState{}
 	defer h.recoverStreamPanic(ctx, state)
 
@@ -452,7 +346,7 @@ func (s *streamResponseState) writeFrame(ctx *rpcContext, timeout time.Duration,
 	return err
 }
 
-func (h *StreamHandler[Req, Res]) recoverStreamPanic(ctx *rpcContext, state *streamResponseState) {
+func (h *streamHandler[Req, Res]) recoverStreamPanic(ctx *rpcContext, state *streamResponseState) {
 	rec := recover()
 	if rec == nil {
 		return
@@ -475,12 +369,12 @@ func (h *StreamHandler[Req, Res]) recoverStreamPanic(ctx *rpcContext, state *str
 	}
 }
 
-func (h *StreamHandler[Req, Res]) writeUnaryError(ctx *rpcContext, state *streamResponseState, err error) {
+func (h *streamHandler[Req, Res]) writeUnaryError(ctx *rpcContext, state *streamResponseState, err error) {
 	state.terminalAttempt = true
 	handleError(ctx, err)
 }
 
-func (h *StreamHandler[Req, Res]) writeTerminalSSEError(ctx *rpcContext, state *streamResponseState, err error) error {
+func (h *streamHandler[Req, Res]) writeTerminalSSEError(ctx *rpcContext, state *streamResponseState, err error) error {
 	state.terminalAttempt = true
 	frame := marshalSSEErrorFrame(ctx, err)
 	return state.writeFrame(ctx, h.effectiveWriteTimeout(ctx), frame)
@@ -491,7 +385,7 @@ type streamTransportError struct{ err error }
 func (e *streamTransportError) Error() string { return e.err.Error() }
 func (e *streamTransportError) Unwrap() error { return e.err }
 
-func (h *StreamHandler[Req, Res]) executeStream(ctx *rpcContext, req Req, state *streamResponseState) error {
+func (h *streamHandler[Req, Res]) executeStream(ctx *rpcContext, req Req, state *streamResponseState) error {
 	allInterceptors := make([]UnaryInterceptor, 0, len(ctx.interceptors)+len(h.unaryInterceptors))
 	allInterceptors = append(allInterceptors, ctx.interceptors...)
 	allInterceptors = append(allInterceptors, h.unaryInterceptors...)
@@ -504,7 +398,7 @@ func (h *StreamHandler[Req, Res]) executeStream(ctx *rpcContext, req Req, state 
 	return h.runStream(ctx, ctx.request.Context(), req, state)
 }
 
-func (h *StreamHandler[Req, Res]) decodeRequest(ctx *rpcContext) (Req, error) {
+func (h *streamHandler[Req, Res]) decodeRequest(ctx *rpcContext) (Req, error) {
 	var req Req
 	if ctx.request.Body != nil {
 		effectiveLimit := ctx.maxRequestBodySize
@@ -527,21 +421,21 @@ func (h *StreamHandler[Req, Res]) decodeRequest(ctx *rpcContext) (Req, error) {
 	return req, nil
 }
 
-func (h *StreamHandler[Req, Res]) effectiveWriteTimeout(ctx *rpcContext) time.Duration {
-	if h.writeTimeoutIsSet {
-		return h.writeTimeout
+func (h *streamHandler[Req, Res]) effectiveWriteTimeout(ctx *rpcContext) time.Duration {
+	if h.writeTimeout != nil {
+		return *h.writeTimeout
 	}
 	return ctx.streamWriteTimeout
 }
 
-func (h *StreamHandler[Req, Res]) effectiveHeartbeat(ctx *rpcContext) time.Duration {
-	if h.heartbeatInterval > 0 {
-		return h.heartbeatInterval
+func (h *streamHandler[Req, Res]) effectiveHeartbeat(ctx *rpcContext) time.Duration {
+	if h.heartbeatInterval != nil {
+		return *h.heartbeatInterval
 	}
 	return ctx.streamHeartbeat
 }
 
-func (h *StreamHandler[Req, Res]) runStream(ctx *rpcContext, executionCtx context.Context, req Req, state *streamResponseState) error {
+func (h *streamHandler[Req, Res]) runStream(ctx *rpcContext, executionCtx context.Context, req Req, state *streamResponseState) error {
 	session := newStreamSession(executionCtx)
 	defer session.cancel(ErrStreamClosed)
 
@@ -606,7 +500,7 @@ func (h *StreamHandler[Req, Res]) runStream(ctx *rpcContext, executionCtx contex
 	return err
 }
 
-func (h *StreamHandler[Req, Res]) streamEvents(ctx *rpcContext, executionCtx context.Context, session *streamSession, state *streamResponseState, events iter.Seq2[any, error], writeTimeout time.Duration) error {
+func (h *streamHandler[Req, Res]) streamEvents(ctx *rpcContext, executionCtx context.Context, session *streamSession, state *streamResponseState, events iter.Seq2[any, error], writeTimeout time.Duration) error {
 	type eventItem struct {
 		event any
 		ack   chan error
@@ -784,7 +678,7 @@ func marshalSSEErrorFrame(ctx *rpcContext, err error) []byte {
 	return frame
 }
 
-func (h *StreamHandler[Req, Res]) logStreamFailure(ctx *rpcContext, message string, err error) {
+func (h *streamHandler[Req, Res]) logStreamFailure(ctx *rpcContext, message string, err error) {
 	logger := ctx.logger
 	if logger == nil {
 		logger = slog.Default()

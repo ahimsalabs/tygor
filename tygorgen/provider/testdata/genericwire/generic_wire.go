@@ -22,6 +22,14 @@ type UnconstrainedCustomMarshalerPayload struct {
 	Box UnconstrainedWireBox[testdata.AliasJSONValue] `json:"box"`
 }
 
+type PhantomPointer[T any] *int
+
+type GenericStringEncodingDepths struct {
+	Applied PhantomPointer[string]  `json:"applied,string"`
+	Double  *PhantomPointer[string] `json:"double,string"`
+	Plain   PhantomPointer[string]  `json:"plain"`
+}
+
 type ExactCustomMarshalerBox[T testdata.AliasJSONValue] struct {
 	Value T `json:"value"`
 }

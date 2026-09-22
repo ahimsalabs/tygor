@@ -560,8 +560,8 @@ func (b *reflectionSchemaBuilder) typeToDescriptor(ctx context.Context, t reflec
 	if desc := b.checkSpecialType(t); desc != nil {
 		return desc, nil
 	}
-	// A defined pointer has a name and does not receive encoding/json's one
-	// unnamed-pointer dereference for json:",string".
+	// Preserve defined pointers as references so aliases and nullability remain
+	// available when classifying encoding/json's json:",string" behavior.
 	if t.Kind() == reflect.Ptr && t.Name() != "" && t.PkgPath() != "" {
 		if err := b.extractType(ctx, t); err != nil {
 			return nil, err

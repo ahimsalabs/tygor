@@ -850,6 +850,39 @@ func TestEmitter_StringEncodedNamedBoolUsesWireStrings(t *testing.T) {
 	}
 }
 
+func TestEmitter_StringEncodedDefinedPointerPreservesNullability(t *testing.T) {
+	pkg := "example.com/model"
+	pointerID := ir.GoIdentifier{Name: "DefinedPointer", Package: pkg}
+	model := &ir.StructDescriptor{
+		Name: ir.GoIdentifier{Name: "Model", Package: pkg},
+		Fields: []ir.FieldDescriptor{{
+			Name: "Value", JSONName: "value", Type: ir.RefWithArgs(pointerID.Name, pointerID.Package, ir.String()), StringEncoded: true,
+		}},
+	}
+	emitter := &Emitter{
+		schema: &ir.Schema{
+			Package: ir.PackageInfo{Path: pkg, Name: "model"},
+			Types: []ir.TypeDescriptor{
+				&ir.AliasDescriptor{
+					Name:           pointerID,
+					TypeParameters: []ir.TypeParameterDescriptor{{ParamName: "T"}},
+					Underlying:     ir.Ptr(ir.Int(64)),
+				},
+				model,
+			},
+		},
+		tsConfig:  TypeScriptConfig{EmitExport: true},
+		indentStr: "  ",
+	}
+	var buf bytes.Buffer
+	if _, err := emitter.EmitType(&buf, model); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `value: string | null;`) {
+		t.Fatalf("string-encoded applied defined pointer lost nullability:\n%s", buf.String())
+	}
+}
+
 // TestEmitter_TypeMappings tests custom type mappings
 func TestEmitter_TypeMappings(t *testing.T) {
 	schema := &ir.Schema{

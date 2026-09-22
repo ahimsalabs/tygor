@@ -27,13 +27,19 @@ func (w *deadlineOnlySSEWriter) SetWriteDeadline(deadline time.Time) error {
 	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
 }
 
-type rejectingDeadlineSSEWriter struct{ http.ResponseWriter }
+type rejectingDeadlineSSEWriter struct {
+	http.ResponseWriter
+	deadlineCalls *atomic.Int32
+}
 
 func (w *rejectingDeadlineSSEWriter) FlushError() error {
 	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func (w *rejectingDeadlineSSEWriter) SetWriteDeadline(time.Time) error {
+	if w.deadlineCalls != nil {
+		w.deadlineCalls.Add(1)
+	}
 	return http.ErrNotSupported
 }
 
@@ -348,24 +354,21 @@ func TestSSEDeadlinePanicRemainsTransportOwned(t *testing.T) {
 				panicValue := &struct{}{}
 				var transformerCalls atomic.Int32
 				var producerStarts atomic.Int32
-				app := NewApp().
-					WithStreamWriteTimeout(time.Second).
-					WithStreamHeartbeat(0).
-					WithErrorTransformer(func(error) *Error {
-						transformerCalls.Add(1)
-						return NewError(CodeInternal, "transformed")
-					})
+				app := NewApp(WithStreamWriteTimeout(time.Second), WithStreamHeartbeat(0), WithErrorTransformer(func(error) *Error {
+					transformerCalls.Add(1)
+					return NewError(CodeInternal, "transformed")
+				}))
 
 				var liveValue *LiveValue[int]
 				path := "/Feed/Subscribe"
 				if endpoint == "stream" {
-					app.Service("Feed").Register("Subscribe", Stream(func(context.Context, Empty, StreamWriter[int]) error {
+					app.Service("Feed").Stream("Subscribe", func(context.Context, Empty, StreamWriter[int]) error {
 						producerStarts.Add(1)
 						return nil
-					}))
+					})
 				} else {
 					liveValue = mustNewLiveValue(t, 1)
-					app.Service("State").Register("Get", liveValue.Handler())
+					app.Service("State").LiveValue("Get", liveValue)
 					path = "/State/Get"
 				}
 
@@ -413,17 +416,17 @@ func TestSSEReturnedFirstFrameDeadlineErrorUsesUnarySetupError(t *testing.T) {
 	for _, endpoint := range []string{"stream", "livevalue"} {
 		t.Run(endpoint, func(t *testing.T) {
 			var producerStarts atomic.Int32
-			app := NewApp().WithStreamWriteTimeout(time.Second).WithStreamHeartbeat(0)
+			app := NewApp(WithStreamWriteTimeout(time.Second), WithStreamHeartbeat(0))
 			var liveValue *LiveValue[int]
 			path := "/Feed/Subscribe"
 			if endpoint == "stream" {
-				app.Service("Feed").Register("Subscribe", Stream(func(context.Context, Empty, StreamWriter[int]) error {
+				app.Service("Feed").Stream("Subscribe", func(context.Context, Empty, StreamWriter[int]) error {
 					producerStarts.Add(1)
 					return nil
-				}))
+				})
 			} else {
 				liveValue = mustNewLiveValue(t, 1)
-				app.Service("State").Register("Get", liveValue.Handler())
+				app.Service("State").LiveValue("Get", liveValue)
 				path = "/State/Get"
 			}
 
@@ -465,20 +468,20 @@ func TestSSEUnwrapPanicRemainsTransportOwned(t *testing.T) {
 			panicValue := &struct{}{}
 			var transformerCalls atomic.Int32
 			var producerStarts atomic.Int32
-			app := NewApp().WithErrorTransformer(func(error) *Error {
+			app := NewApp(WithErrorTransformer(func(error) *Error {
 				transformerCalls.Add(1)
 				return NewError(CodeInternal, "transformed")
-			})
+			}))
 			var liveValue *LiveValue[int]
 			path := "/Feed/Subscribe"
 			if endpoint == "stream" {
-				app.Service("Feed").Register("Subscribe", Stream(func(context.Context, Empty, StreamWriter[int]) error {
+				app.Service("Feed").Stream("Subscribe", func(context.Context, Empty, StreamWriter[int]) error {
 					producerStarts.Add(1)
 					return nil
-				}))
+				})
 			} else {
 				liveValue = mustNewLiveValue(t, 1)
-				app.Service("State").Register("Get", liveValue.Handler())
+				app.Service("State").LiveValue("Get", liveValue)
 				path = "/State/Get"
 			}
 			writer := &panicUnwrapSSEWriter{
@@ -513,18 +516,17 @@ func TestStreamUnaryRetryDoesNotReplayHeaderPanic(t *testing.T) {
 	panicValue := &struct{}{}
 	var setupCalls atomic.Int32
 	var producerStarts atomic.Int32
-	app := NewApp().WithStreamWriteTimeout(time.Second).WithStreamHeartbeat(0)
-	app.WithUnaryInterceptor(func(ctx Context, req any, next HandlerFunc) (any, error) {
+	app := NewApp(WithStreamWriteTimeout(time.Second), WithStreamHeartbeat(0), WithUnaryInterceptors(func(ctx Context, req any, next HandlerFunc) (any, error) {
 		setupCalls.Add(1)
 		_, _ = next(ctx, req)
 		setupCalls.Add(1)
 		_, _ = next(ctx, req)
 		return nil, nil
-	})
-	app.Service("Feed").Register("Subscribe", Stream(func(context.Context, Empty, StreamWriter[int]) error {
+	}))
+	app.Service("Feed").Stream("Subscribe", func(context.Context, Empty, StreamWriter[int]) error {
 		producerStarts.Add(1)
 		return nil
-	}))
+	})
 	writer := &headerPanicSSEWriter{header: make(http.Header), panicValue: panicValue}
 	req := httptest.NewRequest(http.MethodPost, "/Feed/Subscribe", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -568,24 +570,23 @@ func TestSSECapabilityPreflightThroughAppHandler(t *testing.T) {
 	for _, wrapper := range wrappers {
 		for _, endpoint := range []string{"stream", "livevalue"} {
 			t.Run(endpoint+"/"+wrapper.name, func(t *testing.T) {
-				app := NewApp().WithStreamWriteTimeout(wrapper.timeout).WithStreamHeartbeat(0)
-				app.WithMiddleware(func(next http.Handler) http.Handler {
+				app := NewApp(WithStreamWriteTimeout(wrapper.timeout), WithStreamHeartbeat(0), WithHTTPMiddleware(func(next http.Handler) http.Handler {
 					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						next.ServeHTTP(wrapper.wrap(w), r)
 					})
-				})
+				}))
 
 				var producerStarts atomic.Int32
 				var liveValue *LiveValue[int]
 				path := "/Feed/Subscribe"
 				if endpoint == "stream" {
-					app.Service("Feed").Register("Subscribe", Stream(func(_ context.Context, _ Empty, stream StreamWriter[int]) error {
+					app.Service("Feed").Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[int]) error {
 						producerStarts.Add(1)
 						return stream.Send(1)
-					}))
+					})
 				} else {
 					liveValue = mustNewLiveValue(t, 1)
-					app.Service("State").Register("Get", liveValue.Handler())
+					app.Service("State").LiveValue("Get", liveValue)
 					path = "/State/Get"
 				}
 
@@ -615,52 +616,73 @@ func TestSSECapabilityPreflightThroughAppHandler(t *testing.T) {
 
 func TestSSECapabilityPreflightAcceptsSupportedWriters(t *testing.T) {
 	wrappers := []struct {
-		name               string
-		timeout            time.Duration
-		handlerTimeoutZero bool
-		wrap               func(http.ResponseWriter) http.ResponseWriter
+		name                string
+		appTimeout          time.Duration
+		serviceTimeoutZero  bool
+		endpointTimeoutZero bool
+		wrap                func(http.ResponseWriter) http.ResponseWriter
 	}{
 		{
-			name:    "unwrap chain",
-			timeout: time.Second,
-			wrap:    func(w http.ResponseWriter) http.ResponseWriter { return &unwrapSSEWriter{ResponseWriter: w} },
+			name:       "unwrap chain",
+			appTimeout: time.Second,
+			wrap:       func(w http.ResponseWriter) http.ResponseWriter { return &unwrapSSEWriter{ResponseWriter: w} },
 		},
 		{
-			name:    "flush only without deadline support",
-			timeout: time.Second,
-			wrap:    func(w http.ResponseWriter) http.ResponseWriter { return &flushOnlySSEWriter{ResponseWriter: w} },
+			name:       "flush only without deadline support",
+			appTimeout: time.Second,
+			wrap:       func(w http.ResponseWriter) http.ResponseWriter { return &flushOnlySSEWriter{ResponseWriter: w} },
+		},
+		{
+			name:       "flush only with app timeout disabled",
+			appTimeout: 0,
+			wrap:       func(w http.ResponseWriter) http.ResponseWriter { return &flushOnlySSEWriter{ResponseWriter: w} },
+		},
+		{
+			name:               "flush only with service timeout disabled",
+			appTimeout:         time.Second,
+			serviceTimeoutZero: true,
+			wrap:               func(w http.ResponseWriter) http.ResponseWriter { return &flushOnlySSEWriter{ResponseWriter: w} },
+		},
+		{
+			name:                "flush only with endpoint timeout disabled",
+			appTimeout:          time.Second,
+			endpointTimeoutZero: true,
+			wrap:                func(w http.ResponseWriter) http.ResponseWriter { return &flushOnlySSEWriter{ResponseWriter: w} },
 		},
 	}
 
 	for _, wrapper := range wrappers {
 		for _, endpoint := range []string{"stream", "livevalue"} {
 			t.Run(endpoint+"/"+wrapper.name, func(t *testing.T) {
-				app := NewApp().WithStreamWriteTimeout(wrapper.timeout).WithStreamHeartbeat(0)
-				app.WithMiddleware(func(next http.Handler) http.Handler {
+				app := NewApp(WithStreamWriteTimeout(wrapper.appTimeout), WithStreamHeartbeat(0), WithHTTPMiddleware(func(next http.Handler) http.Handler {
 					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						next.ServeHTTP(wrapper.wrap(w), r)
 					})
-				})
+				}))
+				serviceOptions := []ServiceOption(nil)
+				if wrapper.serviceTimeoutZero {
+					serviceOptions = append(serviceOptions, WithStreamWriteTimeout(0))
+				}
 
 				var producerStarts atomic.Int32
 				var closeStream func()
 				path := "/Feed/Subscribe"
 				if endpoint == "stream" {
-					handler := Stream(func(_ context.Context, _ Empty, stream StreamWriter[int]) error {
+					options := []StreamOption(nil)
+					if wrapper.endpointTimeoutZero {
+						options = append(options, WithStreamWriteTimeout(0))
+					}
+					app.Service("Feed", serviceOptions...).Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[int]) error {
 						producerStarts.Add(1)
 						return stream.Send(1)
-					})
-					if wrapper.handlerTimeoutZero {
-						handler.WithWriteTimeout(0)
-					}
-					app.Service("Feed").Register("Subscribe", handler)
+					}, options...)
 				} else {
 					liveValue := mustNewLiveValue(t, 1)
-					handler := liveValue.Handler()
-					if wrapper.handlerTimeoutZero {
-						handler.WithWriteTimeout(0)
+					options := []LiveValueOption(nil)
+					if wrapper.endpointTimeoutZero {
+						options = append(options, WithStreamWriteTimeout(0))
 					}
-					app.Service("State").Register("Get", handler)
+					app.Service("State", serviceOptions...).LiveValue("Get", liveValue, options...)
 					path = "/State/Get"
 					closeStream = liveValue.Close
 				}
@@ -677,15 +699,85 @@ func TestSSECapabilityPreflightAcceptsSupportedWriters(t *testing.T) {
 	}
 }
 
+func TestSSEExplicitZeroDisablesDeadlineAtEveryScope(t *testing.T) {
+	tests := []struct {
+		name                string
+		appTimeout          time.Duration
+		serviceTimeoutZero  bool
+		endpointTimeoutZero bool
+		wantSuccess         bool
+	}{
+		{name: "positive timeout control", appTimeout: time.Second},
+		{name: "app zero", appTimeout: 0, wantSuccess: true},
+		{name: "service zero", appTimeout: time.Second, serviceTimeoutZero: true, wantSuccess: true},
+		{name: "endpoint zero", appTimeout: time.Second, endpointTimeoutZero: true, wantSuccess: true},
+	}
+
+	for _, tt := range tests {
+		for _, endpoint := range []string{"stream", "livevalue"} {
+			t.Run(endpoint+"/"+tt.name, func(t *testing.T) {
+				var deadlineCalls atomic.Int32
+				app := NewApp(WithStreamWriteTimeout(tt.appTimeout), WithStreamHeartbeat(0), WithHTTPMiddleware(func(next http.Handler) http.Handler {
+					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						next.ServeHTTP(&rejectingDeadlineSSEWriter{ResponseWriter: w, deadlineCalls: &deadlineCalls}, r)
+					})
+				}))
+				serviceOptions := []ServiceOption(nil)
+				if tt.serviceTimeoutZero {
+					serviceOptions = append(serviceOptions, WithStreamWriteTimeout(0))
+				}
+
+				path := "/Feed/Subscribe"
+				var closeStream func()
+				if endpoint == "stream" {
+					options := []StreamOption(nil)
+					if tt.endpointTimeoutZero {
+						options = append(options, WithStreamWriteTimeout(0))
+					}
+					app.Service("Feed", serviceOptions...).Stream("Subscribe", func(_ context.Context, _ Empty, stream StreamWriter[int]) error {
+						return stream.Send(1)
+					}, options...)
+				} else {
+					liveValue := mustNewLiveValue(t, 1)
+					options := []LiveValueOption(nil)
+					if tt.endpointTimeoutZero {
+						options = append(options, WithStreamWriteTimeout(0))
+					}
+					app.Service("State", serviceOptions...).LiveValue("Get", liveValue, options...)
+					path = "/State/Get"
+					closeStream = liveValue.Close
+				}
+
+				status, contentType, body := postSSETestServer(t, app, path, closeStream)
+				if tt.wantSuccess {
+					if status != http.StatusOK || contentType != "text/event-stream" || !strings.Contains(body, `"result":1`) {
+						t.Fatalf("response = %d %q body=%q, want successful SSE", status, contentType, body)
+					}
+					if got := deadlineCalls.Load(); got != 0 {
+						t.Fatalf("SetWriteDeadline calls = %d, want 0", got)
+					}
+					return
+				}
+
+				if status != http.StatusInternalServerError || contentType != "application/json" {
+					t.Fatalf("response = %d %q body=%q, want unary 500 application/json", status, contentType, body)
+				}
+				if got := deadlineCalls.Load(); got != 1 {
+					t.Fatalf("SetWriteDeadline calls = %d, want 1", got)
+				}
+			})
+		}
+	}
+}
+
 func TestLiveValuePostCommitPanicDoesNotFallBackToUnaryJSON(t *testing.T) {
-	app := NewApp().WithStreamWriteTimeout(0).WithStreamHeartbeat(0)
-	app.WithMiddleware(func(next http.Handler) http.Handler {
+	app := NewApp(WithStreamWriteTimeout(0), WithStreamHeartbeat(0), WithHTTPMiddleware(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			next.ServeHTTP(&panicAfterCommitSSEWriter{ResponseWriter: w}, r)
 		})
-	})
+	}))
 	liveValue := mustNewLiveValue(t, 1)
-	app.Service("State").Register("Get", liveValue.Handler())
+	app.Service("State").LiveValue("Get", liveValue)
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/State/Get", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")

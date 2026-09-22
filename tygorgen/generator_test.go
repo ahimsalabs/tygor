@@ -231,7 +231,7 @@ func TestGenerate_NoOutDir_ReturnsFilesInMemory(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{
 		Provider: "reflection",
@@ -272,18 +272,18 @@ func TestGenerate_SourceGenericDefinedBytesUseJSONWireType(t *testing.T) {
 	type phantomResponse = testdata.Phantom[[]testdata.Octet]
 
 	app := tygor.NewApp()
-	app.Service("Bytes").Register("Echo", tygor.Exec(func(context.Context, byteResponse) (byteResponse, error) {
+	app.Service("Bytes").Exec("Echo", func(context.Context, byteResponse) (byteResponse, error) {
 		return byteResponse{}, nil
-	}))
-	app.Service("Bytes").Register("Custom", tygor.Exec(func(context.Context, customResponse) (customResponse, error) {
+	})
+	app.Service("Bytes").Exec("Custom", func(context.Context, customResponse) (customResponse, error) {
 		return customResponse{}, nil
-	}))
-	app.Service("Bytes").Register("Nested", tygor.Exec(func(context.Context, nestedResponse) (nestedResponse, error) {
+	})
+	app.Service("Bytes").Exec("Nested", func(context.Context, nestedResponse) (nestedResponse, error) {
 		return nestedResponse{}, nil
-	}))
-	app.Service("Bytes").Register("Phantom", tygor.Exec(func(context.Context, phantomResponse) (phantomResponse, error) {
+	})
+	app.Service("Bytes").Exec("Phantom", func(context.Context, phantomResponse) (phantomResponse, error) {
 		return phantomResponse{}, nil
-	}))
+	})
 
 	dir := t.TempDir()
 	result, err := Generate(app, &Config{
@@ -357,12 +357,12 @@ func TestGenerate_SourceGenericPointerArgumentsResolvePackages(t *testing.T) {
 	type nestedPointerResponse = testdata.Response[[]*map[string]v1.User]
 
 	app := tygor.NewApp()
-	app.Service("Pointers").Register("Slice", tygor.Exec(func(context.Context, pointerResponse) (pointerResponse, error) {
+	app.Service("Pointers").Exec("Slice", func(context.Context, pointerResponse) (pointerResponse, error) {
 		return pointerResponse{}, nil
-	}))
-	app.Service("Pointers").Register("Nested", tygor.Exec(func(context.Context, nestedPointerResponse) (nestedPointerResponse, error) {
+	})
+	app.Service("Pointers").Exec("Nested", func(context.Context, nestedPointerResponse) (nestedPointerResponse, error) {
 		return nestedPointerResponse{}, nil
-	}))
+	})
 	result, err := Generate(app, &Config{Provider: "source", SingleFile: true})
 	if err != nil {
 		t.Fatal(err)
@@ -410,9 +410,9 @@ func TestGenerate_SourceGenericPointerArgumentsResolvePackages(t *testing.T) {
 
 func TestGenerate_SourceDefinedByteSliceDoesNotExtractUnrelatedPackageTypes(t *testing.T) {
 	app := tygor.NewApp()
-	app.Service("Bytes").Register("Raw", tygor.Exec(func(context.Context, struct{}) ([]genericbytes.Octet, error) {
+	app.Service("Bytes").Exec("Raw", func(context.Context, struct{}) ([]genericbytes.Octet, error) {
 		return []genericbytes.Octet{1, 2}, nil
-	}))
+	})
 	result, err := Generate(app, &Config{Provider: "source", SingleFile: true})
 	if err != nil {
 		t.Fatal(err)
@@ -439,7 +439,7 @@ func TestGenerate_SourceDefinedByteSliceDoesNotExtractUnrelatedPackageTypes(t *t
 
 func TestGenerate_SourceNamedTypeCanShadowPredeclaredIdentifier(t *testing.T) {
 	app := tygor.NewApp()
-	app.Service("Shadow").Register("Echo", tygor.Exec(shadow.EchoHandler()))
+	app.Service("Shadow").Exec("Echo", shadow.EchoHandler())
 	result, err := Generate(app, &Config{Provider: "source", SingleFile: true})
 	if err != nil {
 		t.Fatal(err)
@@ -512,7 +512,7 @@ func TestGenerate_WithHandlers(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return &testfixtures.User{Username: req.Username}, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -547,8 +547,8 @@ func TestGenerate_ManifestStructure(t *testing.T) {
 	listHandler := func(ctx context.Context, req *testfixtures.ListPostsParams) ([]*testfixtures.Post, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(createHandler))
-	reg.Service("Posts").Register("List", tygor.Query(listHandler))
+	reg.Service("Users").Exec("Create", createHandler)
+	reg.Service("Posts").Query("List", listHandler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -587,7 +587,7 @@ func TestGenerate_TypesFile(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -616,7 +616,7 @@ func TestGenerate_CustomConfig(t *testing.T) {
 	handler := func(ctx context.Context, req *testfixtures.CreateUserRequest) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(handler))
+	reg.Service("Users").Exec("Create", handler)
 
 	cfg := &Config{
 		OutDir:           outDir,
@@ -660,7 +660,7 @@ func TestGenerate_GETParamsUseLowercaseNames(t *testing.T) {
 	listHandler := func(ctx context.Context, req *testfixtures.ListPostsParams) ([]*testfixtures.Post, error) {
 		return nil, nil
 	}
-	reg.Service("Posts").Register("List", tygor.Query(listHandler))
+	reg.Service("Posts").Query("List", listHandler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -889,8 +889,8 @@ func TestGenerate_PointerNullability(t *testing.T) {
 	listHandler := func(ctx context.Context, req *testfixtures.ListPostsParams) ([]*testfixtures.Post, error) {
 		return nil, nil
 	}
-	reg.Service("Users").Register("Create", tygor.Exec(createHandler))
-	reg.Service("Posts").Register("List", tygor.Query(listHandler))
+	reg.Service("Users").Exec("Create", createHandler)
+	reg.Service("Posts").Query("List", listHandler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 
@@ -926,7 +926,7 @@ func TestGenerate_EmptyRequestType(t *testing.T) {
 	handler := func(ctx context.Context, req *struct{}) (*testfixtures.User, error) {
 		return nil, nil
 	}
-	reg.Service("System").Register("Ping", tygor.Query(handler))
+	reg.Service("System").Query("Ping", handler)
 
 	cfg := &Config{OutDir: outDir, SingleFile: true, Provider: "reflection"}
 

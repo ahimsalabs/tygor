@@ -77,7 +77,7 @@ cd my-app && bun i && bun dev
 
 Or React: `bunx degit ahimsalabs/tygor-templates/starter-react my-app`
 
-Prerequisites: Go 1.21+, Node.js 18+
+Prerequisites: Go 1.27+, Node.js 18+
 
 ## Quick Start
 
@@ -93,8 +93,8 @@ func SetupApp() *tygor.App {
 	app := tygor.NewApp()
 
 	users := app.Service("Users")
-	users.Register("Get", tygor.Query(GetUser))      // GET request
-	users.Register("Create", tygor.Exec(CreateUser)) // POST request
+	users.Query("Get", GetUser)      // GET request
+	users.Exec("Create", CreateUser) // POST request
 
 	return app
 }
@@ -226,8 +226,9 @@ Cache control for Query (GET) endpoints:
 
 <!-- snippet-ignore -->
 ```go
-users.Register("Get", tygor.Query(GetUser).
-    CacheControl(tygor.CacheConfig{MaxAge: 5 * time.Minute, Public: true}))
+users.Query("Get", GetUser,
+    tygor.WithCacheControl(tygor.CacheConfig{MaxAge: 5 * time.Minute, Public: true}),
+)
 ```
 
 ### Interceptors
@@ -236,9 +237,9 @@ Cross-cutting concerns at app, service, or handler level:
 
 <!-- snippet-ignore -->
 ```go
-app.WithUnaryInterceptor(loggingInterceptor)
-service.WithUnaryInterceptor(authInterceptor)
-handler.WithUnaryInterceptor(auditInterceptor)
+app := tygor.NewApp(tygor.WithUnaryInterceptors(loggingInterceptor))
+service := app.Service("Users", tygor.WithUnaryInterceptors(authInterceptor))
+service.Query("Get", GetUser, tygor.WithUnaryInterceptors(auditInterceptor))
 ```
 
 Execution order: app → service → handler → your function.
@@ -249,7 +250,9 @@ Standard HTTP middleware:
 
 <!-- snippet-ignore -->
 ```go
-app.WithMiddleware(middleware.CORS(middleware.CORSAllowAll))
+app := tygor.NewApp(
+    tygor.WithHTTPMiddleware(middleware.CORS(middleware.CORSAllowAll)),
+)
 ```
 
 ## CLI Reference

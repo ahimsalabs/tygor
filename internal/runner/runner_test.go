@@ -52,9 +52,9 @@ type HelloResponse struct {
 func setupApp() *tygor.App {
 	app := tygor.NewApp()
 	svc := app.Service("Test")
-	svc.Register("Hello", tygor.Query(func(_ context.Context, req HelloRequest) (HelloResponse, error) {
+	svc.Query("Hello", func(_ context.Context, req HelloRequest) (HelloResponse, error) {
 		return HelloResponse{Message: "hello " + req.Name}, nil
-	}))
+	})
 	return app
 }
 
@@ -249,9 +249,9 @@ type HelloResponse struct {
 func ExportApp() *tygor.App {
 	app := tygor.NewApp()
 	svc := app.Service("Test")
-	svc.Register("Hello", tygor.Query(func(_ context.Context, req HelloRequest) (HelloResponse, error) {
+	svc.Query("Hello", func(_ context.Context, req HelloRequest) (HelloResponse, error) {
 		return HelloResponse{Message: "hello " + req.Name}, nil
-	}))
+	})
 	return app
 }
 
@@ -381,9 +381,9 @@ type Response struct {
 func MyGenerator() *tygorgen.Generator {
 	app := tygor.NewApp()
 	svc := app.Service("Math")
-	svc.Register("Double", tygor.Query(func(_ context.Context, req Request) (Response, error) {
+	svc.Query("Double", func(_ context.Context, req Request) (Response, error) {
 		return Response{Result: req.Value * 2}, nil
-	}))
+	})
 	return tygorgen.FromApp(app)
 }
 `
@@ -477,9 +477,9 @@ type Data struct {
 func GetApp() *tygor.App {
 	app := tygor.NewApp()
 	svc := app.Service("API")
-	svc.Register("GetData", tygor.Query(func(_ context.Context, _ struct{}) (Data, error) {
+	svc.Query("GetData", func(_ context.Context, _ struct{}) (Data, error) {
 		return Data{Value: "test"}, nil
-	}))
+	})
 	return app
 }
 `
@@ -575,9 +575,9 @@ type Output struct {
 func CheckApp() *tygor.App {
 	app := tygor.NewApp()
 	svc := app.Service("Checker")
-	svc.Register("Process", tygor.Query(func(_ context.Context, in Input) (Output, error) {
+	svc.Query("Process", func(_ context.Context, in Input) (Output, error) {
 		return Output{Y: in.X * 2}, nil
-	}))
+	})
 	return app
 }
 `
@@ -686,9 +686,9 @@ type PingResponse struct {
 func setupApp() *tygor.App {
 	app := tygor.NewApp()
 	svc := app.Service("API")
-	svc.Register("Ping", tygor.Query(func(_ context.Context, req PingRequest) (PingResponse, error) {
+	svc.Query("Ping", func(_ context.Context, req PingRequest) (PingResponse, error) {
 		return PingResponse{Message: "pong"}, nil
-	}))
+	})
 	return app
 }
 `

@@ -719,7 +719,7 @@ func (f *ZodFlavor) typeToZodWithNullable(ctx *EmitContext, typ ir.TypeDescripto
 			nullable = true
 			typ = t.Element
 		case *ir.ReferenceDescriptor:
-			if len(t.TypeArguments) > 0 || ctx == nil || ctx.Schema == nil || ctx.SchemaPrefix != "" || ctx.RecursiveTypes[t.Target] || seen[t.Target] {
+			if (!stringEncoded && len(t.TypeArguments) > 0) || ctx == nil || ctx.Schema == nil || ctx.SchemaPrefix != "" || ctx.RecursiveTypes[t.Target] || seen[t.Target] {
 				goto resolved
 			}
 			alias, ok := ctx.Schema.FindType(t.Target).(*ir.AliasDescriptor)

@@ -38,18 +38,18 @@ func TestSourceGenericDefinedBytesCompileAndRun(t *testing.T) {
 	type phantomResponse = testdata.Phantom[[]testdata.Octet]
 
 	app := tygor.NewApp()
-	app.Service("Bytes").Register("Echo", tygor.Exec(func(context.Context, byteResponse) (byteResponse, error) {
+	app.Service("Bytes").Exec("Echo", func(context.Context, byteResponse) (byteResponse, error) {
 		return byteResponse{}, nil
-	}))
-	app.Service("Bytes").Register("Custom", tygor.Exec(func(context.Context, customResponse) (customResponse, error) {
+	})
+	app.Service("Bytes").Exec("Custom", func(context.Context, customResponse) (customResponse, error) {
 		return customResponse{}, nil
-	}))
-	app.Service("Bytes").Register("Nested", tygor.Exec(func(context.Context, nestedResponse) (nestedResponse, error) {
+	})
+	app.Service("Bytes").Exec("Nested", func(context.Context, nestedResponse) (nestedResponse, error) {
 		return nestedResponse{}, nil
-	}))
-	app.Service("Bytes").Register("Phantom", tygor.Exec(func(context.Context, phantomResponse) (phantomResponse, error) {
+	})
+	app.Service("Bytes").Exec("Phantom", func(context.Context, phantomResponse) (phantomResponse, error) {
 		return phantomResponse{}, nil
-	}))
+	})
 
 	dir := t.TempDir()
 	if _, err := tygorgen.Generate(app, &tygorgen.Config{
@@ -275,6 +275,7 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 			{Name: "DefinedByteSlices"},
 			{Name: "CustomElementByteSlice"},
 			{Name: "AliasResultMarshalers"},
+			{Package: "tygor.dev/tygorgen/provider/testdata/genericwire", Name: "GenericStringEncodingDepths"},
 			{Package: "tygor.dev/tygorgen/provider/testdata/genericwire", Name: "UnconstrainedCustomMarshalerPayload"},
 		},
 	})
@@ -307,19 +308,48 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decodedDepth map[string]any
-	if err := json.Unmarshal(depthPayload, &decodedDepth); err != nil {
+	const wantDepthPayload = `{"direct":"7","single":"7","double":7,"triple":7,"duration":"1000000000","defined":"7"}`
+	if string(depthPayload) != wantDepthPayload {
+		t.Fatalf("encoding/json pointer-depth wire payload = %s, want %s", depthPayload, wantDepthPayload)
+	}
+	nilDepthPayload, err := json.Marshal(testdata.StringEncodingDepths{
+		Direct:   value,
+		Single:   single,
+		Double:   double,
+		Triple:   triple,
+		Duration: time.Second,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"direct", "single", "duration"} {
-		if _, ok := decodedDepth[name].(string); !ok {
-			t.Fatalf("encoding/json pointer-depth field %s = %#v, want string", name, decodedDepth[name])
-		}
+	const wantNilDepthPayload = `{"direct":"7","single":"7","double":7,"triple":7,"duration":"1000000000","defined":null}`
+	if string(nilDepthPayload) != wantNilDepthPayload {
+		t.Fatalf("encoding/json nil pointer-depth wire payload = %s, want %s", nilDepthPayload, wantNilDepthPayload)
 	}
-	for _, name := range []string{"double", "triple"} {
-		if _, ok := decodedDepth[name].(float64); !ok {
-			t.Fatalf("encoding/json pointer-depth field %s = %#v, want number", name, decodedDepth[name])
-		}
+	applied := genericwire.PhantomPointer[string](single)
+	doubleApplied := &applied
+	genericDepthPayload, err := json.Marshal(genericwire.GenericStringEncodingDepths{
+		Applied: applied,
+		Double:  doubleApplied,
+		Plain:   applied,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantGenericDepthPayload = `{"applied":"7","double":7,"plain":7}`
+	if string(genericDepthPayload) != wantGenericDepthPayload {
+		t.Fatalf("encoding/json generic pointer-depth wire payload = %s, want %s", genericDepthPayload, wantGenericDepthPayload)
+	}
+	genericNilDepthPayload, err := json.Marshal(genericwire.GenericStringEncodingDepths{
+		Double: doubleApplied,
+		Plain:  applied,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantGenericNilDepthPayload = `{"applied":null,"double":7,"plain":7}`
+	if string(genericNilDepthPayload) != wantGenericNilDepthPayload {
+		t.Fatalf("encoding/json nil generic pointer-depth wire payload = %s, want %s", genericNilDepthPayload, wantGenericNilDepthPayload)
 	}
 	bytePayload, err := json.Marshal(testdata.DefinedByteSlices{Data: []testdata.Octet{1, 2}})
 	if err != nil {
@@ -361,13 +391,11 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 		t.Fatalf("encoding/json unconstrained custom-marshaler payload = %s, want %s", unconstrainedPayload, wantUnconstrainedPayload)
 	}
 
-	definedLiteral := "7"
-	if _, ok := decodedDepth["defined"].(string); ok {
-		definedLiteral = `"7"`
-	}
 	runtime := loadTypeScriptFixture(t, "json-wire-parity.ts",
 		"__DEPTH_JSON__", strconv.Quote(string(depthPayload)),
-		"__DEFINED_LITERAL__", definedLiteral,
+		"__NIL_DEPTH_JSON__", strconv.Quote(string(nilDepthPayload)),
+		"__GENERIC_DEPTH_JSON__", strconv.Quote(string(genericDepthPayload)),
+		"__GENERIC_NIL_DEPTH_JSON__", strconv.Quote(string(genericNilDepthPayload)),
 		"__BYTE_JSON__", strconv.Quote(string(bytePayload)),
 		"__CUSTOM_BYTE_JSON__", strconv.Quote(string(customBytePayload)),
 		"__ALIAS_MARSHALER_JSON__", strconv.Quote(string(aliasMarshalerPayload)),

@@ -83,8 +83,8 @@ func supportsSSEWriteDeadline(w http.ResponseWriter) bool {
 }
 
 // writeSSEFrame performs one synchronous SSE transport operation. A positive
-// timeout must be enforceable by the ResponseWriter; unsupported deadlines fail
-// closed rather than silently creating an unbounded write.
+// timeout is enforced when the ResponseWriter supports write deadlines; writers
+// that only support flushing remain valid SSE transports without that bound.
 func writeSSEFrame(w http.ResponseWriter, timeout time.Duration, frame []byte) (err error) {
 	return writeSSEFrameWithCommit(w, timeout, frame, nil)
 }

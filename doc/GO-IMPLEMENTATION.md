@@ -84,52 +84,38 @@ func ListNews(ctx context.Context, req *db.ListNewsParams) ([]*db.News, error) {
 }
 ```
 
-### 3.2 Handler Construction
+### 3.2 Typed Registration and Options
 
-The library provides two constructor functions for creating handlers:
+Handlers are registered through generic `Service` methods. Each method accepts
+only its compatible sealed option family:
 
-**POST Handlers (mutations):**
 ```go
-func Exec[Req, Res any](fn func(context.Context, Req) (Res, error)) *ExecHandler[Req, Res]
+func (s *Service) Exec[Req, Res any](name string, fn func(context.Context, Req) (Res, error), options ...ExecOption)
+func (s *Service) Query[Req, Res any](name string, fn func(context.Context, Req) (Res, error), options ...QueryOption)
+func (s *Service) Stream[Req, Res any](name string, fn func(context.Context, Req, StreamWriter[Res]) error, options ...StreamOption)
+func (s *Service) LiveValue[T any](name string, value *LiveValue[T], options ...LiveValueOption)
 ```
 
-**GET Handlers (queries):**
-```go
-func Query[Req, Res any](fn func(context.Context, Req) (Res, error)) *QueryHandler[Req, Res]
-```
-
-**Fluent API:**
-
-`ExecHandler` supports:
-```go
-func (h *ExecHandler[Req, Res]) WithUnaryInterceptor(i UnaryInterceptor) *ExecHandler[Req, Res]
-func (h *ExecHandler[Req, Res]) WithSkipValidation() *ExecHandler[Req, Res]
-func (h *ExecHandler[Req, Res]) WithMaxRequestBodySize(size uint64) *ExecHandler[Req, Res]
-```
-
-`QueryHandler` supports:
-```go
-func (h *QueryHandler[Req, Res]) WithUnaryInterceptor(i UnaryInterceptor) *QueryHandler[Req, Res]
-func (h *QueryHandler[Req, Res]) WithSkipValidation() *QueryHandler[Req, Res]
-func (h *QueryHandler[Req, Res]) CacheControl(cfg CacheConfig) *QueryHandler[Req, Res]
-func (h *QueryHandler[Req, Res]) WithStrictQueryParams() *QueryHandler[Req, Res]
-```
+Options are applied left to right before the endpoint is published. Shared
+options implement only the families where they are meaningful; for example,
+`WithCacheControl` is a `QueryOption`, while `WithStreamHeartbeat` applies to
+stream and live-value endpoints as well as app and service defaults.
 
 **Example Usage:**
 ```go
 // POST handler (default for mutations)
-tygor.Exec(CreateNews)
+news.Exec("Create", CreateNews)
 
 // GET handler with caching
-tygor.Query(ListNews).CacheControl(tygor.CacheConfig{
+news.Query("List", ListNews, tygor.WithCacheControl(tygor.CacheConfig{
     MaxAge: 5 * time.Minute,
     Public: true,
-})
+}))
 ```
 
 **Defaults:**
-- `Exec()`: POST method, no caching, validation enabled
-- `Query()`: GET method, no caching, validation enabled, lenient query params
+- `Service.Exec()`: POST method, no caching, validation enabled
+- `Service.Query()`: GET method, no caching, validation enabled, lenient query params
 
 ---
 
@@ -144,35 +130,40 @@ type App struct {
     // internal fields
 }
 
-func NewApp() *App
+func NewApp(options ...AppOption) *App
 ```
 
 ### 4.2 Service Namespacing
 
-The `App.Service(name string)` method MUST return a `Service` instance that provides a namespace for related operations.
+The `App.Service(name string, options ...ServiceOption)` method MUST return a
+`Service` instance that provides a namespace for related operations.
 
 ```go
 type Service struct {
     // internal fields
 }
 
-func (r *App) Service(name string) *Service
+func (r *App) Service(name string, options ...ServiceOption) *Service
 ```
 
-### 4.3 Handler Registration
+### 4.3 Typed Handler Registration
 
-The `Service.Register(method string, handler RPCMethod)` method MUST register a handler for a specific method name.
+`Service` MUST expose typed methods that apply options and register complete,
+immutable handlers before publishing them.
 
 ```go
-func (s *Service) Register(method string, handler RPCMethod)
+func (s *Service) Exec[Req, Res any](method string, fn func(context.Context, Req) (Res, error), options ...ExecOption)
+func (s *Service) Query[Req, Res any](method string, fn func(context.Context, Req) (Res, error), options ...QueryOption)
+func (s *Service) Stream[Req, Res any](method string, fn func(context.Context, Req, StreamWriter[Res]) error, options ...StreamOption)
+func (s *Service) LiveValue[T any](method string, value *LiveValue[T], options ...LiveValueOption)
 ```
 
 **Example:**
 ```go
 app := tygor.NewApp()
 news := app.Service("News")
-news.Register("List", tygor.Query(ListNews))
-news.Register("Create", tygor.Exec(CreateNews))
+news.Query("List", ListNews)
+news.Exec("Create", CreateNews)
 ```
 
 This registers operations:
@@ -198,31 +189,38 @@ http.ListenAndServe(":8080", app.Handler())
 
 ### 5.1 App Configuration
 
-The `App` MUST support configuration via chaining methods:
+The `App` MUST accept sealed options during construction:
 
 ```go
-func (r *App) WithErrorTransformer(fn ErrorTransformer) *App
-func (r *App) WithMaskInternalErrors() *App
-func (r *App) WithUnaryInterceptor(i UnaryInterceptor) *App
-func (r *App) WithMiddleware(mw func(http.Handler) http.Handler) *App
-func (r *App) WithLogger(logger *slog.Logger) *App
-func (r *App) WithMaxRequestBodySize(size uint64) *App
+func WithErrorTransformer(fn ErrorTransformer) AppOption
+func WithMaskInternalErrors() AppOption
+func WithUnaryInterceptors(interceptors ...UnaryInterceptor) UnaryInterceptorOption
+func WithHTTPMiddleware(middlewares ...func(http.Handler) http.Handler) AppOption
+func WithLogger(logger *slog.Logger) AppOption
+func WithMaxRequestBodySize(size uint64) RequestBodySizeOption
+func WithStreamWriteTimeout(timeout time.Duration) StreamTimingOption
+func WithStreamHeartbeat(interval time.Duration) StreamTimingOption
 ```
 
 **Example:**
 ```go
-app := tygor.NewApp().
-    WithErrorTransformer(customErrorHandler).
-    WithLogger(slog.Default()).
-    WithMaskInternalErrors()
+app := tygor.NewApp(
+    tygor.WithErrorTransformer(customErrorHandler),
+    tygor.WithLogger(slog.Default()),
+    tygor.WithMaskInternalErrors(),
+)
 ```
 
 ### 5.2 Service Configuration
 
-The `Service` type SHOULD support configuration methods:
+The `Service` type SHOULD accept scoped defaults at creation:
 
 ```go
-func (s *Service) WithUnaryInterceptor(i UnaryInterceptor) *Service
+service := app.Service("News",
+    tygor.WithUnaryInterceptors(authInterceptor),
+    tygor.WithMaxRequestBodySize(1<<20),
+    tygor.WithStreamInterceptors(metricsInterceptor),
+)
 ```
 
 ---
@@ -439,50 +437,26 @@ Validation can be disabled per-handler:
 
 ```go
 // Per-handler
-h := tygor.Exec(fn).WithSkipValidation()
+service.Exec("Method", fn, tygor.WithoutValidation())
 ```
 
 ---
 
 ## 9. Internal Architecture
 
-### 9.1 Sealed `RPCMethod` Interface
+### 9.1 Internal Handler Interface
 
-The `RPCMethod` interface MUST be sealed to prevent external implementations. This can be achieved through any mechanism that prevents external packages from satisfying the interface, such as:
+The framework MUST keep its handler interface internal. Public registration is
+available only through the typed `Service` methods.
 
-1. **Internal type in method signature**: A method returning an internal package type (e.g., `Metadata() *internal.Type`)
-2. **Marker method with internal assertion**: A public marker method combined with runtime type assertion to an internal interface
-3. **Unexported method**: An unexported method that external packages cannot implement
-
-**Example using marker method:**
 ```go
 package tygor
 
-// RPCMethod is the public interface for handler registration.
-type RPCMethod interface {
-    IsRPCMethod() // Marker method
-}
-
-// rpcHandler is the internal interface used by the framework.
-// External packages cannot implement this because Service.Register
-// type-asserts to this interface.
-type rpcHandler interface {
-    RPCMethod
+type endpointHandler interface {
     serveHTTP(ctx *rpcContext)
     metadata() *meta.MethodMetadata
 }
 ```
-
-**Example using internal type:**
-```go
-package tygor
-
-type RPCMethod interface {
-    Metadata() *meta.MethodMetadata // Cannot be implemented outside this module
-}
-```
-
-The implementation MUST ensure that only handlers created via `Exec()` or `Query()` can be registered with `Service.Register()`.
 
 ---
 
@@ -528,7 +502,7 @@ func LoggingInterceptor(ctx tygor.Context, req any, handler tygor.HandlerFunc) (
     return res, err
 }
 
-app := tygor.NewApp().WithUnaryInterceptor(LoggingInterceptor)
+app := tygor.NewApp(tygor.WithUnaryInterceptors(LoggingInterceptor))
 ```
 
 ### 10.3 Execution Order
@@ -665,7 +639,7 @@ type Logger interface {
 ### 13.2 Logger Configuration
 
 ```go
-app := tygor.NewApp().WithLogger(slog.Default())
+app := tygor.NewApp(tygor.WithLogger(slog.Default()))
 ```
 
 **Logged Events:**
@@ -707,17 +681,18 @@ func CreateNews(ctx context.Context, req *db.CreateNewsParams) (*db.News, error)
 
 func main() {
     // Create app
-    app := tygor.NewApp().
-        WithLogger(slog.Default()).
-        WithMaskInternalErrors()
+    app := tygor.NewApp(
+        tygor.WithLogger(slog.Default()),
+        tygor.WithMaskInternalErrors(),
+    )
 
     // Register services
     news := app.Service("News")
-    news.Register("List", tygor.Query(ListNews).CacheControl(tygor.CacheConfig{
+    news.Query("List", ListNews, tygor.WithCacheControl(tygor.CacheConfig{
         MaxAge: 5 * time.Minute,
         Public: true,
     }))
-    news.Register("Create", tygor.Exec(CreateNews))
+    news.Exec("Create", CreateNews)
 
     // Generate TypeScript types
     if _, err := tygorgen.FromApp(app).ToDir("./client/src/rpc"); err != nil {
@@ -736,13 +711,13 @@ func main() {
 A conforming Go implementation MUST:
 
 - ✅ Support `func(ctx context.Context, req Req) (Res, error)` handlers
-- ✅ Provide `Exec()` and `Query()` handler constructors with fluent configuration
+- ✅ Provide typed `Service.Exec()`, `Service.Query()`, `Service.Stream()`, and `Service.LiveValue()` registration with capability-specific options
 - ✅ Provide `App` with `Service` namespacing
 - ✅ Provide `Handler()` method returning `http.Handler`
 - ✅ Support GET (query string) and POST (JSON body) serialization
 - ✅ Implement default error transformer with standard error codes
 - ✅ Support custom error transformers
-- ✅ Provide sealed `RPCMethod` interface
-- ✅ Support interceptors at app/service/handler levels via `WithUnaryInterceptor`
+- ✅ Keep the handler interface internal
+- ✅ Support interceptors at app/service/handler levels via `WithUnaryInterceptors`
 - ✅ Provide context API for request metadata (`FromContext`, `Context` interface with `Service()`, `EndpointID()`, `HTTPRequest()`, `HTTPWriter()`)
 - ✅ Generate TypeScript types and manifest

@@ -1,6 +1,8 @@
 module tygor.dev
 
-go 1.25.3
+go 1.27
+
+toolchain go1.27.1
 
 require (
 	github.com/ahimsalabs/cors v0.0.0-20260120085645-41b44d6ce1a9

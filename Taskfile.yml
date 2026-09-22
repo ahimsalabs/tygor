@@ -7,12 +7,7 @@ version: '3'
 vars:
   TOOLS_DIR: "{{.ROOT_DIR}}/.tools"
   AQUA_ROOT: "{{.ROOT_DIR}}/.tools/aqua-pkgs"
-  STATICCHECK_VERSION:
-    sh: |
-      case "$(go env GOVERSION)" in
-        go1.25*) echo v0.7.0 ;;
-        *) echo v0.8.1 ;;
-      esac
+  STATICCHECK_VERSION: v0.8.1
 
 env:
   GOBIN: "{{.TOOLS_DIR}}"

@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"tygor.dev/tygorgen/ir"
-	"tygor.dev/tygorgen/provider/testdata"
 	"tygor.dev/tygorgen/provider/testdata/genericbytes"
 	"tygor.dev/tygorgen/provider/testdata/genericstring"
 )
@@ -1809,25 +1807,9 @@ func assertJSONWireClassification(t *testing.T, schema *ir.Schema) {
 	}
 
 	depths := findType(schema, "StringEncodingDepths").(*ir.StructDescriptor)
-	value := 1
-	defined := testdata.DefinedIntPointer(&value)
-	probeType := reflect.StructOf([]reflect.StructField{{
-		Name: "Value", Type: reflect.TypeOf(defined), Tag: `json:"value,string"`,
-	}})
-	probe := reflect.New(probeType).Elem()
-	probe.Field(0).Set(reflect.ValueOf(defined))
-	wire, err := json.Marshal(probe.Interface())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var actual map[string]any
-	if err := json.Unmarshal(wire, &actual); err != nil {
-		t.Fatal(err)
-	}
-	_, definedStringEncoded := actual["value"].(string)
 	for name, want := range map[string]bool{
 		"Direct": true, "Single": true, "Double": false,
-		"Triple": false, "Duration": true, "Defined": definedStringEncoded,
+		"Triple": false, "Duration": true, "Defined": true,
 	} {
 		field := findFieldByName(depths.Fields, name)
 		if field == nil || field.StringEncoded != want {

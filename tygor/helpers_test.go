@@ -78,9 +78,8 @@ type testContextConfig struct {
 
 // ServeHandler builds the request and serves it to a tygor handler.
 // For testing, it accepts a testContextConfig to configure the context.
-func (tr *TestRequestBuilder) ServeHandler(handler Endpoint, config testContextConfig) *httptest.ResponseRecorder {
+func (tr *TestRequestBuilder) ServeHandler(handler endpointHandler, config testContextConfig) *httptest.ResponseRecorder {
 	req, w := tr.Build()
-	h := handler.(endpointHandler)
 
 	// Create internal context with config
 	ctx := newContext(req.Context(), w, req, "TestService", "TestMethod")
@@ -90,7 +89,7 @@ func (tr *TestRequestBuilder) ServeHandler(handler Endpoint, config testContextC
 	ctx.logger = config.logger
 	ctx.maxRequestBodySize = config.maxRequestBodySize
 
-	h.serveHTTP(ctx)
+	handler.serveHTTP(ctx)
 	return w
 }
 

@@ -10,7 +10,7 @@ func (a *App) Routes() internal.RouteMap {
 
 	routes := make(internal.RouteMap)
 	for name, method := range a.routes {
-		md := method.Metadata()
+		md := method.metadata()
 		md.Name = name
 		routes[name] = md
 	}
