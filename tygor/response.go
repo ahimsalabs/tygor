@@ -30,12 +30,15 @@ type errorResponse struct {
 
 // marshalResponse serializes the complete success envelope before any response
 // headers or body bytes are committed.
-func marshalResponse(result any) ([]byte, error) {
-	data, err := json.Marshal(response{Result: result})
+func marshalResponse(result any, options ...json.Options) ([]byte, error) {
+	payload, err := json.Marshal(result, options...)
 	if err != nil {
 		return nil, err
 	}
-	return append(data, '\n'), nil
+	data := make([]byte, 0, len(payload)+13)
+	data = append(data, `{"result":`...)
+	data = append(data, payload...)
+	return append(data, '}', '\n'), nil
 }
 
 func marshalErrorResponse(err *Error) ([]byte, error) {

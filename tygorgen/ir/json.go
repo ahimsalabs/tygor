@@ -47,11 +47,13 @@ func (d *PrimitiveDescriptor) MarshalJSON() ([]byte, error) {
 		Kind            string `json:"kind"`
 		PrimitiveKind   string `json:"primitiveKind"`
 		BitSize         int    `json:"bitSize,omitempty"`
+		StringEncoded   bool   `json:"stringEncoded,omitempty"`
 		ByteArrayLength *int   `json:"byteArrayLength,omitempty"`
 	}{
 		Kind:            "primitive",
 		PrimitiveKind:   d.PrimitiveKind.String(),
 		BitSize:         d.BitSize,
+		StringEncoded:   d.StringEncoded,
 		ByteArrayLength: d.ByteArrayLength,
 	})
 }
@@ -183,6 +185,7 @@ func (e EndpointDescriptor) MarshalJSON() ([]byte, error) {
 		Path      string         `json:"path"`
 		Request   TypeDescriptor `json:"request,omitempty"`
 		Response  TypeDescriptor `json:"response,omitempty"`
+		JSON      JSONContract   `json:"json"`
 		Doc       string         `json:"doc,omitempty"`
 	}{
 		Name:      e.Name,
@@ -191,6 +194,7 @@ func (e EndpointDescriptor) MarshalJSON() ([]byte, error) {
 		Path:      e.Path,
 		Request:   e.Request,
 		Response:  e.Response,
+		JSON:      e.JSON,
 		Doc:       e.Documentation.Summary,
 	})
 }

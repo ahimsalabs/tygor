@@ -239,6 +239,11 @@ func resolveValidationType(ctx *EmitContext, typ ir.TypeDescriptor) ir.TypeDescr
 			case *ir.AliasDescriptor:
 				typ = target.Underlying
 			case *ir.EnumDescriptor:
+				if target.Underlying != nil {
+					underlying := *target.Underlying
+					underlying.StringEncoded = len(target.StringEncodedValues) > 0
+					return &underlying
+				}
 				if len(target.Members) == 0 {
 					return typ
 				}

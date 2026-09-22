@@ -2001,7 +2001,8 @@ func TestReflectionProvider_CustomMarshalerAsField(t *testing.T) {
 		t.Fatal("ContainsCustomMarshalers not found")
 	}
 
-	// All three fields should be PrimitiveAny
+	// All three fields should have an opaque wire element. The pointer field
+	// must retain its pointer shape so nullability is not widened to any.
 	for _, fieldName := range []string{"JSON", "Text", "Ptr"} {
 		field := findField(structDesc.Fields, fieldName)
 		if field == nil {
@@ -2009,10 +2010,17 @@ func TestReflectionProvider_CustomMarshalerAsField(t *testing.T) {
 			continue
 		}
 
-		// Dereference PtrDescriptor for Ptr field
 		fieldType := field.Type
-		if ptr, ok := fieldType.(*ir.PtrDescriptor); ok {
+		if fieldName == "Ptr" {
+			ptr, ok := fieldType.(*ir.PtrDescriptor)
+			if !ok {
+				t.Errorf("field Ptr: expected PtrDescriptor, got %T", fieldType)
+				continue
+			}
 			fieldType = ptr.Element
+		} else if _, ok := fieldType.(*ir.PtrDescriptor); ok {
+			t.Errorf("field %s unexpectedly has pointer shape", fieldName)
+			continue
 		}
 
 		primDesc, ok := fieldType.(*ir.PrimitiveDescriptor)

@@ -518,6 +518,26 @@ describe("LiveValue primitive", () => {
     metadata: liveValueMetadata,
   };
 
+  test("livevalue joins multiline SSE data fields before parsing JSON", async () => {
+    const body = [
+      'data: {"result":[',
+      'data:   "first",',
+      'data:   "second"',
+      'data: ]}',
+      '',
+      '',
+    ].join("\n");
+    const client = createClient(liveValueRegistry, {
+      fetch: mock(async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } })),
+    });
+    const liveValue = client.Tasks.SyncedList;
+    const unsubscribe = liveValue.subscribe(() => undefined);
+
+    await waitFor(() => liveValue.getSnapshot().data?.[0] === "first", "multiline livevalue event");
+    expect(liveValue.getSnapshot().data).toEqual(["first", "second"]);
+    unsubscribe();
+  });
+
   test("livevalue returns object with data and state properties", () => {
     const mockFetch = mock(async () => mockResponse(200, { result: [] }));
 
@@ -749,6 +769,23 @@ describe("Stream primitive", () => {
     manifest: {} as StreamManifest,
     metadata: streamMetadata,
   };
+
+  test("stream joins multiline SSE data fields before parsing JSON", async () => {
+    const body = [
+      'data: {"result":{',
+      'data:   "time": "now"',
+      'data: }}',
+      '',
+      '',
+    ].join("\n");
+    const client = createClient(streamRegistry, {
+      fetch: mock(async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } })),
+    });
+    const iterator = client.Tasks.Time({})[Symbol.asyncIterator]();
+
+    expect(await iterator.next()).toEqual({ done: false, value: { time: "now" } });
+    expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  });
 
   test("stream returns object with subscribe/getSnapshot and AsyncIterable", () => {
     const mockFetch = mock(async () => mockResponse(200, { result: { time: "now" } }));

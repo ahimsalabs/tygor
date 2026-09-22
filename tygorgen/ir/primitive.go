@@ -49,6 +49,11 @@ type PrimitiveDescriptor struct {
 	exprBase
 	PrimitiveKind PrimitiveKind
 
+	// StringEncoded reports that a numeric Go value is represented by a JSON
+	// string. Unlike changing PrimitiveKind to String, this preserves numeric
+	// omission and validation semantics.
+	StringEncoded bool
+
 	// BitSize specifies the size for numeric types (PrimitiveInt, PrimitiveUint, PrimitiveFloat).
 	// Valid values:
 	// - 0: Platform-dependent size (Go's `int`, `uint`)

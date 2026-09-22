@@ -387,7 +387,7 @@ func (e *Emitter) emitEnumAsUnion(buf *bytes.Buffer, typeName string, enum *ir.E
 		if i > 0 {
 			buf.WriteString(" | ")
 		}
-		buf.WriteString(formatEnumValue(member.Value))
+		buf.WriteString(formatEnumMemberValue(enum, i, member.Value))
 	}
 
 	buf.WriteString(";")
@@ -428,7 +428,7 @@ func (e *Emitter) emitEnumAsEnum(buf *bytes.Buffer, typeName string, enum *ir.En
 		memberName := escapeReservedWord(member.Name)
 		buf.WriteString(memberName)
 		buf.WriteString(" = ")
-		buf.WriteString(formatEnumValue(member.Value))
+		buf.WriteString(formatEnumMemberValue(enum, i, member.Value))
 	}
 
 	buf.WriteString(",\n")
@@ -466,7 +466,7 @@ func (e *Emitter) emitEnumAsObject(buf *bytes.Buffer, typeName string, enum *ir.
 		memberName := escapeReservedWord(member.Name)
 		buf.WriteString(memberName)
 		buf.WriteString(": ")
-		buf.WriteString(formatEnumValue(member.Value))
+		buf.WriteString(formatEnumMemberValue(enum, i, member.Value))
 	}
 
 	buf.WriteString(",\n")
@@ -522,6 +522,9 @@ func (e *Emitter) emitPrimitive(p *ir.PrimitiveDescriptor) string {
 
 // primitiveTypeAndHint returns the TypeScript type and optional hint for a primitive.
 func (e *Emitter) primitiveTypeAndHint(p *ir.PrimitiveDescriptor) (tsType, hint string) {
+	if p.StringEncoded && (p.PrimitiveKind == ir.PrimitiveInt || p.PrimitiveKind == ir.PrimitiveUint || p.PrimitiveKind == ir.PrimitiveFloat) {
+		return "string", ""
+	}
 	switch p.PrimitiveKind {
 	case ir.PrimitiveBool:
 		return "boolean", ""
@@ -871,6 +874,13 @@ func formatEnumValue(value any) string {
 	}
 }
 
+func formatEnumMemberValue(enum *ir.EnumDescriptor, index int, value any) string {
+	if index < len(enum.StringEncodedValues) {
+		return strconv.Quote(enum.StringEncodedValues[index])
+	}
+	return formatEnumValue(value)
+}
+
 // checkLargeIntegerWarning checks if a field uses int64/uint64 without ,string tag
 // and returns a warning per Appendix A.2 of the spec.
 func (e *Emitter) checkLargeIntegerWarning(field ir.FieldDescriptor, typeName string) *ir.Warning {
@@ -892,6 +902,9 @@ func (e *Emitter) checkLargeIntegerWarning(field ir.FieldDescriptor, typeName st
 	// Check if it's a primitive int64 or uint64
 	prim, ok := baseType.(*ir.PrimitiveDescriptor)
 	if !ok {
+		return nil
+	}
+	if prim.StringEncoded {
 		return nil
 	}
 

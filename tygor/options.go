@@ -1,6 +1,7 @@
 package tygor
 
 import (
+	json "encoding/json/v2"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -35,6 +36,18 @@ type StreamOption interface {
 // LiveValueOption configures a live value endpoint before it is registered.
 type LiveValueOption interface {
 	applyLiveValue(*liveValueConfig)
+}
+
+// JSONOption configures encoding/json/v2 behavior at any server scope.
+// Options at narrower scopes override options at broader scopes according to
+// [json.JoinOptions].
+type JSONOption interface {
+	AppOption
+	ServiceOption
+	ExecOption
+	QueryOption
+	StreamOption
+	LiveValueOption
 }
 
 // UnaryInterceptorOption can configure unary interceptors at every server scope.
@@ -80,6 +93,7 @@ type execConfig struct {
 	interceptors       []UnaryInterceptor
 	skipValidation     bool
 	maxRequestBodySize *uint64
+	jsonOptions        json.Options
 }
 
 type queryConfig struct {
@@ -87,6 +101,7 @@ type queryConfig struct {
 	skipValidation    bool
 	cacheConfig       *CacheConfig
 	strictQueryParams bool
+	jsonOptions       json.Options
 }
 
 type streamConfig struct {
@@ -96,12 +111,41 @@ type streamConfig struct {
 	maxRequestBodySize *uint64
 	writeTimeout       *time.Duration
 	heartbeatInterval  *time.Duration
+	jsonOptions        json.Options
 }
 
 type liveValueConfig struct {
 	interceptors      []UnaryInterceptor
 	writeTimeout      *time.Duration
 	heartbeatInterval *time.Duration
+	jsonOptions       json.Options
+}
+
+type jsonOption struct{ options json.Options }
+
+// WithJSONOptions composes encoding/json/v2 options at the current scope.
+// Repeated calls are joined in application order, so later values win.
+func WithJSONOptions(options ...json.Options) JSONOption {
+	return jsonOption{options: json.JoinOptions(options...)}
+}
+
+func (o jsonOption) applyApp(app *App) {
+	app.jsonOptions = json.JoinOptions(app.jsonOptions, o.options)
+}
+func (o jsonOption) applyService(service *Service) {
+	service.jsonOptions = json.JoinOptions(service.jsonOptions, o.options)
+}
+func (o jsonOption) applyExec(config *execConfig) {
+	config.jsonOptions = json.JoinOptions(config.jsonOptions, o.options)
+}
+func (o jsonOption) applyQuery(config *queryConfig) {
+	config.jsonOptions = json.JoinOptions(config.jsonOptions, o.options)
+}
+func (o jsonOption) applyStream(config *streamConfig) {
+	config.jsonOptions = json.JoinOptions(config.jsonOptions, o.options)
+}
+func (o jsonOption) applyLiveValue(config *liveValueConfig) {
+	config.jsonOptions = json.JoinOptions(config.jsonOptions, o.options)
 }
 
 type unaryInterceptorsOption struct {
