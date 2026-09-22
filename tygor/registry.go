@@ -1,10 +1,8 @@
 package tygor
 
 import (
-	"fmt"
 	"log/slog"
 	"net/http"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -177,17 +175,21 @@ func (a *App) Service(name string) *Service {
 
 // serveHTTP handles incoming API requests (internal, called via Handler()).
 func (a *App) serveHTTP(w http.ResponseWriter, req *http.Request) {
+	recovery := &panicRecoveryState{}
+	var rpcCtx *rpcContext
+	var endpoint string
 	defer func() {
 		if rec := recover(); rec != nil {
-			stack := debug.Stack()
-			logger := a.logger
-			if logger == nil {
-				logger = slog.Default()
+			if recovery.isOwned() {
+				panic(rec)
 			}
-			logger.Error("PANIC recovered",
-				slog.Any("panic", rec),
-				slog.String("stack", string(stack)))
-			writeError(w, NewError(CodeInternal, fmt.Sprintf("internal server error (panic): %v", rec)), a.logger)
+			logPanic(a.logger, endpoint, "request handler", rec)
+			panicErr := NewError(CodeInternal, "internal server error")
+			if rpcCtx != nil {
+				handleError(rpcCtx, panicErr)
+				return
+			}
+			writePreparedErrorOwned(recovery, w, prepareErrorResponse(a.errorTransformer, a.maskInternalErrors, panicErr), a.logger)
 		}
 	}()
 
@@ -196,8 +198,8 @@ func (a *App) serveHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Normalize path
 	parts := strings.Split(path, "/")
-	if len(parts) < 2 {
-		writeError(w, NewError(CodeNotFound, "route not found"), a.logger)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		writeError(recovery, w, NewError(CodeNotFound, "route not found"), a.logger)
 		return
 	}
 
@@ -206,20 +208,21 @@ func (a *App) serveHTTP(w http.ResponseWriter, req *http.Request) {
 	// We store keys as "Service.Method" internally to match the Manifest format
 	// But the URL is /Service/Method.
 	key := service + "." + method
+	endpoint = key
 
 	a.mu.RLock()
 	handler, ok := a.routes[key]
 	a.mu.RUnlock()
 
 	if !ok {
-		writeError(w, NewError(CodeNotFound, "route not found"), a.logger)
+		writeError(recovery, w, NewError(CodeNotFound, "route not found"), a.logger)
 		return
 	}
 
 	// Type assert to internal handler interface
 	h, ok := handler.(endpointHandler)
 	if !ok {
-		writeError(w, NewError(CodeInternal, "invalid handler type"), a.logger)
+		writeError(recovery, w, NewError(CodeInternal, "invalid handler type"), a.logger)
 		return
 	}
 
@@ -227,22 +230,23 @@ func (a *App) serveHTTP(w http.ResponseWriter, req *http.Request) {
 	meta := h.metadata()
 	expectedMethod := primitiveToHTTPMethod(meta.Primitive)
 	if req.Method != expectedMethod {
-		writeError(w, Errorf(CodeMethodNotAllowed, "method %s not allowed, expected %s", req.Method, expectedMethod), a.logger)
+		writeError(recovery, w, Errorf(CodeMethodNotAllowed, "method %s not allowed, expected %s", req.Method, expectedMethod), a.logger)
 		return
 	}
 
 	// Create tygor Context with request metadata and config
-	ctx := newContext(req.Context(), w, req, service, method)
-	ctx.errorTransformer = a.errorTransformer
-	ctx.maskInternalErrors = a.maskInternalErrors
-	ctx.interceptors = a.interceptors
-	ctx.logger = a.logger
-	ctx.maxRequestBodySize = a.maxRequestBodySize
-	ctx.streamWriteTimeout = a.getStreamWriteTimeout()
-	ctx.streamHeartbeat = a.getStreamHeartbeat()
+	rpcCtx = newContext(req.Context(), w, req, service, method)
+	rpcCtx.panicRecovery = recovery
+	rpcCtx.errorTransformer = a.errorTransformer
+	rpcCtx.maskInternalErrors = a.maskInternalErrors
+	rpcCtx.interceptors = a.interceptors
+	rpcCtx.logger = a.logger
+	rpcCtx.maxRequestBodySize = a.maxRequestBodySize
+	rpcCtx.streamWriteTimeout = a.getStreamWriteTimeout()
+	rpcCtx.streamHeartbeat = a.getStreamHeartbeat()
 
 	// Execute handler
-	h.serveHTTP(ctx)
+	h.serveHTTP(rpcCtx)
 }
 
 type Service struct {

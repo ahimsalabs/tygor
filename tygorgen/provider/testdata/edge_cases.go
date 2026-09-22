@@ -46,12 +46,23 @@ const (
 	BoolTrue  EnumBool = true
 )
 
-// JSONSpecialTypes demonstrates json.Number and json.RawMessage
+type JSONNumberAlias = json.Number
+type DefinedJSONNumber json.Number
+
+// JSONSpecialTypes demonstrates json.Number and json.RawMessage.
 type JSONSpecialTypes struct {
-	// Number is a json.Number field, should map to string
+	// Number is a json.Number field, which emits a numeric JSON token.
 	Number json.Number `json:"number"`
 	// OptionalNumber is an optional json.Number
 	OptionalNumber json.Number `json:"optional_number,omitempty"`
+	// NumberAsString uses encoding/json's string option.
+	NumberAsString json.Number `json:"number_as_string,string"`
+	// NumberAlias is a true alias of json.Number.
+	NumberAlias JSONNumberAlias `json:"number_alias"`
+	// DefinedNumber is a distinct string-backed type.
+	DefinedNumber DefinedJSONNumber `json:"defined_number"`
+	// NumberMap has string-shaped JSON object keys, not numeric values.
+	NumberMap map[json.Number]string `json:"number_map"`
 	// RawMessage is a json.RawMessage field, should map to any
 	RawMessage json.RawMessage `json:"raw_message"`
 	// OptionalRaw is an optional json.RawMessage

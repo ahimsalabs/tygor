@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"tygor.dev/tygorgen/ir"
+	"tygor.dev/tygorgen/provider/testdata"
+	"tygor.dev/tygorgen/provider/testdata/anona"
+	"tygor.dev/tygorgen/provider/testdata/anonb"
 )
 
 // Test types for comprehensive coverage
@@ -57,13 +60,20 @@ type MapTypes struct {
 	MapOmit   map[string]string `json:"map_omit,omitempty"`
 }
 
+type JSONNumberAlias = json.Number
+type DefinedJSONNumber json.Number
+
 type SpecialTypes struct {
-	Time         time.Time       `json:"time"`
-	Duration     time.Duration   `json:"duration"`
-	JSONNumber   json.Number     `json:"json_number"`
-	RawMessage   json.RawMessage `json:"raw_message"`
-	AnyInterface interface{}     `json:"any"`
-	EmptyStruct  struct{}        `json:"empty"`
+	Time              time.Time              `json:"time"`
+	Duration          time.Duration          `json:"duration"`
+	JSONNumber        json.Number            `json:"json_number"`
+	JSONNumberString  json.Number            `json:"json_number_string,string"`
+	JSONNumberAlias   JSONNumberAlias        `json:"json_number_alias"`
+	DefinedJSONNumber DefinedJSONNumber      `json:"defined_json_number"`
+	JSONNumberMap     map[json.Number]string `json:"json_number_map"`
+	RawMessage        json.RawMessage        `json:"raw_message"`
+	AnyInterface      interface{}            `json:"any"`
+	EmptyStruct       struct{}               `json:"empty"`
 }
 
 type EmbeddedNoTag struct {
@@ -148,9 +158,19 @@ type ConcreteGeneric struct {
 	Response GenericResponse[string] `json:"response"`
 }
 
+type GenericList[T any] []T
+type GenericLookup[T any] map[string]T
+
+type ConcreteGenericContainers struct {
+	List   GenericList[string] `json:"list"`
+	Lookup GenericLookup[int]  `json:"lookup"`
+}
+
 type StringAlias string
 
 type IntAlias int
+
+type reflectionRecursivePointerAlias *reflectionRecursivePointerAlias
 
 type AliasStruct struct {
 	StringAlias StringAlias `json:"string_alias"`
@@ -341,7 +361,11 @@ func TestReflectionProvider_SpecialTypes(t *testing.T) {
 		t.Fatalf("BuildSchema failed: %v", err)
 	}
 
-	structDesc := schema.Types[0].(*ir.StructDescriptor)
+	specialType := findType(schema, "SpecialTypes")
+	structDesc, ok := specialType.(*ir.StructDescriptor)
+	if !ok {
+		t.Fatalf("SpecialTypes should be a StructDescriptor, got %T", specialType)
+	}
 
 	timeField := findField(structDesc.Fields, "Time")
 	primDesc := timeField.Type.(*ir.PrimitiveDescriptor)
@@ -357,8 +381,41 @@ func TestReflectionProvider_SpecialTypes(t *testing.T) {
 
 	jsonNumberField := findField(structDesc.Fields, "JSONNumber")
 	primDesc = jsonNumberField.Type.(*ir.PrimitiveDescriptor)
-	if primDesc.PrimitiveKind != ir.PrimitiveString {
-		t.Errorf("JSONNumber should be PrimitiveString")
+	if primDesc.PrimitiveKind != ir.PrimitiveFloat || primDesc.BitSize != 64 {
+		t.Errorf("JSONNumber should be PrimitiveFloat(64), got %#v", primDesc)
+	}
+
+	jsonNumberStringField := findField(structDesc.Fields, "JSONNumberString")
+	primDesc = jsonNumberStringField.Type.(*ir.PrimitiveDescriptor)
+	if primDesc.PrimitiveKind != ir.PrimitiveFloat || primDesc.BitSize != 64 || !jsonNumberStringField.StringEncoded {
+		t.Errorf("JSONNumberString should be string-encoded PrimitiveFloat(64), got field %#v", jsonNumberStringField)
+	}
+
+	jsonNumberAliasField := findField(structDesc.Fields, "JSONNumberAlias")
+	primDesc = jsonNumberAliasField.Type.(*ir.PrimitiveDescriptor)
+	if primDesc.PrimitiveKind != ir.PrimitiveFloat || primDesc.BitSize != 64 {
+		t.Errorf("JSONNumberAlias should be PrimitiveFloat(64), got %#v", primDesc)
+	}
+
+	jsonNumberMapField := findField(structDesc.Fields, "JSONNumberMap")
+	mapDesc := jsonNumberMapField.Type.(*ir.MapDescriptor)
+	mapKey := mapDesc.Key.(*ir.PrimitiveDescriptor)
+	if mapKey.PrimitiveKind != ir.PrimitiveString {
+		t.Errorf("JSONNumberMap key should be PrimitiveString, got %#v", mapKey)
+	}
+
+	definedNumberField := findField(structDesc.Fields, "DefinedJSONNumber")
+	definedRef, ok := definedNumberField.Type.(*ir.ReferenceDescriptor)
+	if !ok || definedRef.Target.Name != "DefinedJSONNumber" {
+		t.Fatalf("DefinedJSONNumber field should reference DefinedJSONNumber, got %#v", definedNumberField.Type)
+	}
+	definedAlias, ok := findType(schema, "DefinedJSONNumber").(*ir.AliasDescriptor)
+	if !ok {
+		t.Fatal("DefinedJSONNumber should be an AliasDescriptor")
+	}
+	definedUnderlying, ok := definedAlias.Underlying.(*ir.PrimitiveDescriptor)
+	if !ok || definedUnderlying.PrimitiveKind != ir.PrimitiveString {
+		t.Errorf("DefinedJSONNumber should remain string-backed, got %#v", definedAlias.Underlying)
 	}
 
 	rawMessageField := findField(structDesc.Fields, "RawMessage")
@@ -390,9 +447,9 @@ func TestReflectionProvider_Embedding(t *testing.T) {
 		t.Fatalf("BuildSchema failed: %v", err)
 	}
 
-	// Should have 3 types: EmbeddingStruct, EmbeddedNoTag, EmbeddedWithTag
-	if len(schema.Types) != 3 {
-		t.Fatalf("expected 3 types, got %d", len(schema.Types))
+	// The promoted base is flattened; only referenced nested types are extracted.
+	if len(schema.Types) != 2 {
+		t.Fatalf("expected 2 types, got %d", len(schema.Types))
 	}
 
 	var embeddingStruct *ir.StructDescriptor
@@ -407,18 +464,15 @@ func TestReflectionProvider_Embedding(t *testing.T) {
 		t.Fatal("EmbeddingStruct not found")
 	}
 
-	// Check Extends (should have EmbeddedNoTag)
-	if len(embeddingStruct.Extends) != 1 {
-		t.Errorf("expected 1 extended type, got %d", len(embeddingStruct.Extends))
-	} else {
-		if embeddingStruct.Extends[0].Name != "EmbeddedNoTag" {
-			t.Errorf("expected EmbeddedNoTag in Extends, got %s", embeddingStruct.Extends[0].Name)
-		}
+	if len(embeddingStruct.Extends) != 0 {
+		t.Errorf("expected no Extends entries, got %d", len(embeddingStruct.Extends))
 	}
 
-	// Check Fields (should have Nested and OwnField)
-	if len(embeddingStruct.Fields) != 2 {
-		t.Errorf("expected 2 fields, got %d", len(embeddingStruct.Fields))
+	if len(embeddingStruct.Fields) != 3 {
+		t.Errorf("expected 3 fields, got %d", len(embeddingStruct.Fields))
+	}
+	if findField(embeddingStruct.Fields, "EmbeddedField") == nil {
+		t.Error("promoted EmbeddedField not found")
 	}
 
 	nestedField := findField(embeddingStruct.Fields, "Nested")
@@ -678,6 +732,35 @@ func TestReflectionProvider_GenericInstantiation(t *testing.T) {
 
 	if !genericFound {
 		t.Error("GenericResponse type not found")
+	}
+}
+
+func TestReflectionProvider_GenericContainerIdentity(t *testing.T) {
+	provider := &ReflectionProvider{}
+	schema, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{reflect.TypeOf(ConcreteGenericContainers{})},
+	})
+	if err != nil {
+		t.Fatalf("BuildSchema failed: %v", err)
+	}
+	if validationErrors := schema.Validate(); len(validationErrors) != 0 {
+		t.Fatalf("schema validation failed: %v", validationErrors)
+	}
+
+	container := findType(schema, "ConcreteGenericContainers").(*ir.StructDescriptor)
+	for _, fieldName := range []string{"List", "Lookup"} {
+		field := findField(container.Fields, fieldName)
+		ref, ok := field.Type.(*ir.ReferenceDescriptor)
+		if !ok {
+			t.Fatalf("%s should be a ReferenceDescriptor, got %T", fieldName, field.Type)
+		}
+		if strings.ContainsAny(ref.Target.Name, "[]") {
+			t.Errorf("%s reference name was not sanitized: %q", fieldName, ref.Target.Name)
+		}
+		decl := findType(schema, ref.Target.Name)
+		if decl == nil {
+			t.Errorf("%s reference target %q has no declaration", fieldName, ref.Target.Name)
+		}
 	}
 }
 
@@ -1369,7 +1452,10 @@ func TestReflectionProvider_MapKeyTypes_AllIntegers(t *testing.T) {
 func TestReflectionProvider_MapKeyTypes_TextMarshaler(t *testing.T) {
 	provider := &ReflectionProvider{}
 	schema, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{
-		RootTypes: []reflect.Type{reflect.TypeOf(MapKeyTypes{})},
+		RootTypes: []reflect.Type{
+			reflect.TypeOf(MapKeyTypes{}),
+			reflect.TypeFor[testdata.AliasResultTextMap](),
+		},
 	})
 
 	if err != nil {
@@ -1396,6 +1482,23 @@ func TestReflectionProvider_MapKeyTypes_TextMarshaler(t *testing.T) {
 	}
 	if tmField.Type.Kind() != ir.KindMap {
 		t.Errorf("TextMarshalerMap should be KindMap, got %v", tmField.Type.Kind())
+	}
+
+	aliasResultMap, ok := findType(schema, "AliasResultTextMap").(*ir.StructDescriptor)
+	if !ok {
+		t.Fatalf("AliasResultTextMap = %T, want StructDescriptor", findType(schema, "AliasResultTextMap"))
+	}
+	valuesField := findField(aliasResultMap.Fields, "Values")
+	if valuesField == nil {
+		t.Fatalf("AliasResultTextMap.Values = %#v, want map", valuesField)
+	}
+	mapDescriptor, ok := valuesField.Type.(*ir.MapDescriptor)
+	if !ok {
+		t.Fatalf("AliasResultTextMap.Values = %#v, want map", valuesField.Type)
+	}
+	key, ok := mapDescriptor.Key.(*ir.PrimitiveDescriptor)
+	if !ok || key.PrimitiveKind != ir.PrimitiveAny {
+		t.Fatalf("AliasResultTextMap key = %#v, want custom-marshaled unknown", mapDescriptor.Key)
 	}
 }
 
@@ -1476,16 +1579,12 @@ func TestReflectionProvider_EmbeddedPointer(t *testing.T) {
 		t.Fatal("EmbeddingWithPtr not found")
 	}
 
-	// Pointer embedding without tag should be in Extends
-	found := false
-	for _, ext := range embeddingStruct.Extends {
-		if ext.Name == "EmbeddedPtrType" {
-			found = true
-			break
-		}
+	promotedField := findField(embeddingStruct.Fields, "PtrField")
+	if promotedField == nil {
+		t.Fatal("promoted PtrField not found")
 	}
-	if !found {
-		t.Error("EmbeddedPtrType should be in Extends")
+	if !promotedField.Optional {
+		t.Error("field promoted through a pointer embed should be optional")
 	}
 
 	// Pointer embedding with tag should be in Fields
@@ -1536,9 +1635,8 @@ func TestReflectionProvider_MultipleLevelEmbedding(t *testing.T) {
 		t.Fatalf("BuildSchema failed: %v", err)
 	}
 
-	// Should extract all levels: Level1Embed, Level2Embed, Level3Embed
-	if len(schema.Types) < 3 {
-		t.Errorf("expected at least 3 types, got %d", len(schema.Types))
+	if len(schema.Types) != 1 {
+		t.Errorf("expected only the flattened root type, got %d", len(schema.Types))
 	}
 
 	// Find Level1Embed
@@ -1554,16 +1652,10 @@ func TestReflectionProvider_MultipleLevelEmbedding(t *testing.T) {
 		t.Fatal("Level1Embed not found")
 	}
 
-	// Should have Level2Embed in Extends
-	found := false
-	for _, ext := range level1.Extends {
-		if ext.Name == "Level2Embed" {
-			found = true
-			break
+	for _, fieldName := range []string{"L1Field", "L2Field", "L3Field"} {
+		if findField(level1.Fields, fieldName) == nil {
+			t.Errorf("promoted field %s not found", fieldName)
 		}
-	}
-	if !found {
-		t.Error("Level2Embed should be in Level1Embed.Extends")
 	}
 }
 
@@ -1988,6 +2080,137 @@ func TestReflectionProvider_TimeNotCustomMarshaler(t *testing.T) {
 	}
 	if primDesc.PrimitiveKind != ir.PrimitiveTime {
 		t.Errorf("T field: expected PrimitiveTime, got %v", primDesc.PrimitiveKind)
+	}
+}
+
+func TestReflectionProvider_JSONEmbeddingParity(t *testing.T) {
+	tests := []struct {
+		name       string
+		typ        reflect.Type
+		wantFields []string
+		absent     []string
+	}{
+		{name: "equal-depth conflict", typ: reflect.TypeOf(testdata.EqualDepthConflict{}), wantFields: []string{"A", "B", "Own"}, absent: []string{"Clash"}},
+		{name: "tagged dominance", typ: reflect.TypeOf(testdata.TaggedDominance{}), wantFields: []string{"Tagged"}, absent: []string{"Same"}},
+		{name: "options-only embed", typ: reflect.TypeOf(testdata.OptionsOnlyEmbedding{}), wantFields: []string{"Clash", "A"}},
+		{name: "tagged embed", typ: reflect.TypeOf(testdata.TaggedEmbedding{}), wantFields: []string{"ConflictA"}},
+		{name: "scalar embeds", typ: reflect.TypeOf(testdata.ScalarEmbedding{}), wantFields: []string{"EmbeddedString", "EmbeddedInterface"}},
+	}
+
+	provider := &ReflectionProvider{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{RootTypes: []reflect.Type{tt.typ}})
+			if err != nil {
+				t.Fatalf("BuildSchema failed: %v", err)
+			}
+			if validationErrors := schema.Validate(); len(validationErrors) != 0 {
+				t.Fatalf("schema validation failed: %v", validationErrors)
+			}
+			root := findType(schema, tt.typ.Name()).(*ir.StructDescriptor)
+			if len(root.Extends) != 0 {
+				t.Fatalf("provider emitted Extends: %v", root.Extends)
+			}
+			for _, name := range tt.wantFields {
+				if findField(root.Fields, name) == nil {
+					t.Errorf("field %s not found", name)
+				}
+			}
+			for _, name := range tt.absent {
+				if findField(root.Fields, name) != nil {
+					t.Errorf("ambiguous field %s was not omitted", name)
+				}
+			}
+		})
+	}
+
+	t.Run("pointer promotion is optional", func(t *testing.T) {
+		schema, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{
+			RootTypes: []reflect.Type{reflect.TypeOf(testdata.PointerEmbedding{})},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		field := findField(findType(schema, "PointerEmbedding").(*ir.StructDescriptor).Fields, "FromPointer")
+		if field == nil || !field.Optional {
+			t.Fatalf("promoted pointer field = %#v, want optional", field)
+		}
+	})
+}
+
+func TestReflectionProvider_CustomMarshalerRoot(t *testing.T) {
+	provider := &ReflectionProvider{}
+	schema, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{reflect.TypeOf(testdata.MarshaledEnum(0))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias, ok := findType(schema, "MarshaledEnum").(*ir.AliasDescriptor)
+	if !ok || alias.Underlying.(*ir.PrimitiveDescriptor).PrimitiveKind != ir.PrimitiveAny {
+		t.Fatalf("MarshaledEnum = %T, want any alias", findType(schema, "MarshaledEnum"))
+	}
+}
+
+func TestReflectionProvider_JSONWireClassification(t *testing.T) {
+	schema, err := (&ReflectionProvider{}).BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{
+			reflect.TypeOf(testdata.StringEncodingDepths{}),
+			reflect.TypeOf(testdata.DefinedByteSlices{}),
+			reflect.TypeOf(testdata.CustomElementByteSlice{}),
+			reflect.TypeOf(testdata.AliasResultMarshalers{}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONWireClassification(t, schema)
+}
+
+func TestReflectionProvider_OuterPointerToRecursivePointerAliasTerminates(t *testing.T) {
+	type result struct {
+		schema *ir.Schema
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		schema, err := (&ReflectionProvider{}).BuildSchema(context.Background(), ReflectionInputOptions{
+			RootTypes: []reflect.Type{reflect.TypeFor[*reflectionRecursivePointerAlias]()},
+		})
+		done <- result{schema: schema, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		alias, ok := findType(got.schema, "reflectionRecursivePointerAlias").(*ir.AliasDescriptor)
+		if !ok || !got.schema.HasPointerOnlyAliasCycle(alias) {
+			t.Fatalf("recursive reflected alias = %#v, want detected pointer-only cycle", alias)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reflection provider hung on outer pointer to recursive pointer alias")
+	}
+}
+
+func TestReflectionProvider_AnonymousIdentityIncludesPackage(t *testing.T) {
+	schema, err := (&ReflectionProvider{}).BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{reflect.TypeOf(anona.A{}), reflect.TypeOf(anonb.B{})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validationErrors := schema.Validate(); len(validationErrors) != 0 {
+		t.Fatalf("schema validation failed: %v", validationErrors)
+	}
+
+	aField := findField(findType(schema, "A").(*ir.StructDescriptor).Fields, "X")
+	bField := findField(findType(schema, "B").(*ir.StructDescriptor).Fields, "X")
+	aRef := aField.Type.(*ir.ReferenceDescriptor)
+	bRef := bField.Type.(*ir.ReferenceDescriptor)
+	if aRef.Target != bRef.Target || bRef.Target.Package != reflect.TypeOf(anona.A{}).PkgPath() || schema.FindType(bRef.Target) == nil {
+		t.Fatalf("cached anonymous identities = %v and %v, want one resolvable package-qualified identity", aRef.Target, bRef.Target)
 	}
 }
 

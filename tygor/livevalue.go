@@ -1,8 +1,10 @@
 package tygor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"log/slog"
@@ -14,110 +16,108 @@ import (
 	"tygor.dev/internal"
 )
 
+// ErrLiveValueClosed is returned when an update is attempted after Close.
+var ErrLiveValueClosed = errors.New("livevalue closed")
+
 // LiveValue holds a single value that can be read, written, and subscribed to.
 // Updates are broadcast to all subscribers via SSE streaming.
-// Thread-safe for concurrent Get/Set operations.
+// All operations are safe for concurrent use.
 //
 // Unlike event streams, LiveValue represents current state - subscribers always
 // receive the latest value, and intermediate updates may be skipped if
 // a subscriber is slow.
 //
+// LiveValue owns its state as JSON. Values must round-trip through encoding/json.
+// Get and Subscribe decode fresh snapshots, so callers may safely mutate returned
+// values. Go state that JSON does not represent, such as unexported fields and
+// pointer identity, is not preserved, and interface values use encoding/json's
+// default decoded types. Custom JSON codecs must decode deterministically. Inputs
+// may be mutated after NewLiveValue, Set, or Update returns, but not concurrently
+// while that operation is encoding them.
+//
 // Example:
 //
-//	status := tygor.NewLiveValue(&Status{State: "idle"})
+//	status, err := tygor.NewLiveValue(&Status{State: "idle"})
+//	if err != nil {
+//		return err
+//	}
 //
 //	// Read current value
 //	current := status.Get()
 //
 //	// Update and broadcast to all subscribers
-//	status.Set(&Status{State: "running"})
+//	if err := status.Set(&Status{State: "running"}); err != nil {
+//		return err
+//	}
 //
 //	// Register SSE endpoint with proper "livevalue" primitive
 //	svc.Register("Status", status.Handler())
 type LiveValue[T any] struct {
 	mu          sync.RWMutex
-	value       T
-	bytes       json.RawMessage // pre-serialized for efficient broadcast
+	bytes       json.RawMessage
 	subscribers map[int64]chan json.RawMessage
 	nextSubID   int64
 	closed      bool
 }
 
-// NewLiveValue creates a new LiveValue with the given initial value.
-func NewLiveValue[T any](initial T) *LiveValue[T] {
-	a := &LiveValue[T]{
-		value:       initial,
-		subscribers: make(map[int64]chan json.RawMessage),
+// NewLiveValue creates a LiveValue whose initial state is an owned JSON snapshot.
+// It returns an error if initial cannot round-trip through encoding/json.
+func NewLiveValue[T any](initial T) (*LiveValue[T], error) {
+	data, err := encodeLiveValue(initial)
+	if err != nil {
+		return nil, fmt.Errorf("initialize livevalue: %w", err)
 	}
-	// Pre-serialize initial value (ignore error - will be caught on first Set if invalid)
-	a.bytes, _ = json.Marshal(initial)
-	return a
+
+	return &LiveValue[T]{
+		bytes:       data,
+		subscribers: make(map[int64]chan json.RawMessage),
+	}, nil
 }
 
-// Get returns the current value.
+// Get returns a fresh decode of the current JSON snapshot.
 func (a *LiveValue[T]) Get() T {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.value
+	data := a.bytes
+	a.mu.RUnlock()
+	return mustDecodeLiveValue[T](data)
 }
 
 // Set updates the value and broadcasts to all subscribers.
-// The value is serialized once and the same bytes are sent to all subscribers.
-// No-op if the LiveValue has been closed.
-func (a *LiveValue[T]) Set(value T) {
-	// Serialize once before taking lock
-	data, err := json.Marshal(value)
+// The update is rejected without changing state if value cannot round-trip
+// through encoding/json. It returns ErrLiveValueClosed after Close.
+func (a *LiveValue[T]) Set(value T) error {
+	data, err := encodeLiveValue(value)
 	if err != nil {
-		// If serialization fails, still update in-memory value
-		// but don't broadcast (subscribers would get stale data)
-		a.mu.Lock()
-		if !a.closed {
-			a.value = value
-		}
-		a.mu.Unlock()
-		return
+		return fmt.Errorf("set livevalue: %w", err)
 	}
 
-	// Update value and snapshot subscribers
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.closed {
-		a.mu.Unlock()
-		return
+		return ErrLiveValueClosed
 	}
-	a.value = value
-	a.bytes = data
-	subs := make([]chan json.RawMessage, 0, len(a.subscribers))
-	for _, ch := range a.subscribers {
-		subs = append(subs, ch)
-	}
-	a.mu.Unlock()
-
-	// Broadcast outside lock with non-blocking sends
-	for _, ch := range subs {
-		select {
-		case ch <- data:
-			// Delivered
-		default:
-			// Channel full - drain old value and send new (latest-wins)
-			select {
-			case <-ch:
-			default:
-			}
-			select {
-			case ch <- data:
-			default:
-			}
-		}
-	}
+	a.commitLocked(data)
+	return nil
 }
 
 // Update atomically applies fn to the current value.
-// Useful for read-modify-write operations.
-func (a *LiveValue[T]) Update(fn func(T) T) {
+// The callback is invoked exactly once while the LiveValue is locked. It must be
+// short-running and must not call methods on this LiveValue. The update is
+// rejected without changing state if its result cannot round-trip through JSON.
+func (a *LiveValue[T]) Update(fn func(T) T) error {
 	a.mu.Lock()
-	newValue := fn(a.value)
-	a.mu.Unlock()
-	a.Set(newValue)
+	defer a.mu.Unlock()
+	if a.closed {
+		return ErrLiveValueClosed
+	}
+
+	current := mustDecodeLiveValue[T](a.bytes)
+	data, err := encodeLiveValue(fn(current))
+	if err != nil {
+		return fmt.Errorf("update livevalue: %w", err)
+	}
+	a.commitLocked(data)
+	return nil
 }
 
 // Subscribe returns an iterator that yields the current value and all future
@@ -125,27 +125,15 @@ func (a *LiveValue[T]) Update(fn func(T) T) {
 // For use in Go code, not HTTP handlers.
 func (a *LiveValue[T]) Subscribe(ctx context.Context) iter.Seq[T] {
 	return func(yield func(T) bool) {
-		// Send current value
-		a.mu.RLock()
-		current := a.value
-		closed := a.closed
-		a.mu.RUnlock()
-
-		if closed {
+		subID, current, ch, ok := a.registerSubscriber()
+		if !ok {
 			return
-		}
-
-		if !yield(current) {
-			return
-		}
-
-		// Create channel and subscribe
-		ch := make(chan json.RawMessage, 1)
-		subID := a.addSubscriber(ch)
-		if subID < 0 {
-			return // Atom was closed
 		}
 		defer a.removeSubscriber(subID)
+
+		if !yield(mustDecodeLiveValue[T](current)) {
+			return
+		}
 
 		for {
 			select {
@@ -153,13 +141,9 @@ func (a *LiveValue[T]) Subscribe(ctx context.Context) iter.Seq[T] {
 				return
 			case data, ok := <-ch:
 				if !ok {
-					return // Atom was closed
+					return
 				}
-				var val T
-				if err := json.Unmarshal(data, &val); err != nil {
-					continue // Skip malformed data
-				}
-				if !yield(val) {
+				if !yield(mustDecodeLiveValue[T](data)) {
 					return
 				}
 			}
@@ -177,20 +161,27 @@ func (a *LiveValue[T]) Handler() *LiveValueHandler[T] {
 	return &LiveValueHandler[T]{liveValue: a}
 }
 
-// addSubscriber adds a channel to the subscriber list.
-// Returns -1 if the LiveValue has been closed.
-func (a *LiveValue[T]) addSubscriber(ch chan json.RawMessage) int64 {
+func (a *LiveValue[T]) isClosed() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.closed
+}
+
+// registerSubscriber atomically captures the initial state and registers for
+// every later state. The caller must remove a successful registration.
+func (a *LiveValue[T]) registerSubscriber() (int64, json.RawMessage, <-chan json.RawMessage, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.closed {
-		return -1
+		return 0, nil, nil, false
 	}
 
+	ch := make(chan json.RawMessage, 1)
 	id := a.nextSubID
 	a.nextSubID++
 	a.subscribers[id] = ch
-	return id
+	return id, a.bytes, ch, true
 }
 
 // removeSubscriber removes a channel from the subscriber list.
@@ -200,8 +191,31 @@ func (a *LiveValue[T]) removeSubscriber(id int64) {
 	delete(a.subscribers, id)
 }
 
+// commitLocked replaces the current state and queues it for every subscriber.
+// a.mu must be held by the caller. Queue capacity is one: when full, the older
+// pending state is replaced so slow subscribers eventually observe the latest.
+func (a *LiveValue[T]) commitLocked(data json.RawMessage) {
+	a.bytes = data
+	for _, ch := range a.subscribers {
+		select {
+		case ch <- data:
+			continue
+		default:
+		}
+
+		select {
+		case <-ch:
+		default:
+		}
+		// The channel has capacity one and every producer holds a.mu, so the
+		// drain above guarantees room even if the consumer receives concurrently.
+		ch <- data
+	}
+}
+
 // Close signals all subscribers to disconnect and prevents new subscriptions.
-// Safe to call multiple times. After Close, Set is a no-op.
+// Safe to call multiple times. After Close, Set and Update return
+// ErrLiveValueClosed, while Get continues to return the last accepted state.
 func (a *LiveValue[T]) Close() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -218,12 +232,42 @@ func (a *LiveValue[T]) Close() {
 	}
 }
 
+func encodeLiveValue[T any](value T) (json.RawMessage, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("marshal JSON snapshot: %w", err)
+	}
+	if _, err := decodeLiveValue[T](data); err != nil {
+		return nil, fmt.Errorf("decode JSON snapshot: %w", err)
+	}
+	return data, nil
+}
+
+func decodeLiveValue[T any](data json.RawMessage) (T, error) {
+	var value T
+	if err := json.Unmarshal(bytes.Clone(data), &value); err != nil {
+		return value, err
+	}
+	return value, nil
+}
+
+func mustDecodeLiveValue[T any](data json.RawMessage) T {
+	value, err := decodeLiveValue[T](data)
+	if err != nil {
+		// Every stored snapshot was already decoded successfully. A later failure
+		// means a custom codec violated LiveValue's deterministic codec contract.
+		panic(fmt.Sprintf("tygor: decode validated livevalue snapshot: %v", err))
+	}
+	return value
+}
+
 // LiveValueHandler implements [Endpoint] for LiveValue subscriptions.
 // It streams the current value immediately, then pushes updates via SSE.
 type LiveValueHandler[T any] struct {
 	liveValue         *LiveValue[T]
 	interceptors      []UnaryInterceptor
 	writeTimeout      time.Duration
+	writeTimeoutIsSet bool
 	heartbeatInterval time.Duration
 }
 
@@ -234,8 +278,10 @@ func (h *LiveValueHandler[T]) WithUnaryInterceptor(i UnaryInterceptor) *LiveValu
 }
 
 // WithWriteTimeout sets the timeout for writing each event to the client.
+// A zero duration explicitly disables deadlines but still requires flushing.
 func (h *LiveValueHandler[T]) WithWriteTimeout(d time.Duration) *LiveValueHandler[T] {
 	h.writeTimeout = d
+	h.writeTimeoutIsSet = true
 	return h
 }
 
@@ -263,6 +309,20 @@ func (h *LiveValueHandler[T]) metadata() *internal.MethodMetadata {
 
 // serveHTTP implements the SSE streaming for livevalue subscriptions.
 func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
+	state := &streamResponseState{}
+	logger := ctx.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			if state.started {
+				ctx.panicRecovery.claim()
+			}
+			panic(rec)
+		}
+	}()
+
 	// Run unary interceptors for setup (auth, etc.)
 	if len(h.interceptors) > 0 || len(ctx.interceptors) > 0 {
 		allInterceptors := make([]UnaryInterceptor, 0, len(ctx.interceptors)+len(h.interceptors))
@@ -278,68 +338,70 @@ func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 			return
 		}
 	}
-
-	// Check if livevalue is closed before setting up SSE
-	h.liveValue.mu.RLock()
-	current := h.liveValue.bytes
-	closed := h.liveValue.closed
-	h.liveValue.mu.RUnlock()
-
-	if closed {
+	if h.liveValue.isClosed() {
 		handleError(ctx, NewError(CodeUnavailable, "livevalue closed"))
 		return
 	}
 
-	// Set SSE headers
-	ctx.writer.Header().Set("Content-Type", "text/event-stream")
-	ctx.writer.Header().Set("Cache-Control", "no-cache")
-	ctx.writer.Header().Set("Connection", "keep-alive")
-	ctx.writer.Header().Set("X-Accel-Buffering", "no")
-
-	flusher, ok := ctx.writer.(http.Flusher)
-	if !ok {
-		handleError(ctx, NewError(CodeInternal, "streaming not supported"))
-		return
-	}
-	flusher.Flush()
-
-	logger := ctx.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
-	// Determine effective timeouts
 	writeTimeout := ctx.streamWriteTimeout
-	if h.writeTimeout > 0 {
+	if h.writeTimeoutIsSet {
 		writeTimeout = h.writeTimeout
 	}
+	var preflightErr error
+	ctx.panicRecovery.own(func() {
+		preflightErr = preflightSSE(ctx.writer, writeTimeout)
+	})
+	if preflightErr != nil {
+		logger.Error("livevalue preflight failed",
+			slog.String("endpoint", ctx.EndpointID()),
+			slog.Any("error", preflightErr))
+		handleError(ctx, NewError(CodeInternal, "streaming response capabilities not supported"))
+		return
+	}
+
+	// Capture the initial state and register before any network I/O so updates
+	// during the initial write are queued rather than lost.
+	subID, current, ch, ok := h.liveValue.registerSubscriber()
+	if !ok {
+		handleError(ctx, NewError(CodeUnavailable, "livevalue closed"))
+		return
+	}
+	defer h.liveValue.removeSubscriber(subID)
+
+	// Set SSE headers
+	ctx.panicRecovery.own(func() {
+		ctx.writer.Header().Set("Content-Type", "text/event-stream")
+		ctx.writer.Header().Set("Cache-Control", "no-cache")
+		ctx.writer.Header().Set("Connection", "keep-alive")
+		ctx.writer.Header().Set("X-Accel-Buffering", "no")
+	})
+
 	heartbeatInterval := ctx.streamHeartbeat
 	if h.heartbeatInterval > 0 {
 		heartbeatInterval = h.heartbeatInterval
 	}
 
-	var rc *http.ResponseController
-	if writeTimeout > 0 {
-		rc = http.NewResponseController(ctx.writer)
-	}
-
-	if err := h.writeSSEEvent(ctx.writer, current); err != nil {
+	abortTransport := func(message string, err error) {
 		if !isClientDisconnect(err) {
-			logger.Error("failed to write initial livevalue value",
+			logger.Error(message,
 				slog.String("endpoint", ctx.EndpointID()),
 				slog.Any("error", err))
 		}
-		return
+		ctx.panicRecovery.claim()
+		panic(http.ErrAbortHandler)
 	}
-	flusher.Flush()
 
-	// Subscribe for updates
-	ch := make(chan json.RawMessage, 1)
-	subID := h.liveValue.addSubscriber(ch)
-	if subID < 0 {
-		return // LiveValue was closed between check and subscribe
+	if err := state.writeFrame(ctx, writeTimeout, nil); err != nil {
+		if !state.started {
+			handleError(ctx, NewError(CodeInternal, "streaming response setup failed"))
+			return
+		}
+		abortTransport("failed to flush livevalue headers", err)
 	}
-	defer h.liveValue.removeSubscriber(subID)
+
+	if err := state.writeFrame(ctx, writeTimeout, liveValueSSEFrame(current)); err != nil {
+		abortTransport("failed to write initial livevalue value", err)
+	}
 
 	// Set up heartbeat
 	var heartbeat <-chan time.Time
@@ -356,51 +418,25 @@ func (h *LiveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 			return
 
 		case <-heartbeat:
-			if _, err := fmt.Fprint(ctx.writer, ": heartbeat\n\n"); err != nil {
-				if !isClientDisconnect(err) {
-					logger.Error("failed to write heartbeat",
-						slog.String("endpoint", ctx.EndpointID()),
-						slog.Any("error", err))
-				}
-				return
+			if err := state.writeFrame(ctx, writeTimeout, []byte(": heartbeat\n\n")); err != nil {
+				abortTransport("failed to write heartbeat", err)
 			}
-			flusher.Flush()
 
 		case data, ok := <-ch:
 			if !ok {
 				return // LiveValue was closed
 			}
 
-			if rc != nil {
-				if err := rc.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-					logger.Warn("write deadline not supported",
-						slog.String("endpoint", ctx.EndpointID()),
-						slog.Any("error", err))
-					rc = nil
-				}
+			if err := state.writeFrame(ctx, writeTimeout, liveValueSSEFrame(data)); err != nil {
+				abortTransport("failed to write livevalue update", err)
 			}
-
-			if err := h.writeSSEEvent(ctx.writer, data); err != nil {
-				if !isClientDisconnect(err) {
-					logger.Error("failed to write livevalue update",
-						slog.String("endpoint", ctx.EndpointID()),
-						slog.Any("error", err))
-				}
-				return
-			}
-
-			if rc != nil {
-				rc.SetWriteDeadline(time.Time{})
-			}
-			flusher.Flush()
 		}
 	}
 }
 
-// writeSSEEvent writes a pre-serialized value as an SSE event.
-func (h *LiveValueHandler[T]) writeSSEEvent(w http.ResponseWriter, data json.RawMessage) error {
-	// Wrap in response envelope: {"result": <data>}
-	// Since data is already JSON, we construct the envelope manually
-	_, err := fmt.Fprintf(w, "data: {\"result\":%s}\n\n", data)
-	return err
+func liveValueSSEFrame(data json.RawMessage) []byte {
+	frame := make([]byte, 0, len(data)+len("data: {\"result\":}\n\n"))
+	frame = append(frame, "data: {\"result\":"...)
+	frame = append(frame, data...)
+	return append(frame, "}\n\n"...)
 }

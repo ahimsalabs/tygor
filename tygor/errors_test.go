@@ -273,7 +273,7 @@ func TestWriteError(t *testing.T) {
 	svcErr := NewError(CodeNotFound, "resource not found")
 	w := httptest.NewRecorder()
 
-	writeError(w, svcErr, nil)
+	writeError(&panicRecoveryState{}, w, svcErr, nil)
 
 	tygortest.AssertStatus(t, w, http.StatusNotFound)
 	tygortest.AssertHeader(t, w, "Content-Type", "application/json")
@@ -306,7 +306,7 @@ func TestWriteError_EncodingFailure(t *testing.T) {
 		Level: slog.LevelError,
 	}))
 
-	writeError(w, svcErr, logger)
+	writeError(&panicRecoveryState{}, w, svcErr, logger)
 
 	// Verify error was logged
 	logOutput := buf.String()

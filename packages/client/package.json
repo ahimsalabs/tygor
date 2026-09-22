@@ -2,23 +2,20 @@
   "name": "@tygor/client",
   "version": "0.8.6",
   "description": "TypeScript runtime client for tygor RPC framework",
-  "main": "./runtime.js",
-  "types": "./runtime.d.ts",
+  "main": "./dist/runtime.js",
+  "types": "./dist/runtime.d.ts",
   "type": "module",
   "exports": {
     ".": {
-      "types": "./runtime.d.ts",
-      "import": "./runtime.js"
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
     }
   },
   "files": [
-    "runtime.js",
-    "runtime.d.ts",
-    "runtime.d.ts.map",
-    "generated/"
+    "dist/"
   ],
   "scripts": {
-    "build": "bunx tsc",
+    "build": "bun x typescript",
     "prepublishOnly": "bun run build"
   },
   "keywords": [

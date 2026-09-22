@@ -254,7 +254,7 @@ Both providers MUST satisfy the following requirements. Requirements specific to
 1. Providers MUST extract struct field names and types. Source provider uses `go/types`; reflection provider uses `reflect`.
 2. Providers MUST extract struct tag values (json, validate, etc.).
 3. Providers MUST NOT emit duplicate types to `Schema.Types`.
-4. Providers MUST use the package path and type name to construct `GoIdentifier` values. For generic instantiations, providers MUST apply the synthetic naming algorithm (§3.4).
+4. Providers MUST use the full package path and type name to construct `GoIdentifier` values. Source-provider references to generic instantiations MUST target the generic declaration and carry `ReferenceDescriptor.TypeArguments`. Reflection-provider instantiations MUST apply the synthetic naming algorithm (§3.4).
 5. **Source provider only**: MUST extract documentation comments for types and fields.
 6. **Reflection provider only**: MUST represent generic types as their instantiated form (e.g., `Response[User]` becomes a concrete type with `User` substituted).
 
@@ -267,7 +267,7 @@ Both providers MUST satisfy the following requirements. Requirements specific to
 | `time.Duration` | `PrimitiveDuration` | int64 nanoseconds in JSON |
 | `interface{}`, `any` | `PrimitiveAny` | Empty interface |
 | `uintptr` | `PrimitiveUint` | Encoded as unsigned integer |
-| `json.Number` | `PrimitiveString` | Serializes as raw JSON number |
+| `json.Number` | `PrimitiveFloat` (64-bit) | Serializes as raw JSON number |
 | `json.RawMessage` | `PrimitiveAny` | Embeds raw JSON content |
 
 #### 3.3.3 Interface Handling
@@ -303,7 +303,7 @@ Providers MUST return an error when encountering:
 
 Generic type handling differs between providers:
 
-**Source Provider:** Has access to type parameters and can preserve generic definitions. The provider MUST emit generic types with their type parameters preserved (e.g., `Response<T>`). This enables generators to produce generic output in target languages that support generics.
+**Source Provider:** Has access to type parameters and preserves generic definitions (e.g., `Response<T>`). A use such as `Response<User>` is a reference to `Response` whose `TypeArguments` contains a reference to `User`. This keeps declaration and application identities consistent and enables generators to produce generic output in target languages that support generics.
 
 **Reflection Provider:** Only sees generic types after type arguments have been substituted. For example:
 
@@ -332,7 +332,7 @@ Generators MUST accept whatever name the provider produces in `GoIdentifier.Name
 
 **Synthetic Name Algorithm for Generic Instantiations:**
 
-Providers MUST use the following algorithm to generate synthetic names for generic type instantiations:
+The reflection provider MUST use the following algorithm to generate synthetic names for generic type instantiations:
 
 ```
 SyntheticGenericName(baseName string, typeArgs []string) string:
@@ -360,14 +360,14 @@ SyntheticGenericName(baseName string, typeArgs []string) string:
 | `Pair[*Foo, Bar]` | `Pair_PtrFoo_Bar` |
 
 This algorithm ensures:
-1. Consistent naming across providers
+1. Consistent naming for reflection-provider instantiations
 2. Valid Go identifiers (no brackets, dots, or special characters)
 3. Deterministic output for the same input
 4. Readable names that preserve type argument information
 
 **Recursive Generic Cycle Detection:**
 
-Providers MUST detect and handle recursive generic type instantiation to avoid infinite expansion. A recursive generic cycle occurs when instantiating a generic type leads back to an instantiation of itself with different type arguments.
+Providers that monomorphize generic types MUST detect and handle recursive generic type instantiation to avoid infinite expansion. A recursive generic cycle occurs when instantiating a generic type leads back to an instantiation of itself with different type arguments. The source provider preserves generic definitions and applied references instead of recursively expanding them.
 
 Example:
 
@@ -383,9 +383,9 @@ When extracting `Container[string]`, the provider encounters:
 2. `Container[Container[string]]` → field `Nested` has type `*Container[Container[Container[string]]]`
 3. This continues infinitely...
 
-Providers MUST:
+Monomorphizing providers MUST:
 1. Track the set of generic instantiations currently being expanded (the "expansion stack")
-2. When encountering a type reference that would create an infinite expansion, emit a `TypeRefDescriptor` pointing to the base generic type name
+2. When encountering a type reference that would create an infinite expansion, emit a `ReferenceDescriptor` pointing to the base generic type name
 3. SHOULD emit a warning when a recursive generic cycle is detected
 
 This allows generators to produce valid output while alerting users to potentially problematic type definitions. Note that such types may still be useful at runtime with careful construction.
@@ -535,7 +535,7 @@ type StructDescriptor struct {
     Name           GoIdentifier
     TypeParameters []TypeParameterDescriptor // Generic type parameters (source provider only)
     Fields         []FieldDescriptor
-    Extends        []GoIdentifier  // Embedded types without json tags (inheritance)
+    Extends        []GoIdentifier  // Explicit producer-defined inheritance
     Documentation  Documentation
     Source         Source
 }
@@ -607,19 +607,23 @@ type FieldDescriptor struct {
 
 **Embedding Rules:**
 
-The schema builder splits embedded struct fields based on json tag presence:
+Go providers MUST emit the effective `encoding/json` field set in `Fields`.
+They leave `Extends` empty because target-language inheritance cannot represent
+Go's depth, tag-dominance, conflict, or nil embedded-pointer behavior exactly.
+`Extends` remains available to other IR producers that intentionally model
+explicit inheritance.
 
-| Embedded Field | JSON Tag | Result |
-|----------------|----------|--------|
-| `Bar` | none | Added to `Extends` |
-| `*Bar` | none | Added to `Extends` (pointer dereferenced) |
-| `Bar` | `json:"bar"` | Added to `Fields` with `JSONName: "bar"` |
-| `Bar` | `json:"-"` | Skipped entirely (not in `Extends` or `Fields`) |
+| Embedded Field | JSON Tag | Provider Result |
+|----------------|----------|-----------------|
+| `Bar` | none | Promote the dominant JSON-visible fields from `Bar` into `Fields` |
+| `*Bar` | none | Promote dominant fields and mark them optional |
+| `Bar` | `json:"bar"` | Add `Bar` as a regular field with `JSONName: "bar"` |
+| named scalar or interface | none | Add it as a regular field using the embedded type name |
+| any embedded field | `json:"-"` | Skip it entirely |
 
-This matches Go's `encoding/json` marshaling semantics:
-- No tag: embedded fields are flattened (inheritance)
-- Named tag: embedded field becomes a nested object
-- Skip tag: embedded field is excluded from serialization
+Providers MUST recursively extract named dependencies referenced by selected
+fields. An untagged embedded struct is not itself a wire dependency after its
+effective fields have been flattened.
 
 **Nil Embedded Pointers:**
 
@@ -638,7 +642,8 @@ type Inner struct {
 // With Inner non-nil: {"field":"inner_value","own":"value"}
 ```
 
-This is a runtime behavior. For type generation, providers emit the embedded fields as if they were present (via `Extends`). Generators MAY note that fields from pointer-embedded structs can be absent at runtime, but this is typically left to runtime validation.
+Providers represent this behavior by setting `Optional=true` on every field
+promoted through a pointer-embedded path.
 
 **Embedded Field Name Conflicts:**
 
@@ -655,7 +660,7 @@ type B struct { Field string `json:"x"` }
 type Outer struct { A; B }  // "x" is omitted due to ambiguity
 ```
 
-Providers SHOULD return an error when detecting same-depth field name conflicts, as this usually indicates a design issue. Alternatively, providers MAY accept a configuration option to choose a disambiguation strategy (e.g., prefer first, prefer tagged).
+Providers MUST omit unresolved same-depth conflicts, matching `encoding/json`.
 
 **TypeScript Output Example:**
 
@@ -665,11 +670,16 @@ type Foo struct {
     Bar
     Baz `json:"baz"`
 }
+
+type Bar struct {
+    ID string `json:"id"`
+}
 ```
 
 Generates:
 ```typescript
-export interface Foo extends Bar {
+export interface Foo {
+    readonly id: string;
     readonly baz: Baz;
 }
 ```
@@ -820,11 +830,11 @@ func (d *PrimitiveDescriptor) Kind() DescriptorKind { return KindPrimitive }
 
 // ArrayDescriptor represents an ordered collection (slice or fixed-length array).
 //
-// Nullability: Go slices (Length == 0) can be nil, which serializes to JSON null.
+// Nullability: Go slices can be nil, which serializes to JSON null.
 // This is NOT represented with PtrDescriptor; instead, generators derive nullability
 // from context:
 // - If Optional=false: field: T[] | null (always present, can be null)
-// - If Optional=true: field?: T[] (optional, never null when present)
+// - If Optional=true: field?: T[] | null (optional and nullable are independent)
 // See §4.9 for the complete decision tree.
 //
 // Note: [N]byte fixed arrays serialize as JSON arrays of numbers, NOT base64.
@@ -833,9 +843,13 @@ type ArrayDescriptor struct {
     exprBase
     Element TypeDescriptor
 
-    // Length is 0 for slices ([]T), or >0 for fixed-length arrays ([N]T).
+    // Length is 0 for slices and [0]T arrays, or positive for [N]T.
     // Generators MAY emit tuples for fixed arrays in languages that support them.
     Length int
+
+    // IsArray explicitly marks a fixed array, including [0]T. For compatibility,
+    // descriptors with Length > 0 are arrays even when this field is false.
+    IsArray bool
 }
 
 func (d *ArrayDescriptor) Kind() DescriptorKind { return KindArray }
@@ -846,7 +860,7 @@ func (d *ArrayDescriptor) Kind() DescriptorKind { return KindArray }
 // This is NOT represented with PtrDescriptor; instead, generators derive nullability
 // from context:
 // - If Optional=false: field: Record<K,V> | null (always present, can be null)
-// - If Optional=true: field?: Record<K,V> (optional, never null when present)
+// - If Optional=true: field?: Record<K,V> | null (optional and nullable are independent)
 // See §4.9 for the complete decision tree.
 type MapDescriptor struct {
     exprBase
@@ -905,6 +919,11 @@ Generators that support branded types SHOULD preserve string-based alias keys. G
 type ReferenceDescriptor struct {
     exprBase
     Target GoIdentifier
+
+    // TypeArguments contains the arguments for a generic application. Arguments
+    // may include type parameters declared by the containing type. It is empty
+    // only for references to non-generic declarations.
+    TypeArguments []TypeDescriptor
 }
 
 func (d *ReferenceDescriptor) Kind() DescriptorKind { return KindReference }
@@ -912,7 +931,7 @@ func (d *ReferenceDescriptor) Kind() DescriptorKind { return KindReference }
 // PtrDescriptor represents a Go pointer type (*T).
 // The TypeScript output depends on field context (see §4.9):
 // - If Optional=false: field: T | null (always present, can be null)
-// - If Optional=true: field?: T (optional, never null when present)
+// - If Optional=true: field?: T | null (optional and nullable are independent)
 type PtrDescriptor struct {
     exprBase
     Element TypeDescriptor
@@ -1336,7 +1355,7 @@ Go's `encoding/json` accepts and produces JSON based on field type and struct ta
 For each field, determine two independent boolean properties:
 
 1. **Optional** (`?:`): True if `FieldDescriptor.Optional` is true (i.e., `omitempty` or `omitzero` tag is present)
-2. **Nullable** (`| null`): True if the field's IR type is `*PtrDescriptor`, `*ArrayDescriptor`, or `*MapDescriptor`
+2. **Nullable** (`| null`): True for pointers, slices (`ArrayDescriptor.IsSlice()`), maps, and `PrimitiveBytes` (`[]byte`); fixed arrays are not nullable
 
 Then emit the field according to this table:
 
@@ -1498,7 +1517,8 @@ type FilesystemSink struct {
     Mode os.FileMode
 
     // Overwrite controls behavior for existing files.
-    // If false, returns an error when a file exists.
+    // If false, publication is create-only and any existing path is an error,
+    // even when its content is identical.
     Overwrite bool
 }
 
@@ -1510,7 +1530,9 @@ func (s *FilesystemSink) WriteFile(ctx context.Context, path string, content []b
 
 1. The sink MUST create parent directories as needed.
 2. The sink MUST reject paths that escape the root via `..` traversal.
-3. The sink SHOULD perform atomic writes (write to temp file, then rename). On platforms where atomic rename is not supported, the sink MAY write directly.
+3. With `Overwrite=true`, the sink SHOULD publish complete files with a same-directory temporary file and rename. Replacement atomicity follows the host filesystem's rename semantics.
+4. With `Overwrite=false`, publication MUST be create-only across concurrent sink instances and processes: exactly one writer may create an absent path, and no writer may replace an existing path.
+5. These publication guarantees do not imply crash durability. The standard filesystem sink does not `fsync` file contents or parent-directory metadata.
 
 #### 5.3.2 Memory Sink
 
@@ -1830,7 +1852,7 @@ type TypeMatcher struct {
 
 | Go Type | TypeScript | Zod | JSON Schema |
 |---------|------------|-----|-------------|
-| `json.Number` | `string` | `z.string()` | `string` (see note) |
+| `json.Number` | `number` | `z.number()` | `number` (see note) |
 | `json.RawMessage` | `unknown` | `z.unknown()` | `{}` |
 | `map[string]T` | `Record<string, T>` | `z.record(z.string(), T)` | `object` |
 | `[]T` | `T[]` (or `T[] \| null`, see §4.9) | `z.array(T)` | `array` |
@@ -1847,7 +1869,7 @@ type TypeMatcher struct {
 
 **General notes:**
 - `time.Duration` serializes as an integer representing nanoseconds. Values up to ~104 days fit within JavaScript's `Number.MAX_SAFE_INTEGER` (2^53-1). Beyond that, sub-microsecond precision is lost, which is rarely a concern at such timescales. Generators MAY emit a branded type (e.g., `type Duration = number & { __brand: "Duration" }`) for additional type safety.
-- `json.Number` is a Go type (`type Number string`) that serializes as a raw JSON number, not a quoted string. It's used to preserve numeric precision. At the type level, treat it as a string; at runtime, the JSON wire format is a number. Empty `json.Number` values become `0`.
+- `json.Number` serializes as a raw JSON number, so generators model its wire value as a number. JavaScript consumers can still lose precision or range when parsing values beyond IEEE-754; APIs requiring lexical preservation should use an explicitly string-encoded type.
 - `uintptr` is encoded identically to other unsigned integers by `encoding/json`.
 - `json.RawMessage` is a `[]byte` type that embeds raw JSON content directly without encoding. It is treated as `PrimitiveAny` in the IR.
 - `struct{}` (empty struct) serializes as `{}` (empty JSON object). With `omitzero`, empty struct fields are omitted; with `omitempty`, they are NOT omitted (structs are never considered "empty" for `omitempty` purposes).
@@ -1985,9 +2007,9 @@ Numeric types carry a `BitSize` field (0, 8, 16, 32, 64) rather than separate `P
 
 ### Synthetic Names for Generics
 
-`GoIdentifier.Name` is always a valid Go identifier (`[A-Za-z_][A-Za-z0-9_]*`). For generic instantiations like `Response[User]`, providers apply the synthetic naming algorithm (§3.4) to produce `Response_User`. This ensures generators don't need special-case handling for brackets or dots.
+`GoIdentifier.Name` is always a valid Go identifier (`[A-Za-z_][A-Za-z0-9_]*`). The reflection provider applies the synthetic naming algorithm (§3.4) to an instantiation such as `Response[User]`, producing `Response_User`. The source provider retains `Response` as the declaration identity and carries `User` in `ReferenceDescriptor.TypeArguments`.
 
-**Tradeoff**: Names are less readable than `Response<User>`, but universally safe across target languages.
+**Tradeoff**: Reflection's synthetic names are less readable than `Response<User>`, but universally safe across target languages.
 
 ### Source Provider as Primary
 

@@ -16,9 +16,9 @@ export interface AppStatus {
  */
 export interface DiscoverySchema {
   Package: PackageInfo;
-  Types?: TypeDescriptor[];
-  Services?: ServiceDescriptor[];
-  Warnings?: Warning[];
+  Types: TypeDescriptor[] | null;
+  Services: ServiceDescriptor[] | null;
+  Warnings?: Warning[] | null;
 }
 /**
  * Documentation holds doc comments.
@@ -27,7 +27,7 @@ export interface DiscoverySchema {
 export interface Documentation {
   Summary?: string;
   Body?: string;
-  Deprecated?: string;
+  Deprecated?: string | null;
 }
 /**
  * EndpointDescriptor describes an RPC endpoint.
@@ -38,8 +38,8 @@ export interface EndpointDescriptor {
   fullName: string;
   primitive: string;
   path: string;
-  request?: TypeRef;
-  response?: TypeRef;
+  request?: TypeRef | null;
+  response?: TypeRef | null;
   doc?: string;
 }
 /**
@@ -95,7 +95,7 @@ export interface GetSourceRequest {
 export interface GetSourceResponse {
   file: string;
   language: string;
-  lines?: SourceLine[];
+  lines: SourceLine[] | null;
   context: number /* int */;
 }
 /**
@@ -114,10 +114,10 @@ export interface GetStatusResponse {
   port?: number /* int */;
   error?: string;
   phase?: string;
-  command?: string;
+  command: string | null;
   cwd?: string;
-  exitCode?: number /* int */;
-  rawrData?: string[];
+  exitCode: number /* int */ | null;
+  rawrData?: string[] | null;
 }
 /**
  * GoIdentifier is a fully-qualified Go type name.
@@ -141,7 +141,7 @@ export interface PackageInfo {
  * @see tygor.dev/cmd/tygor/internal/dev/dev.go#ReloadRequest
  */
 export interface ReloadRequest {
-  files?: string[];
+  files?: string[] | null;
   reason?: string;
 }
 /**
@@ -156,7 +156,7 @@ export interface ReloadResponse {
  */
 export interface ServiceDescriptor {
   name: string;
-  endpoints?: EndpointDescriptor[];
+  endpoints: EndpointDescriptor[] | null;
   doc?: string;
 }
 /**
@@ -185,13 +185,13 @@ export interface SourceLocation {
 export interface TypeDescriptor {
   kind: string;
   Name: GoIdentifier;
-  TypeParameters?: TypeParameter[];
-  Fields?: FieldDescriptor[];
-  Members?: EnumMember[];
-  Underlying?: TypeRef;
-  Extends?: GoIdentifier[];
-  Documentation?: Documentation;
-  Source?: SourceLocation;
+  TypeParameters?: TypeParameter[] | null;
+  Fields?: FieldDescriptor[] | null;
+  Members?: EnumMember[] | null;
+  Underlying?: TypeRef | null;
+  Extends?: GoIdentifier[] | null;
+  Documentation?: Documentation | null;
+  Source?: SourceLocation | null;
 }
 /**
  * TypeParameter describes a generic type parameter.
@@ -200,7 +200,7 @@ export interface TypeDescriptor {
 export interface TypeParameter {
   kind: string;
   paramName: string;
-  constraint?: TypeRef;
+  constraint?: TypeRef | null;
 }
 /**
  * TypeRef is a reference to a type (used in fields, requests, responses).
@@ -213,13 +213,13 @@ export interface TypeRef {
   bitSize?: number /* int */;
   name?: string;
   "package"?: string;
-  element?: TypeRef;
+  element?: TypeRef | null;
   length?: number /* int */;
-  key?: TypeRef;
-  value?: TypeRef;
-  types?: TypeRef[];
+  key?: TypeRef | null;
+  value?: TypeRef | null;
+  types?: TypeRef[] | null;
   paramName?: string;
-  constraint?: TypeRef;
+  constraint?: TypeRef | null;
 }
 /**
  * UpdateStatusRequest is sent by vite plugin to update app status.

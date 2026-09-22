@@ -77,33 +77,6 @@ func TestTypeScriptGenerator_Generate_EnumDefaultStyle(t *testing.T) {
 	}
 }
 
-func TestEmitter_PrefixTypeReferences_ComplexCases(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{"simple type", "User", "types.User"},
-		{"array type", "User[]", "types.User[]"},
-		{"primitive", "string", "string"},
-		{"Record with user type", "Record<string, User>", "Record<string, types.User>"},
-		{"union with null", "User | null", "types.User | null"},
-		{"generic type", "Response<User>", "types.Response<types.User>"},
-		{"nested generics", "Response<Array<User>>", "types.Response<Array<types.User>>"},
-		{"multiple types in union", "User | Admin | null", "types.User | types.Admin | null"},
-		{"array of generic", "Response<User>[]", "types.Response<types.User>[]"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := prefixTypeReferences(tt.input, "types.")
-			if result != tt.expected {
-				t.Errorf("prefixTypeReferences(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestTypeScriptGenerator_Generate_UseInterfaceNoExtends(t *testing.T) {
 	// Test interface generation when UseInterface is explicitly true with no extends
 	schema := &ir.Schema{

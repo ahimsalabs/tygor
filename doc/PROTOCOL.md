@@ -46,6 +46,8 @@ The HTTP endpoint for an operation MUST be constructed as:
 - `POST /Users/Create`
 
 Path segments are case-sensitive and MUST match the service and method names exactly.
+The path MUST contain exactly two non-empty segments. A trailing slash, repeated
+slash, or any additional segment is not equivalent to the registered operation.
 
 ### 3.2 HTTP Methods
 
@@ -85,7 +87,15 @@ GET /News/List?limit=10&offset=0&tags=tech&tags=go
 **Request Encoding:**
 - Request parameters MUST be encoded as JSON in the request body
 - Content-Type header MUST be `application/json`
-- An empty request body MUST be treated as equivalent to `{}` (empty object)
+- An empty request body MUST leave the request at its Go zero value; normal
+  request validation still applies. For a pointer request this is distinct from
+  `{}`, which allocates the pointed-to value.
+- A non-empty body MUST contain exactly one JSON value. Trailing JSON values or
+  non-whitespace data MUST be rejected; trailing JSON whitespace is allowed.
+- JSON `null` follows Go's `encoding/json` semantics. In particular, it leaves
+  a pointer request nil, which normal request validation rejects as an invalid
+  argument. The `tygor.Empty` request type intentionally accepts empty, `null`,
+  and `{}` bodies.
 
 **Example:**
 ```

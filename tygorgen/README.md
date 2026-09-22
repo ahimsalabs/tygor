@@ -97,8 +97,8 @@ tygorgen.FromApp(app).
 	WithFlavor(tygorgen.FlavorZodMini). // Or use zod/mini for smaller bundles
 	SingleFile().                       // All types in one file
 	EnumStyle("enum").                  // "union" | "enum" | "const"
-	OptionalType("null").               // "undefined" | "null"
-	TypeMapping("time.Time", "Date").   // Custom type mappings
+	OptionalType("null").               // "default" | "undefined" | "null"
+	TypeMapping("time.Time", "string"). // Keep mappings compatible with Zod wire schemas
 	PreserveComments("types").          // "default" | "types" | "none"
 	ToDir("./client/src/rpc")
 ```

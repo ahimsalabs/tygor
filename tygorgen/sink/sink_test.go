@@ -422,6 +422,12 @@ func TestFilesystemSink(t *testing.T) {
 		if !strings.Contains(err.Error(), "already exists") {
 			t.Errorf("WriteFile() error = %v, want error containing 'already exists'", err)
 		}
+
+		// Create-only behavior does not special-case identical content.
+		err = sink.WriteFile(ctx, "test.txt", []byte("first"))
+		if err == nil || !strings.Contains(err.Error(), "already exists") {
+			t.Errorf("identical WriteFile() error = %v, want already exists", err)
+		}
 	})
 
 	t.Run("rejects absolute paths", func(t *testing.T) {
@@ -540,6 +546,43 @@ func TestFilesystemSink_Concurrent(t *testing.T) {
 		if strings.HasSuffix(entry.Name(), ".tmp") || strings.HasPrefix(entry.Name(), ".tygor-") {
 			t.Errorf("Found temp file after concurrent writes: %s", entry.Name())
 		}
+	}
+}
+
+func TestFilesystemSink_CreateOnlyConcurrentPublication(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := context.Background()
+	const writers = 32
+
+	start := make(chan struct{})
+	results := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		go func(id int) {
+			<-start
+			s := NewFilesystemSink(tmpDir)
+			s.Overwrite = false
+			results <- s.WriteFile(ctx, "winner.txt", []byte{byte(id)})
+		}(i)
+	}
+	close(start)
+
+	successes := 0
+	for range writers {
+		if err := <-results; err == nil {
+			successes++
+		} else if !strings.Contains(err.Error(), "already exists") {
+			t.Errorf("unexpected publication error: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful publishers = %d, want exactly 1", successes)
+	}
+	content, err := os.ReadFile(filepath.Join(tmpDir, "winner.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content) != 1 {
+		t.Fatalf("published content length = %d, want 1", len(content))
 	}
 }
 

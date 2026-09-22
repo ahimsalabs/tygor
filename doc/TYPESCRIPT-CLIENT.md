@@ -758,15 +758,15 @@ The Go server's `tygorgen.Config` affects the generated TypeScript types. Here's
 ```go
 // Go configuration (default)
 tygorgen.FromApp(app).
-    OptionalType("undefined").
+    OptionalType("default").
     ToDir("./client/src/rpc")
 ```
 
 ```typescript
 // Generated TypeScript
 export interface UpdateUserParams {
-  name?: string;      // string | undefined
-  email?: string;     // string | undefined
+  name?: string | null;
+  email?: string | null;
 }
 ```
 
@@ -785,7 +785,8 @@ export interface UpdateUserParams {
 }
 ```
 
-**Recommendation:** Use `"undefined"` (default) for better JSON semantics.
+The default models omission and JSON `null` independently. Use `"undefined"` or
+`"null"` only when the application deliberately narrows that wire contract.
 
 ### 9.2 Enum Style
 

@@ -10,7 +10,10 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"golang.org/x/tools/go/packages"
 	"tygor.dev/tygorgen/ir"
@@ -30,6 +33,17 @@ func normalizePkgPath(pkg *types.Package) string {
 		return "main"
 	}
 	return pkg.Path()
+}
+
+func isJSONNumberType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	named, ok := types.Unalias(t).(*types.Named)
+	if !ok || named.Obj() == nil || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Pkg().Path() == "encoding/json" && named.Obj().Name() == "Number"
 }
 
 // RootType identifies a type to extract with its package context.
@@ -52,9 +66,34 @@ type SourceInputOptions struct {
 	RootTypes []RootType
 }
 
+// TypeExpressionResolver converts a reflected Go type expression into its
+// source-derived wire descriptor. currentPackage is the package identity used
+// for unqualified named types in expression.
+type TypeExpressionResolver func(expression, currentPackage string) (ir.TypeDescriptor, error)
+
 // BuildSchema analyzes source code and returns a Schema.
 // The provider recursively extracts all types reachable from RootTypes.
 func (p *SourceProvider) BuildSchema(ctx context.Context, opts SourceInputOptions) (*ir.Schema, error) {
+	schema, _, err := p.BuildSchemaWithResolver(ctx, opts)
+	return schema, err
+}
+
+// BuildSchemaWithResolver analyzes source code and also returns a resolver
+// backed by the same loaded go/types packages. The resolver is used for
+// concrete generic endpoint arguments whose reflected spelling does not retain
+// enough information to determine encoding/json wire behavior.
+func (p *SourceProvider) BuildSchemaWithResolver(ctx context.Context, opts SourceInputOptions) (*ir.Schema, TypeExpressionResolver, error) {
+	builder, err := p.buildSchema(ctx, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	resolver := func(expression, currentPackage string) (ir.TypeDescriptor, error) {
+		return builder.resolveTypeExpression(expression, currentPackage)
+	}
+	return builder.schema, resolver, nil
+}
+
+func (p *SourceProvider) buildSchema(ctx context.Context, opts SourceInputOptions) (*schemaBuilder, error) {
 	if len(opts.Packages) == 0 {
 		return nil, fmt.Errorf("no packages specified")
 	}
@@ -98,27 +137,11 @@ func (p *SourceProvider) BuildSchema(ctx context.Context, opts SourceInputOption
 		typeNames:      make(map[string]bool),
 	}
 
-	// Populate package info from first INPUT package (not first loaded package)
-	// packages.Load returns packages in dependency order, not input order
-	var mainPkg *packages.Package
-	firstInput := opts.Packages[0]
-	for _, pkg := range pkgs {
-		// "." is special: packages.Load(".") returns the package with its real path,
-		// not ".". So we match on "." by finding a package whose directory matches cwd,
-		// or just take the first non-dependency package.
-		if firstInput == "." {
-			// For ".", use the first package that was explicitly requested
-			// packages.Load returns requested packages first, then dependencies
-			mainPkg = pkg
-			break
-		}
-		if pkg.PkgPath == firstInput {
-			mainPkg = pkg
-			break
-		}
-	}
-	if mainPkg == nil {
-		return nil, fmt.Errorf("input package %s not found in loaded packages", firstInput)
+	// Resolve the selector through the loaded package metadata. Package patterns
+	// such as "." and "./api" are selectors, not canonical package identities.
+	mainPkg, err := builder.resolvePackage(opts.Packages[0])
+	if err != nil {
+		return nil, err
 	}
 	// Get the actual directory from the package's files
 	pkgDir := mainPkg.PkgPath // fallback to package path
@@ -146,7 +169,7 @@ func (p *SourceProvider) BuildSchema(ctx context.Context, opts SourceInputOption
 		}
 	}
 
-	return builder.schema, nil
+	return builder, nil
 }
 
 // schemaBuilder accumulates types and manages the extraction process.
@@ -166,21 +189,211 @@ type enumConstant struct {
 	obj   *types.Const // Store the const object for doc extraction
 }
 
-// extractRootType finds and extracts a named type by name and package.
-func (b *schemaBuilder) extractRootType(root RootType) error {
-	for _, pkg := range b.pkgs {
-		// If package is specified, only look in that package
-		// Special case: "main" from reflect matches any package named "main"
-		if root.Package != "" {
-			if root.Package == "main" {
-				if pkg.Name != "main" {
-					continue
-				}
-			} else if pkg.PkgPath != root.Package {
-				continue
+type sourceJSONField struct {
+	field    *types.Var
+	tag      string
+	name     string
+	opts     []string
+	index    []int
+	tagged   bool
+	optional bool
+}
+
+func (b *schemaBuilder) resolveTypeExpression(expression, currentPackage string) (ir.TypeDescriptor, error) {
+	typ, err := b.parseTypeExpression(strings.TrimSpace(expression), currentPackage)
+	if err != nil {
+		return nil, err
+	}
+	descriptor, err := b.convertType(typ)
+	if err != nil {
+		return nil, fmt.Errorf("convert type expression %q: %w", expression, err)
+	}
+	return descriptor, nil
+}
+
+func (b *schemaBuilder) parseTypeExpression(expression, currentPackage string) (types.Type, error) {
+	expression = strings.TrimSpace(expression)
+	if expression == "" {
+		return nil, fmt.Errorf("empty type expression")
+	}
+	if expression == "interface{}" || expression == "interface {}" {
+		return types.NewInterfaceType(nil, nil).Complete(), nil
+	}
+	if object := types.Universe.Lookup(expression); object != nil {
+		if typeName, ok := object.(*types.TypeName); ok {
+			return typeName.Type(), nil
+		}
+	}
+	if strings.HasPrefix(expression, "*") {
+		element, err := b.parseTypeExpression(expression[1:], currentPackage)
+		if err != nil {
+			return nil, err
+		}
+		return types.NewPointer(element), nil
+	}
+	if strings.HasPrefix(expression, "[]") {
+		element, err := b.parseTypeExpression(expression[2:], currentPackage)
+		if err != nil {
+			return nil, err
+		}
+		return types.NewSlice(element), nil
+	}
+	if strings.HasPrefix(expression, "map[") {
+		end := matchingTypeExpressionBracket(expression, 3)
+		if end < 0 || end == len(expression)-1 {
+			return nil, fmt.Errorf("invalid map type expression %q", expression)
+		}
+		key, err := b.parseTypeExpression(expression[4:end], currentPackage)
+		if err != nil {
+			return nil, fmt.Errorf("resolve map key in %q: %w", expression, err)
+		}
+		value, err := b.parseTypeExpression(expression[end+1:], currentPackage)
+		if err != nil {
+			return nil, fmt.Errorf("resolve map value in %q: %w", expression, err)
+		}
+		return types.NewMap(key, value), nil
+	}
+	if strings.HasPrefix(expression, "[") {
+		end := strings.IndexByte(expression, ']')
+		if end <= 1 || end == len(expression)-1 {
+			return nil, fmt.Errorf("invalid array type expression %q", expression)
+		}
+		length, err := strconv.ParseInt(expression[1:end], 10, 64)
+		if err != nil || length < 0 {
+			return nil, fmt.Errorf("invalid array length in type expression %q", expression)
+		}
+		element, err := b.parseTypeExpression(expression[end+1:], currentPackage)
+		if err != nil {
+			return nil, err
+		}
+		return types.NewArray(element, length), nil
+	}
+
+	base, arguments := splitTypeExpression(expression)
+	baseType, err := b.resolveNamedTypeExpression(base, currentPackage)
+	if err != nil {
+		return nil, err
+	}
+	if len(arguments) == 0 {
+		return baseType, nil
+	}
+	typeArguments := make([]types.Type, len(arguments))
+	for i, argument := range arguments {
+		typeArguments[i], err = b.parseTypeExpression(argument, currentPackage)
+		if err != nil {
+			return nil, fmt.Errorf("resolve type argument %d in %q: %w", i, expression, err)
+		}
+	}
+	instantiated, err := types.Instantiate(types.NewContext(), baseType, typeArguments, true)
+	if err != nil {
+		return nil, fmt.Errorf("instantiate type expression %q: %w", expression, err)
+	}
+	return instantiated, nil
+}
+
+func (b *schemaBuilder) resolveNamedTypeExpression(expression, currentPackage string) (types.Type, error) {
+	pkgPath, name := splitQualifiedTypeExpression(expression, currentPackage)
+	if pkgPath == "" {
+		return nil, fmt.Errorf("unresolved type expression %q", expression)
+	}
+	pkg := b.findLoadedPackage(pkgPath)
+	if pkg == nil || pkg.Types == nil {
+		return nil, fmt.Errorf("package %s for type expression %q was not loaded", pkgPath, expression)
+	}
+	object := pkg.Types.Scope().Lookup(name)
+	typeName, ok := object.(*types.TypeName)
+	if !ok {
+		return nil, fmt.Errorf("type %s not found in package %s", name, pkgPath)
+	}
+	return typeName.Type(), nil
+}
+
+func (b *schemaBuilder) findLoadedPackage(path string) *packages.Package {
+	seen := make(map[*packages.Package]bool)
+	var find func(*packages.Package) *packages.Package
+	find = func(pkg *packages.Package) *packages.Package {
+		if pkg == nil || seen[pkg] {
+			return nil
+		}
+		seen[pkg] = true
+		if pkg.PkgPath == path || path == "main" && pkg.Name == "main" {
+			return pkg
+		}
+		for _, imported := range pkg.Imports {
+			if match := find(imported); match != nil {
+				return match
 			}
 		}
+		return nil
+	}
+	for _, pkg := range b.pkgs {
+		if match := find(pkg); match != nil {
+			return match
+		}
+	}
+	return nil
+}
 
+func matchingTypeExpressionBracket(expression string, open int) int {
+	depth := 0
+	for i := open; i < len(expression); i++ {
+		switch expression[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func splitTypeExpression(expression string) (string, []string) {
+	open := strings.IndexByte(expression, '[')
+	if open < 0 || !strings.HasSuffix(expression, "]") {
+		return expression, nil
+	}
+	body := expression[open+1 : len(expression)-1]
+	var arguments []string
+	start, depth := 0, 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+		case ',':
+			if depth == 0 {
+				arguments = append(arguments, strings.TrimSpace(body[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	arguments = append(arguments, strings.TrimSpace(body[start:]))
+	return strings.TrimSpace(expression[:open]), arguments
+}
+
+func splitQualifiedTypeExpression(expression, currentPackage string) (string, string) {
+	if dot := strings.LastIndexByte(expression, '.'); dot >= 0 {
+		return expression[:dot], expression[dot+1:]
+	}
+	return currentPackage, expression
+}
+
+// extractRootType finds and extracts a named type by name and package.
+func (b *schemaBuilder) extractRootType(root RootType) error {
+	packagesToSearch := b.pkgs
+	if root.Package != "" {
+		pkg, err := b.resolvePackage(root.Package)
+		if err != nil {
+			return err
+		}
+		packagesToSearch = []*packages.Package{pkg}
+	}
+
+	for _, pkg := range packagesToSearch {
 		obj := pkg.Types.Scope().Lookup(root.Name)
 		if obj == nil {
 			continue
@@ -189,6 +402,9 @@ func (b *schemaBuilder) extractRootType(root RootType) error {
 		typeName, ok := obj.(*types.TypeName)
 		if !ok {
 			continue
+		}
+		if typeName.IsAlias() {
+			return fmt.Errorf("go type alias %q is not supported as an explicit root", root.Name)
 		}
 
 		if err := b.extractNamedType(typeName); err != nil {
@@ -200,6 +416,44 @@ func (b *schemaBuilder) extractRootType(root RootType) error {
 		return fmt.Errorf("type %s not found in package %s", root.Name, root.Package)
 	}
 	return fmt.Errorf("type %s not found in any package", root.Name)
+}
+
+func (b *schemaBuilder) resolvePackage(selector string) (*packages.Package, error) {
+	var matches []*packages.Package
+	for _, pkg := range b.pkgs {
+		if pkg.PkgPath == selector || selector == "main" && pkg.Name == "main" {
+			matches = append(matches, pkg)
+		}
+	}
+
+	if len(matches) == 0 && (filepath.IsAbs(selector) || strings.HasPrefix(selector, ".")) {
+		selectorDir, err := filepath.Abs(selector)
+		if err != nil {
+			return nil, fmt.Errorf("resolve package selector %q: %w", selector, err)
+		}
+		selectorDir = canonicalDir(selectorDir)
+		for _, pkg := range b.pkgs {
+			if len(pkg.GoFiles) > 0 && canonicalDir(filepath.Dir(pkg.GoFiles[0])) == selectorDir {
+				matches = append(matches, pkg)
+			}
+		}
+	}
+
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("input package %s not found in loaded packages", selector)
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("input package %s is ambiguous", selector)
+	}
+	return matches[0], nil
+}
+
+func canonicalDir(path string) string {
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }
 
 // extractAllExportedTypes extracts all exported types from all packages.
@@ -238,6 +492,11 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 		return nil
 	}
 
+	hasCustomMarshaler := b.hasCustomMarshaler(named)
+	if !hasCustomMarshaler && genericSliceMayEncodeAsByteSlice(named) {
+		return fmt.Errorf("generic slice %s may encode as a base64 byte slice; generic byte-capable slice aliases are not supported", tn.Name())
+	}
+
 	// Check for name collision (§3.5)
 	name := tn.Name()
 	pkg := ""
@@ -250,27 +509,13 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 	}
 	b.typeNames[fullName] = true
 
-	// First, scan for enum constants before processing the type
-	b.scanEnumConstants(tn)
-
 	// Extract documentation and source location
 	doc := b.extractDocumentation(tn)
 	src := b.extractSource(tn)
+	typeParams := b.buildTypeParameters(named)
 
-	// Check if this is an enum type
-	if consts, isEnum := b.enumCandidates[named]; isEnum && len(consts) > 0 {
-		pkgPath := ""
-		if named.Obj() != nil && named.Obj().Pkg() != nil {
-			pkgPath = normalizePkgPath(named.Obj().Pkg())
-		}
-		enumDesc := b.buildEnumDescriptor(tn.Name(), pkgPath, consts, doc, src)
-		b.namedTypes[key] = enumDesc
-		b.schema.AddType(enumDesc)
-		return nil
-	}
-
-	// Check for custom marshalers on the named type itself
-	if b.hasCustomMarshaler(named) {
+	// Custom wire encodings take precedence over enum inference.
+	if hasCustomMarshaler {
 		pkgPath := ""
 		if named.Obj() != nil && named.Obj().Pkg() != nil {
 			pkgPath = normalizePkgPath(named.Obj().Pkg())
@@ -282,13 +527,26 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 		})
 		// Create an alias to PrimitiveAny
 		aliasDesc := &ir.AliasDescriptor{
-			Name:          ir.GoIdentifier{Name: tn.Name(), Package: pkgPath},
-			Underlying:    ir.Any(),
-			Documentation: doc,
-			Source:        src,
+			Name:           ir.GoIdentifier{Name: tn.Name(), Package: pkgPath},
+			TypeParameters: typeParams,
+			Underlying:     ir.Any(),
+			Documentation:  doc,
+			Source:         src,
 		}
 		b.namedTypes[key] = aliasDesc
 		b.schema.AddType(aliasDesc)
+		return nil
+	}
+
+	b.scanEnumConstants(tn)
+	if consts, isEnum := b.enumCandidates[named]; isEnum && len(consts) > 0 {
+		pkgPath := ""
+		if named.Obj() != nil && named.Obj().Pkg() != nil {
+			pkgPath = normalizePkgPath(named.Obj().Pkg())
+		}
+		enumDesc := b.buildEnumDescriptor(tn.Name(), pkgPath, consts, doc, src)
+		b.namedTypes[key] = enumDesc
+		b.schema.AddType(enumDesc)
 		return nil
 	}
 
@@ -315,10 +573,11 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 		})
 		// Create an alias to PrimitiveAny
 		aliasDesc := &ir.AliasDescriptor{
-			Name:          ir.GoIdentifier{Name: tn.Name(), Package: pkgPath},
-			Underlying:    ir.Any(),
-			Documentation: doc,
-			Source:        src,
+			Name:           ir.GoIdentifier{Name: tn.Name(), Package: pkgPath},
+			TypeParameters: typeParams,
+			Underlying:     ir.Any(),
+			Documentation:  doc,
+			Source:         src,
 		}
 		b.namedTypes[key] = aliasDesc
 		b.schema.AddType(aliasDesc)
@@ -334,16 +593,108 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 			pkgPath = normalizePkgPath(named.Obj().Pkg())
 		}
 		aliasDesc := &ir.AliasDescriptor{
-			Name:          ir.GoIdentifier{Name: tn.Name(), Package: pkgPath},
-			Underlying:    underlying,
-			Documentation: doc,
-			Source:        src,
+			Name:           ir.GoIdentifier{Name: tn.Name(), Package: pkgPath},
+			TypeParameters: typeParams,
+			Underlying:     underlying,
+			Documentation:  doc,
+			Source:         src,
 		}
 		b.namedTypes[key] = aliasDesc
 		b.schema.AddType(aliasDesc)
 	}
 
 	return nil
+}
+
+func genericSliceMayEncodeAsByteSlice(named *types.Named) bool {
+	slice, ok := named.Underlying().(*types.Slice)
+	if !ok {
+		return false
+	}
+	typeParam, ok := unresolvedSliceElementTypeParam(slice)
+	if !ok {
+		return false
+	}
+	return constraintMayAdmitUint8(typeParam.Constraint(), make(map[types.Type]bool))
+}
+
+func unresolvedSliceElementTypeParam(slice *types.Slice) (*types.TypeParam, bool) {
+	typeParam, ok := types.Unalias(slice.Elem()).(*types.TypeParam)
+	return typeParam, ok
+}
+
+// constraintMayAdmitUint8 deliberately ignores interface methods. A defined
+// uint8 type can implement unrelated methods while retaining byte-slice JSON
+// encoding, so only structural type-set restrictions can rule uint8 out.
+func constraintMayAdmitUint8(constraint types.Type, seen map[types.Type]bool) bool {
+	if constraint == nil {
+		return true
+	}
+	constraint = types.Unalias(constraint)
+	if seen[constraint] {
+		return true
+	}
+	seen[constraint] = true
+	defer delete(seen, constraint)
+
+	switch underlying := constraint.Underlying().(type) {
+	case *types.Interface:
+		underlying.Complete()
+		for i := 0; i < underlying.NumEmbeddeds(); i++ {
+			if !constraintMayAdmitUint8(underlying.EmbeddedType(i), seen) {
+				return false
+			}
+		}
+		return true
+	case *types.Union:
+		for i := 0; i < underlying.Len(); i++ {
+			if constraintMayAdmitUint8(underlying.Term(i).Type(), seen) {
+				return true
+			}
+		}
+		return false
+	case *types.Basic:
+		return underlying.Kind() == types.Uint8
+	default:
+		return false
+	}
+}
+
+func constraintOnlyAdmitsUint8(constraint types.Type) bool {
+	iface, ok := types.Unalias(constraint).Underlying().(*types.Interface)
+	if !ok || !types.Satisfies(types.Typ[types.Uint8], iface) {
+		return false
+	}
+	for kind := types.Bool; kind <= types.UnsafePointer; kind++ {
+		if kind == types.Uint8 || kind == types.UntypedNil {
+			continue
+		}
+		if types.Satisfies(types.Typ[kind], iface) {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *schemaBuilder) buildTypeParameters(named *types.Named) []ir.TypeParameterDescriptor {
+	tparams := named.TypeParams()
+	if tparams == nil || tparams.Len() == 0 {
+		return nil
+	}
+
+	result := make([]ir.TypeParameterDescriptor, 0, tparams.Len())
+	for i := 0; i < tparams.Len(); i++ {
+		tp := tparams.At(i)
+		var constraint ir.TypeDescriptor
+		if constraintType := tp.Constraint(); constraintType != nil {
+			constraint = b.convertTypeParamConstraint(constraintType)
+		}
+		result = append(result, ir.TypeParameterDescriptor{
+			ParamName:  tp.Obj().Name(),
+			Constraint: constraint,
+		})
+	}
+	return result
 }
 
 // typeKey generates a unique key for a named type.
@@ -385,6 +736,24 @@ func (b *schemaBuilder) convertType(t types.Type) (ir.TypeDescriptor, error) {
 				}
 			}
 		}
+
+		if args := typ.TypeArgs(); args != nil && args.Len() > 0 {
+			if genericInstantiationChangesByteSliceWire(typ.Origin().Underlying(), typ.Underlying(), make(map[typePair]bool)) {
+				return nil, fmt.Errorf("generic type %s instantiated with byte-slice-compatible arguments changes JSON to base64 byte-slice encoding", obj.Name())
+			}
+			typeArgs := make([]ir.TypeDescriptor, args.Len())
+			for i := 0; i < args.Len(); i++ {
+				arg, err := b.convertType(args.At(i))
+				if err != nil {
+					return nil, fmt.Errorf("convert type argument %d for %s: %w", i, obj.Name(), err)
+				}
+				typeArgs[i] = arg
+			}
+			if err := b.validatePrimitiveWireTypeArguments(typ, typeArgs); err != nil {
+				return nil, err
+			}
+			return ir.RefWithArgs(obj.Name(), pkgPath, typeArgs...), nil
+		}
 		return ir.Ref(obj.Name(), pkgPath), nil
 
 	case *types.Pointer:
@@ -395,6 +764,9 @@ func (b *schemaBuilder) convertType(t types.Type) (ir.TypeDescriptor, error) {
 		return ir.Ptr(elem), nil
 
 	case *types.Slice:
+		if typeParam, ok := unresolvedSliceElementTypeParam(typ); ok && constraintOnlyAdmitsUint8(typeParam.Constraint()) {
+			return nil, fmt.Errorf("slice of unresolved type parameter %s always encodes as a base64 byte slice; generic byte slices are not supported", typeParam.Obj().Name())
+		}
 		elem, err := b.convertType(typ.Elem())
 		if err != nil {
 			return nil, err
@@ -409,7 +781,7 @@ func (b *schemaBuilder) convertType(t types.Type) (ir.TypeDescriptor, error) {
 		return ir.Array(elem, int(typ.Len())), nil
 
 	case *types.Map:
-		key, err := b.convertType(typ.Key())
+		key, err := b.convertMapKeyType(typ.Key())
 		if err != nil {
 			return nil, err
 		}
@@ -458,15 +830,226 @@ func (b *schemaBuilder) convertType(t types.Type) (ir.TypeDescriptor, error) {
 	}
 }
 
+type typePair struct {
+	origin       types.Type
+	instantiated types.Type
+}
+
+// genericInstantiationChangesByteSliceWire reports whether substituting type
+// arguments turns a generic []T field into encoding/json's base64 byte-slice
+// representation. Generic structs such as Page[T any] are safe to describe,
+// but concrete byte-compatible applications do not satisfy that reusable
+// TypeScript contract and must be rejected.
+func genericInstantiationChangesByteSliceWire(origin, instantiated types.Type, seen map[typePair]bool) bool {
+	origin = types.Unalias(origin)
+	instantiated = types.Unalias(instantiated)
+	pair := typePair{origin: origin, instantiated: instantiated}
+	if seen[pair] {
+		return false
+	}
+	seen[pair] = true
+
+	switch original := origin.(type) {
+	case *types.Slice:
+		actual, ok := instantiated.(*types.Slice)
+		if !ok {
+			return false
+		}
+		if _, ok := types.Unalias(original.Elem()).(*types.TypeParam); ok && isJSONByteSlice(actual) {
+			return true
+		}
+		return genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
+	case *types.Array:
+		actual, ok := instantiated.(*types.Array)
+		return ok && genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
+	case *types.Pointer:
+		actual, ok := instantiated.(*types.Pointer)
+		return ok && genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
+	case *types.Map:
+		actual, ok := instantiated.(*types.Map)
+		return ok && genericInstantiationChangesByteSliceWire(original.Elem(), actual.Elem(), seen)
+	case *types.Struct:
+		actual, ok := instantiated.(*types.Struct)
+		if !ok || original.NumFields() != actual.NumFields() {
+			return false
+		}
+		for i := 0; i < original.NumFields(); i++ {
+			if genericInstantiationChangesByteSliceWire(original.Field(i).Type(), actual.Field(i).Type(), seen) {
+				return true
+			}
+		}
+	case *types.Named:
+		actual, ok := instantiated.(*types.Named)
+		return ok && genericInstantiationChangesByteSliceWire(original.Underlying(), actual.Underlying(), seen)
+	}
+	return false
+}
+
+// validatePrimitiveWireTypeArguments rejects applications whose concrete JSON
+// wire type cannot satisfy the constraint retained in generated TypeScript.
+// Go validates constraints against the Go type, but special encodings such as
+// custom marshalers and json.Number can change that type at the wire boundary.
+func (b *schemaBuilder) validatePrimitiveWireTypeArguments(named *types.Named, arguments []ir.TypeDescriptor) error {
+	hasPrimitiveArgument := false
+	for _, argument := range arguments {
+		if _, ok := argument.(*ir.PrimitiveDescriptor); ok {
+			hasPrimitiveArgument = true
+			break
+		}
+	}
+	if !hasPrimitiveArgument {
+		return nil
+	}
+
+	descriptor := b.namedTypes[b.typeKey(named)]
+	var parameters []ir.TypeParameterDescriptor
+	switch descriptor := descriptor.(type) {
+	case *ir.StructDescriptor:
+		parameters = descriptor.TypeParameters
+	case *ir.AliasDescriptor:
+		parameters = descriptor.TypeParameters
+	default:
+		parameters = b.buildTypeParameters(named.Origin())
+	}
+	if len(parameters) != len(arguments) {
+		return fmt.Errorf("type argument metadata for %s has %d parameters, expected %d", named.Obj().Name(), len(parameters), len(arguments))
+	}
+
+	bindings := make(wireTypeBindings, len(parameters))
+	for i := range parameters {
+		bindings[parameters[i].ParamName] = wireTypeBinding{descriptor: arguments[i]}
+	}
+	typeParameters := named.TypeParams()
+	for i, parameter := range parameters {
+		argument, ok := arguments[i].(*ir.PrimitiveDescriptor)
+		if !ok || parameter.Constraint == nil || b.wireConstraintAcceptsPrimitive(parameter.Constraint, argument, bindings, make(map[ir.GoIdentifier]bool)) {
+			continue
+		}
+
+		constraint := parameter.ParamName
+		if typeParameters != nil && i < typeParameters.Len() {
+			constraint = typeParameters.At(i).Constraint().String()
+		}
+		genericName := named.Obj().Name()
+		if pkg := named.Obj().Pkg(); pkg != nil {
+			genericName = pkg.Path() + "." + genericName
+		}
+		return fmt.Errorf(
+			"type argument %d (%s) for %s parameter %s has JSON wire type %s, incompatible with preserved constraint %s",
+			i,
+			named.TypeArgs().At(i).String(),
+			genericName,
+			parameter.ParamName,
+			wirePrimitiveCategory(argument.PrimitiveKind),
+			constraint,
+		)
+	}
+	return nil
+}
+
+func (b *schemaBuilder) wireConstraintAcceptsPrimitive(
+	constraint ir.TypeDescriptor,
+	argument *ir.PrimitiveDescriptor,
+	bindings wireTypeBindings,
+	activeAliases map[ir.GoIdentifier]bool,
+) bool {
+	switch constraint := constraint.(type) {
+	case *ir.PrimitiveDescriptor:
+		return constraint.PrimitiveKind == ir.PrimitiveAny ||
+			wirePrimitiveCategory(constraint.PrimitiveKind) == wirePrimitiveCategory(argument.PrimitiveKind)
+	case *ir.TypeParameterDescriptor:
+		binding, ok := bindings[constraint.ParamName]
+		return ok && b.wireConstraintAcceptsPrimitive(binding.descriptor, argument, binding.bindings, activeAliases)
+	case *ir.UnionDescriptor:
+		for _, member := range constraint.Types {
+			if b.wireConstraintAcceptsPrimitive(member, argument, bindings, activeAliases) {
+				return true
+			}
+		}
+	case *ir.ReferenceDescriptor:
+		if activeAliases[constraint.Target] {
+			return false
+		}
+		underlying, aliasBindings, ok := b.wireConstraintAlias(constraint, bindings)
+		if !ok {
+			return false
+		}
+		activeAliases[constraint.Target] = true
+		accepted := b.wireConstraintAcceptsPrimitive(underlying, argument, aliasBindings, activeAliases)
+		delete(activeAliases, constraint.Target)
+		return accepted
+	case *ir.PtrDescriptor:
+		return b.wireConstraintAcceptsPrimitive(constraint.Element, argument, bindings, activeAliases)
+	}
+	return false
+}
+
+func (b *schemaBuilder) wireConstraintAlias(
+	reference *ir.ReferenceDescriptor,
+	bindings wireTypeBindings,
+) (ir.TypeDescriptor, wireTypeBindings, bool) {
+	alias, ok := b.schema.FindType(reference.Target).(*ir.AliasDescriptor)
+	if !ok {
+		return nil, nil, false
+	}
+
+	aliasBindings := make(wireTypeBindings, len(alias.TypeParameters))
+	for i, parameter := range alias.TypeParameters {
+		if i < len(reference.TypeArguments) {
+			aliasBindings[parameter.ParamName] = wireTypeBinding{
+				descriptor: reference.TypeArguments[i],
+				bindings:   bindings,
+			}
+		}
+	}
+	return alias.Underlying, aliasBindings, true
+}
+
+type wireTypeBinding struct {
+	descriptor ir.TypeDescriptor
+	bindings   wireTypeBindings
+}
+
+type wireTypeBindings map[string]wireTypeBinding
+
+func wirePrimitiveCategory(kind ir.PrimitiveKind) string {
+	switch kind {
+	case ir.PrimitiveInt, ir.PrimitiveUint, ir.PrimitiveFloat, ir.PrimitiveDuration:
+		return "number"
+	case ir.PrimitiveString, ir.PrimitiveBytes, ir.PrimitiveTime:
+		return "string"
+	case ir.PrimitiveBool:
+		return "boolean"
+	case ir.PrimitiveAny:
+		return "unknown"
+	case ir.PrimitiveEmpty:
+		return "object"
+	default:
+		return kind.String()
+	}
+}
+
+func (b *schemaBuilder) convertMapKeyType(t types.Type) (ir.TypeDescriptor, error) {
+	// json.Number values are numeric JSON tokens, but map keys are always JSON
+	// object member names and encoding/json accepts arbitrary Number key text.
+	if isJSONNumberType(t) {
+		return ir.String(), nil
+	}
+	return b.convertType(t)
+}
+
 // handleSpecialType handles special types like time.Time, []byte, etc.
 func (b *schemaBuilder) handleSpecialType(t types.Type) ir.TypeDescriptor {
+	if isJSONNumberType(t) {
+		// json.Number emits an unquoted numeric token. Float64 is the closest
+		// existing IR representation, though consumers may lose precision/range.
+		return ir.Float(64)
+	}
+
 	switch typ := t.(type) {
 	case *types.Slice:
-		// Check for []byte or []uint8
-		if basic, ok := typ.Elem().(*types.Basic); ok {
-			if basic.Kind() == types.Byte || basic.Kind() == types.Uint8 {
-				return ir.Bytes()
-			}
+		if isJSONByteSlice(typ) {
+			return ir.Bytes()
 		}
 
 	case *types.Named:
@@ -486,11 +1069,6 @@ func (b *schemaBuilder) handleSpecialType(t types.Type) ir.TypeDescriptor {
 		// time.Duration
 		if pkgPath == "time" && name == "Duration" {
 			return ir.Duration()
-		}
-
-		// json.Number
-		if pkgPath == "encoding/json" && name == "Number" {
-			return ir.String()
 		}
 
 		// json.RawMessage
@@ -514,53 +1092,40 @@ func (b *schemaBuilder) handleSpecialType(t types.Type) ir.TypeDescriptor {
 
 // hasCustomMarshaler checks if a type implements json.Marshaler or encoding.TextMarshaler.
 func (b *schemaBuilder) hasCustomMarshaler(named *types.Named) bool {
-	// Look for MarshalJSON() ([]byte, error) method
-	for i := 0; i < named.NumMethods(); i++ {
-		method := named.Method(i)
-		if method.Name() == "MarshalJSON" {
-			sig := method.Type().(*types.Signature)
-			if sig.Params().Len() == 0 && sig.Results().Len() == 2 {
-				// Check return types: first must be []byte, second must be error
-				results := sig.Results()
-				firstType := results.At(0).Type()
-				secondType := results.At(1).Type()
-
-				// Check first result is []byte
-				if slice, ok := firstType.(*types.Slice); ok {
-					if basic, ok := slice.Elem().(*types.Basic); ok {
-						if basic.Kind() == types.Byte || basic.Kind() == types.Uint8 {
-							// Check second result is error
-							if secondType.String() == "error" {
-								return true
-							}
-						}
-					}
-				}
-			}
-		}
-		if method.Name() == "MarshalText" {
-			sig := method.Type().(*types.Signature)
-			if sig.Params().Len() == 0 && sig.Results().Len() == 2 {
-				// Check return types: first must be []byte, second must be error
-				results := sig.Results()
-				firstType := results.At(0).Type()
-				secondType := results.At(1).Type()
-
-				// Check first result is []byte
-				if slice, ok := firstType.(*types.Slice); ok {
-					if basic, ok := slice.Elem().(*types.Basic); ok {
-						if basic.Kind() == types.Byte || basic.Kind() == types.Uint8 {
-							// Check second result is error
-							if secondType.String() == "error" {
-								return true
-							}
-						}
-					}
-				}
-			}
+	for _, receiver := range []types.Type{named, types.NewPointer(named)} {
+		if hasCustomMarshalerMethod(receiver) {
+			return true
 		}
 	}
 	return false
+}
+
+func hasCustomMarshalerMethod(receiver types.Type) bool {
+	methods := types.NewMethodSet(receiver)
+	for i := 0; i < methods.Len(); i++ {
+		method, ok := methods.At(i).Obj().(*types.Func)
+		if ok && (method.Name() == "MarshalJSON" || method.Name() == "MarshalText") && isBytesErrorMethod(method) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBytesErrorMethod(method *types.Func) bool {
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Params().Len() != 0 || sig.Results().Len() != 2 {
+		return false
+	}
+	byteSlice := types.NewSlice(types.Typ[types.Byte])
+	return types.Identical(types.Unalias(sig.Results().At(0).Type()), byteSlice) &&
+		types.Identical(types.Unalias(sig.Results().At(1).Type()), types.Universe.Lookup("error").Type())
+}
+
+// isJSONByteSlice mirrors encoding/json's byte-slice selection. Defined uint8
+// elements are base64 encoded unless *Element has a JSON or text marshaler.
+func isJSONByteSlice(slice *types.Slice) bool {
+	basic, ok := slice.Elem().Underlying().(*types.Basic)
+	return ok && basic.Kind() == types.Uint8 && !hasCustomMarshalerMethod(types.NewPointer(slice.Elem()))
 }
 
 // isValidMapKey checks if a type is a valid JSON map key.
@@ -570,7 +1135,7 @@ func (b *schemaBuilder) isValidMapKey(t types.Type) bool {
 		kind := typ.Kind()
 		// String and integer types are valid
 		return kind == types.String ||
-			kind >= types.Int && kind <= types.Uint64
+			kind >= types.Int && kind <= types.Uintptr
 
 	case *types.Named:
 		// Check underlying type and TextMarshaler
@@ -586,28 +1151,11 @@ func (b *schemaBuilder) isValidMapKey(t types.Type) bool {
 
 // hasTextMarshaler checks if a type implements encoding.TextMarshaler.
 func (b *schemaBuilder) hasTextMarshaler(named *types.Named) bool {
-	for i := 0; i < named.NumMethods(); i++ {
-		method := named.Method(i)
-		if method.Name() == "MarshalText" {
-			sig := method.Type().(*types.Signature)
-			if sig.Params().Len() == 0 && sig.Results().Len() == 2 {
-				// Check return types: first must be []byte, second must be error
-				results := sig.Results()
-				firstType := results.At(0).Type()
-				secondType := results.At(1).Type()
-
-				// Check first result is []byte
-				if slice, ok := firstType.(*types.Slice); ok {
-					if basic, ok := slice.Elem().(*types.Basic); ok {
-						if basic.Kind() == types.Byte || basic.Kind() == types.Uint8 {
-							// Check second result is error
-							if secondType.String() == "error" {
-								return true
-							}
-						}
-					}
-				}
-			}
+	methods := types.NewMethodSet(named)
+	for i := 0; i < methods.Len(); i++ {
+		method, ok := methods.At(i).Obj().(*types.Func)
+		if ok && method.Name() == "MarshalText" && isBytesErrorMethod(method) {
+			return true
 		}
 	}
 	return false
@@ -943,127 +1491,231 @@ func (b *schemaBuilder) buildStructDescriptor(named *types.Named, name string, d
 		pkgPath = normalizePkgPath(named.Obj().Pkg())
 	}
 
-	// Extract type parameters for generic types
-	var typeParams []ir.TypeParameterDescriptor
-	if tparams := named.TypeParams(); tparams != nil && tparams.Len() > 0 {
-		for i := 0; i < tparams.Len(); i++ {
-			tp := tparams.At(i)
-			// tp.Constraint() returns the constraint interface
-			// For [T any], this returns a non-nil interface but it's the universal constraint
-			// We need to check if it's effectively unconstrained
-			constraintType := tp.Constraint()
-			var constraint ir.TypeDescriptor
-			if constraintType != nil {
-				constraint = b.convertTypeParamConstraint(constraintType)
-			}
-			typeParams = append(typeParams, ir.TypeParameterDescriptor{
-				ParamName:  tp.Obj().Name(),
-				Constraint: constraint,
-			})
-		}
-	}
-
 	descriptor := &ir.StructDescriptor{
 		Name:           ir.GoIdentifier{Name: name, Package: pkgPath},
-		TypeParameters: typeParams,
+		TypeParameters: b.buildTypeParameters(named),
 		Fields:         []ir.FieldDescriptor{},
-		Extends:        []ir.GoIdentifier{},
 		Documentation:  doc,
 		Source:         src,
 	}
 
-	// Process struct fields
-	for i := 0; i < structType.NumFields(); i++ {
-		field := structType.Field(i)
-		tag := structType.Tag(i)
-
-		// Skip unexported fields
-		if !field.Exported() {
-			continue
-		}
-
-		// Parse struct tags
-		jsonTag, jsonOpts := b.parseJSONTag(tag)
-
-		// Skip fields with json:"-"
-		if jsonTag == "-" {
-			continue
-		}
-
-		// Handle embedded fields
-		if field.Embedded() {
-			if jsonTag == "" {
-				// No JSON tag - this is inheritance (Extends)
-				fieldType := field.Type()
-				// Dereference pointer
-				if ptr, ok := fieldType.(*types.Pointer); ok {
-					fieldType = ptr.Elem()
-				}
-				if named, ok := fieldType.(*types.Named); ok {
-					obj := named.Obj()
-					embeddedPkgPath := ""
-					if obj != nil && obj.Pkg() != nil {
-						embeddedPkgPath = normalizePkgPath(obj.Pkg())
-					}
-					descriptor.Extends = append(descriptor.Extends, ir.GoIdentifier{
-						Name:    obj.Name(),
-						Package: embeddedPkgPath,
-					})
-				}
-				continue
-			}
-			// Has JSON tag - treat as regular field
-		}
-
-		// Convert field type - use convertFieldType to handle anonymous structs
-		fieldTypeDesc, err := b.convertFieldType(field.Type(), name, field.Name(), pkgPath)
+	fields := b.sourceJSONFields(structType)
+	for _, field := range fields {
+		fieldDesc, err := b.buildSourceFieldDescriptor(field, name, pkgPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert field %s: %w", field.Name(), err)
+			return nil, err
 		}
-
-		// Determine JSON name
-		jsonName := jsonTag
-		if jsonName == "" {
-			jsonName = field.Name()
-		}
-
-		// Check for omitempty/omitzero
-		optional := false
-		for _, opt := range jsonOpts {
-			if opt == "omitempty" || opt == "omitzero" {
-				optional = true
-				break
-			}
-		}
-
-		// Check for string encoding
-		stringEncoded := false
-		for _, opt := range jsonOpts {
-			if opt == "string" {
-				stringEncoded = true
-				break
-			}
-		}
-
-		// Extract validate tag
-		validateTag := b.extractTag(tag, "validate")
-
-		fieldDesc := ir.FieldDescriptor{
-			Name:          field.Name(),
-			Type:          fieldTypeDesc,
-			JSONName:      jsonName,
-			Optional:      optional,
-			StringEncoded: stringEncoded,
-			Skip:          false,
-			ValidateTag:   validateTag,
-			RawTags:       b.parseAllTags(tag),
-			Documentation: b.extractFieldDocumentation(named.Obj(), field.Pos()),
-		}
-
 		descriptor.Fields = append(descriptor.Fields, fieldDesc)
 	}
 
 	return descriptor, nil
+}
+
+func (b *schemaBuilder) sourceJSONFields(root *types.Struct) []sourceJSONField {
+	type scan struct {
+		typ      types.Type
+		strct    *types.Struct
+		index    []int
+		optional bool
+	}
+
+	current := []scan(nil)
+	next := []scan{{typ: root, strct: root}}
+	var count, nextCount map[types.Type]int
+	visited := make(map[types.Type]bool)
+	var fields []sourceJSONField
+
+	for len(next) > 0 {
+		current, next = next, current[:0]
+		count, nextCount = nextCount, make(map[types.Type]int)
+
+		for _, parent := range current {
+			if visited[parent.typ] {
+				continue
+			}
+			visited[parent.typ] = true
+
+			for i := 0; i < parent.strct.NumFields(); i++ {
+				field := parent.strct.Field(i)
+				embeddedType, embeddedStruct, isEmbeddedStruct := sourceEmbeddedStruct(field.Type())
+				if field.Embedded() {
+					if !field.Exported() && !isEmbeddedStruct {
+						continue
+					}
+				} else if !field.Exported() {
+					continue
+				}
+
+				tag := parent.strct.Tag(i)
+				rawJSONTag := b.extractTag(tag, "json")
+				if rawJSONTag == "-" {
+					continue
+				}
+				name, opts := b.parseJSONTag(tag)
+				if !isValidJSONTag(name) {
+					name = ""
+				}
+				index := append(append([]int(nil), parent.index...), i)
+
+				if name != "" || !field.Embedded() || !isEmbeddedStruct {
+					tagged := name != ""
+					if name == "" {
+						name = field.Name()
+					}
+					candidate := sourceJSONField{
+						field:    field,
+						tag:      tag,
+						name:     name,
+						opts:     opts,
+						index:    index,
+						tagged:   tagged,
+						optional: parent.optional,
+					}
+					fields = append(fields, candidate)
+					if count[parent.typ] > 1 {
+						fields = append(fields, candidate)
+					}
+					continue
+				}
+
+				nextCount[embeddedType]++
+				if nextCount[embeddedType] == 1 {
+					next = append(next, scan{
+						typ:      embeddedType,
+						strct:    embeddedStruct,
+						index:    index,
+						optional: parent.optional || isSourcePointer(field.Type()),
+					})
+				}
+			}
+		}
+	}
+
+	sort.Slice(fields, func(i, j int) bool {
+		if fields[i].name != fields[j].name {
+			return fields[i].name < fields[j].name
+		}
+		if len(fields[i].index) != len(fields[j].index) {
+			return len(fields[i].index) < len(fields[j].index)
+		}
+		if fields[i].tagged != fields[j].tagged {
+			return fields[i].tagged
+		}
+		return compareFieldIndex(fields[i].index, fields[j].index) < 0
+	})
+
+	out := fields[:0]
+	for i := 0; i < len(fields); {
+		end := i + 1
+		for end < len(fields) && fields[end].name == fields[i].name {
+			end++
+		}
+		if end-i == 1 || len(fields[i].index) != len(fields[i+1].index) || fields[i].tagged != fields[i+1].tagged {
+			out = append(out, fields[i])
+		}
+		i = end
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return compareFieldIndex(out[i].index, out[j].index) < 0
+	})
+	return out
+}
+
+func sourceEmbeddedStruct(t types.Type) (types.Type, *types.Struct, bool) {
+	t = types.Unalias(t)
+	if pointer, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(pointer.Elem())
+	}
+	switch typ := t.(type) {
+	case *types.Named:
+		strct, ok := typ.Underlying().(*types.Struct)
+		return typ, strct, ok
+	case *types.Struct:
+		return typ, typ, true
+	default:
+		return t, nil, false
+	}
+}
+
+func isSourcePointer(t types.Type) bool {
+	_, ok := types.Unalias(t).(*types.Pointer)
+	return ok
+}
+
+func compareFieldIndex(a, b []int) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
+}
+
+func isValidJSONTag(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", r):
+		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
+			return false
+		}
+	}
+	return true
+}
+
+func (b *schemaBuilder) buildSourceFieldDescriptor(field sourceJSONField, parentName, pkgPath string) (ir.FieldDescriptor, error) {
+	fieldType, err := b.convertFieldType(field.field.Type(), parentName, field.field.Name(), pkgPath)
+	if err != nil {
+		return ir.FieldDescriptor{}, fmt.Errorf("failed to convert field %s: %w", field.field.Name(), err)
+	}
+
+	optional := field.optional
+	stringEncodingRequested := false
+	for _, opt := range field.opts {
+		optional = optional || opt == "omitempty" || opt == "omitzero"
+		stringEncodingRequested = stringEncodingRequested || opt == "string"
+	}
+	if stringEncodingRequested {
+		if typeParam := unresolvedStringEncodingTypeParameter(field.field.Type()); typeParam != nil {
+			return ir.FieldDescriptor{}, fmt.Errorf(
+				`field %s: json:",string" on unresolved type parameter %s is not supported`,
+				field.field.Name(), typeParam.Obj().Name(),
+			)
+		}
+	}
+
+	return ir.FieldDescriptor{
+		Name:          field.field.Name(),
+		Type:          fieldType,
+		JSONName:      field.name,
+		Optional:      optional,
+		StringEncoded: stringEncodingRequested && b.schema.StringEncodingApplies(fieldType),
+		ValidateTag:   b.extractTag(field.tag, "validate"),
+		RawTags:       b.parseAllTags(field.tag),
+		Documentation: b.extractFieldDocumentation(field.field, field.field.Pos()),
+	}, nil
+}
+
+func unresolvedStringEncodingTypeParameter(t types.Type) *types.TypeParam {
+	t = types.Unalias(t)
+	if pointer, ok := t.(*types.Pointer); ok {
+		t = pointer.Elem()
+	}
+	t = types.Unalias(t)
+	typeParam, _ := t.(*types.TypeParam)
+	return typeParam
 }
 
 // parseJSONTag parses the json struct tag.
@@ -1130,15 +1782,19 @@ func (b *schemaBuilder) convertTypeParamConstraint(constraint types.Type) ir.Typ
 			if result != nil {
 				return result
 			}
-			// If the interface has methods but no union type set, return a reference
-			// to the named constraint type (e.g., [T Stringer] -> Ref("Stringer"))
+			// If the interface has methods but no union type set, preserve the
+			// named constraint and extract its declaration like any other reference.
 			if iface.NumMethods() > 0 {
-				obj := named.Obj()
-				pkgPath := ""
-				if obj != nil && obj.Pkg() != nil {
-					pkgPath = normalizePkgPath(obj.Pkg())
+				desc, err := b.convertType(named)
+				if err == nil {
+					return desc
 				}
-				return ir.Ref(obj.Name(), pkgPath)
+				b.schema.AddWarning(ir.Warning{
+					Code:     "CONSTRAINT_CONVERSION_FAILED",
+					Message:  fmt.Sprintf("failed to convert type parameter constraint %s: %v", constraint.String(), err),
+					TypeName: constraint.String(),
+				})
+				return nil
 			}
 		}
 		// Fall through to convertType for other named types
@@ -1176,6 +1832,7 @@ func (b *schemaBuilder) convertTypeParamConstraint(constraint types.Type) ir.Typ
 	// For [T ~string | ~int], the interface has embedded types that form a union
 	if iface.NumEmbeddeds() > 0 {
 		var unionTypes []ir.TypeDescriptor
+		conversionFailed := false
 
 		for i := 0; i < iface.NumEmbeddeds(); i++ {
 			embedded := iface.EmbeddedType(i)
@@ -1190,8 +1847,11 @@ func (b *schemaBuilder) convertTypeParamConstraint(constraint types.Type) ir.Typ
 					desc, err := b.convertType(termType)
 					if err == nil && desc != nil {
 						unionTypes = append(unionTypes, desc)
-					} else if err != nil {
-						// Log warning but continue processing other union terms
+					} else {
+						conversionFailed = true
+						if err == nil {
+							err = fmt.Errorf("no representable descriptor")
+						}
 						b.schema.AddWarning(ir.Warning{
 							Code:     "UNION_TERM_CONVERSION_FAILED",
 							Message:  fmt.Sprintf("failed to convert union term %s: %v", termType.String(), err),
@@ -1204,8 +1864,11 @@ func (b *schemaBuilder) convertTypeParamConstraint(constraint types.Type) ir.Typ
 				desc, err := b.convertType(embedded)
 				if err == nil && desc != nil {
 					unionTypes = append(unionTypes, desc)
-				} else if err != nil {
-					// Log warning but continue processing
+				} else {
+					conversionFailed = true
+					if err == nil {
+						err = fmt.Errorf("no representable descriptor")
+					}
 					b.schema.AddWarning(ir.Warning{
 						Code:     "CONSTRAINT_EMBEDDED_CONVERSION_FAILED",
 						Message:  fmt.Sprintf("failed to convert embedded constraint type %s: %v", embedded.String(), err),
@@ -1213,6 +1876,9 @@ func (b *schemaBuilder) convertTypeParamConstraint(constraint types.Type) ir.Typ
 					})
 				}
 			}
+		}
+		if conversionFailed {
+			return nil
 		}
 
 		if len(unionTypes) > 1 {
@@ -1265,99 +1931,16 @@ func (b *schemaBuilder) handleAnonymousStruct(structType *types.Struct, parentNa
 
 	// Build the struct descriptor for the anonymous struct
 	descriptor := &ir.StructDescriptor{
-		Name:    ir.GoIdentifier{Name: syntheticName, Package: pkgPath},
-		Fields:  []ir.FieldDescriptor{},
-		Extends: []ir.GoIdentifier{},
+		Name:   ir.GoIdentifier{Name: syntheticName, Package: pkgPath},
+		Fields: []ir.FieldDescriptor{},
 	}
 
-	// Process fields of the anonymous struct
-	for i := 0; i < structType.NumFields(); i++ {
-		field := structType.Field(i)
-		tag := structType.Tag(i)
-
-		// Skip unexported fields
-		if !field.Exported() {
-			continue
-		}
-
-		// Parse struct tags
-		jsonTag, jsonOpts := b.parseJSONTag(tag)
-
-		// Skip fields with json:"-"
-		if jsonTag == "-" {
-			continue
-		}
-
-		// Handle embedded fields
-		if field.Embedded() {
-			if jsonTag == "" {
-				// No JSON tag - this is inheritance (Extends)
-				fieldType := field.Type()
-				// Dereference pointer
-				if ptr, ok := fieldType.(*types.Pointer); ok {
-					fieldType = ptr.Elem()
-				}
-				if named, ok := fieldType.(*types.Named); ok {
-					obj := named.Obj()
-					embeddedPkgPath := ""
-					if obj != nil && obj.Pkg() != nil {
-						embeddedPkgPath = normalizePkgPath(obj.Pkg())
-					}
-					descriptor.Extends = append(descriptor.Extends, ir.GoIdentifier{
-						Name:    obj.Name(),
-						Package: embeddedPkgPath,
-					})
-				}
-				continue
-			}
-			// Has JSON tag - treat as regular field
-		}
-
-		// Convert field type - use recursive call for nested anonymous structs
-		fieldTypeDesc, err := b.convertFieldType(field.Type(), syntheticName, field.Name(), pkgPath)
+	fields := b.sourceJSONFields(structType)
+	for _, field := range fields {
+		fieldDesc, err := b.buildSourceFieldDescriptor(field, syntheticName, pkgPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert field %s.%s: %w", syntheticName, field.Name(), err)
+			return nil, fmt.Errorf("failed to convert field %s.%s: %w", syntheticName, field.field.Name(), err)
 		}
-
-		// Determine JSON name
-		jsonName := jsonTag
-		if jsonName == "" {
-			jsonName = field.Name()
-		}
-
-		// Check for omitempty/omitzero
-		optional := false
-		for _, opt := range jsonOpts {
-			if opt == "omitempty" || opt == "omitzero" {
-				optional = true
-				break
-			}
-		}
-
-		// Check for string encoding
-		stringEncoded := false
-		for _, opt := range jsonOpts {
-			if opt == "string" {
-				stringEncoded = true
-				break
-			}
-		}
-
-		// Extract validate tag
-		validateTag := b.extractTag(tag, "validate")
-
-		fieldDesc := ir.FieldDescriptor{
-			Name:          field.Name(),
-			Type:          fieldTypeDesc,
-			JSONName:      jsonName,
-			Optional:      optional,
-			StringEncoded: stringEncoded,
-			Skip:          false,
-			ValidateTag:   validateTag,
-			RawTags:       b.parseAllTags(tag),
-			Documentation: ir.Documentation{}, // Anonymous struct fields don't have documentation positions
-		}
-
 		descriptor.Fields = append(descriptor.Fields, fieldDesc)
 	}
 
@@ -1408,10 +1991,15 @@ func parseStructTag(tag string) map[string]string {
 		if i >= len(tag) {
 			break
 		}
-		value := tag[1:i]
+		value, err := strconv.Unquote(tag[:i+1])
+		if err != nil {
+			break
+		}
 		tag = tag[i+1:]
 
-		result[key] = value
+		if _, exists := result[key]; !exists {
+			result[key] = value
+		}
 	}
 	return result
 }

@@ -6,9 +6,7 @@ package-lock.json
 .tools/
 
 # TypeScript build output (client runtime)
-client/runtime.js
-client/runtime.d.ts
-client/runtime.d.ts.map
+packages/client/dist/
 
 # Example build artifacts
 examples/*/server

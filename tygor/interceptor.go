@@ -9,7 +9,8 @@ import (
 // or the final handler.
 type HandlerFunc func(ctx context.Context, req any) (res any, err error)
 
-// UnaryInterceptor is a hook that wraps handler execution for unary (non-streaming) calls.
+// UnaryInterceptor wraps unary handler execution and the setup phase of
+// streaming handlers. Stream-lifetime behavior belongs in StreamInterceptor.
 //
 // Interceptors receive Context for type-safe access to request metadata:
 //
@@ -45,15 +46,8 @@ func chainInterceptors(interceptors []UnaryInterceptor) UnaryInterceptor {
 		for i := len(interceptors) - 1; i >= 0; i-- {
 			current := interceptors[i]
 			next := chain
-			chain = func(ctx context.Context, req any) (any, error) {
-				// Convert context.Context back to Context
-				// This works because the interceptor passes ctx (which is Context) to handler
-				tygorCtx, ok := ctx.(Context)
-				if !ok {
-					// If someone wrapped the context, extract our Context from it
-					tygorCtx, _ = FromContext(ctx)
-				}
-				return current(tygorCtx, req, next)
+			chain = func(c context.Context, req any) (any, error) {
+				return current(contextWithMetadata(c, ctx), req, next)
 			}
 		}
 		return chain(ctx, req)

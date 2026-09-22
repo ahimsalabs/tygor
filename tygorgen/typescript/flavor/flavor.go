@@ -30,14 +30,41 @@ type Flavor interface {
 
 // EmitContext provides shared context for flavor emission.
 type EmitContext struct {
-	Schema             *ir.Schema
-	IndentStr          string
-	EmitTypes          bool              // Whether base types.ts is being generated
-	TypeMappings       map[string]string // Go type → TS type overrides
-	StripPackagePrefix string
+	Schema                           *ir.Schema
+	IndentStr                        string
+	EmitTypes                        bool              // Whether base types.ts is being generated
+	TypeMappings                     map[string]string // Go type → TS type overrides
+	StripPackagePrefix               string
+	TypeNames                        map[ir.GoIdentifier]string
+	RecursiveTypes                   map[ir.GoIdentifier]bool
+	TypeDeclarations                 map[ir.GoIdentifier]string
+	SchemaPrefix                     string
+	TypeExpression                   func(ir.TypeDescriptor) (string, error)
+	TypeExpressionWithTypeParameters func(ir.TypeDescriptor, func(string) string) (string, error)
 
 	// Warnings collects non-fatal issues during generation.
 	Warnings []string
+}
+
+// TypeName returns the allocated TypeScript name for a Go identity.
+func (ctx *EmitContext) TypeName(id ir.GoIdentifier) string {
+	if name, ok := ctx.TypeNames[id]; ok {
+		return name
+	}
+	return id.Name
+}
+
+// SchemaName returns the allocated schema export for a Go identity.
+func (ctx *EmitContext) SchemaName(id ir.GoIdentifier) string {
+	return ctx.SchemaPrefix + ctx.TypeName(id) + "Schema"
+}
+
+// DataTypeName returns a type reference suitable for recursive schema annotations.
+func (ctx *EmitContext) DataTypeName(id ir.GoIdentifier) string {
+	if ctx.EmitTypes {
+		return "types." + ctx.TypeName(id)
+	}
+	return ctx.TypeName(id)
 }
 
 // AddWarning adds a warning message to the context.

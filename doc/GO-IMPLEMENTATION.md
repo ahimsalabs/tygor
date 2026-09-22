@@ -381,13 +381,27 @@ type ListParams struct {
 For POST requests, the library MUST decode JSON bodies using `encoding/json`.
 
 **Empty Body Handling:**
-An empty request body (EOF) MUST be treated as an empty JSON object `{}`. This allows clients to call endpoints with empty request types without explicitly sending `{}`:
+An empty request body (EOF) MUST leave the request at its Go zero value. Normal
+request validation still applies. In particular, an empty body leaves an
+ordinary pointer request nil, while `{}` allocates the pointed-to value. This
+allows clients to call endpoints using `tygor.Empty` without explicitly sending
+`{}`:
 
 ```bash
 # Both are valid for endpoints with empty request types:
 curl -X POST http://localhost:8080/Tasks/Kill
 curl -X POST http://localhost:8080/Tasks/Kill -d '{}'
 ```
+
+**Single Value and Null Handling:**
+A non-empty body MUST contain exactly one JSON value. After decoding that value,
+the decoder MUST require EOF; JSON whitespace before EOF is allowed. A trailing
+value or trailing non-whitespace data is an invalid argument.
+
+JSON `null` uses the normal `encoding/json` behavior. It leaves a pointer
+request nil, which request validation rejects as an invalid argument unless
+validation is disabled. `tygor.Empty` is the intentional exception and accepts
+empty, `null`, and `{}` bodies.
 
 **Pointer Field Handling:**
 Pointer fields SHOULD support `omitempty` to distinguish between "not provided" and "explicitly null":
@@ -595,7 +609,7 @@ type Config struct {
     // OPTIONAL: Enum generation style ("union", "enum", "const")
     EnumStyle string
 
-    // OPTIONAL: Optional field typing ("undefined", "null")
+    // OPTIONAL: Optional/nullable field typing ("default", "undefined", "null")
     OptionalType string
 
     // OPTIONAL: Custom frontmatter for generated files
@@ -608,7 +622,7 @@ type Config struct {
 {
     PreserveComments: "default",
     EnumStyle: "union",
-    OptionalType: "undefined",
+    OptionalType: "default",
     TypeMappings: map[string]string{
         "time.Time":          "string",
         "pgtype.Timestamptz": "string | null",

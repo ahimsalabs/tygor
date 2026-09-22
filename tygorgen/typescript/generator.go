@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -34,6 +33,7 @@ func (g *TypeScriptGenerator) Generate(ctx context.Context, schema *ir.Schema, o
 	// Apply defaults to TypeScript config
 	tsConfig := getTypeScriptConfig(opts.Config)
 	flavorCfg := getFlavorConfig(opts.Config)
+	plan := newGenerationPlan(schema, opts.Config)
 
 	result := &GenerateResult{
 		Files:          []OutputFile{},
@@ -45,7 +45,7 @@ func (g *TypeScriptGenerator) Generate(ctx context.Context, schema *ir.Schema, o
 	if flavorCfg.EmitTypes {
 		if opts.Config.SingleFile {
 			// Single file mode: all types in one types.ts
-			typesContent, typesGenerated, warnings, err := g.generateTypes(ctx, schema, opts.Config, tsConfig)
+			typesContent, typesGenerated, warnings, err := g.generateTypes(ctx, schema, opts.Config, tsConfig, plan)
 			if err != nil {
 				return nil, fmt.Errorf("failed to generate types: %w", err)
 			}
@@ -63,7 +63,7 @@ func (g *TypeScriptGenerator) Generate(ctx context.Context, schema *ir.Schema, o
 			})
 		} else {
 			// Multi-file mode: one file per package + barrel
-			files, typesGenerated, warnings, err := g.generateMultiFileTypes(ctx, schema, opts.Config, tsConfig)
+			files, typesGenerated, warnings, err := g.generateMultiFileTypes(ctx, schema, opts.Config, tsConfig, plan)
 			if err != nil {
 				return nil, fmt.Errorf("failed to generate types: %w", err)
 			}
@@ -85,7 +85,7 @@ func (g *TypeScriptGenerator) Generate(ctx context.Context, schema *ir.Schema, o
 
 	// Generate flavor outputs
 	if len(flavorCfg.Flavors) > 0 {
-		flavorFiles, err := g.generateFlavors(ctx, schema, opts.Config, flavorCfg)
+		flavorFiles, err := g.generateFlavors(ctx, schema, opts.Config, flavorCfg, plan)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate flavors: %w", err)
 		}
@@ -111,7 +111,7 @@ func (g *TypeScriptGenerator) Generate(ctx context.Context, schema *ir.Schema, o
 	// Generate schema map if zod flavor is enabled
 	for _, flavorName := range flavorCfg.Flavors {
 		if flavorName == "zod" || flavorName == "zod-mini" {
-			schemaMapContent, err := g.generateSchemaMap(ctx, schema, opts.Config, flavorName)
+			schemaMapContent, err := g.generateSchemaMap(ctx, schema, opts.Config, flavorName, plan)
 			if err != nil {
 				return nil, fmt.Errorf("failed to generate schema map: %w", err)
 			}
@@ -131,7 +131,7 @@ func (g *TypeScriptGenerator) Generate(ctx context.Context, schema *ir.Schema, o
 	// Generate manifest.ts only when using app mode (services not nil)
 	// This is skipped for types-only generation where Services is explicitly nil
 	if schema.Services != nil {
-		manifestContent, err := g.generateManifest(ctx, schema, opts.Config, tsConfig)
+		manifestContent, err := g.generateManifest(ctx, schema, opts.Config, tsConfig, flavorCfg, plan)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate manifest: %w", err)
 		}
@@ -150,7 +150,7 @@ func (g *TypeScriptGenerator) Generate(ctx context.Context, schema *ir.Schema, o
 }
 
 // generateTypes generates the types.ts file content.
-func (g *TypeScriptGenerator) generateTypes(ctx context.Context, schema *ir.Schema, config GeneratorConfig, tsConfig TypeScriptConfig) ([]byte, int, []ir.Warning, error) {
+func (g *TypeScriptGenerator) generateTypes(ctx context.Context, schema *ir.Schema, config GeneratorConfig, tsConfig TypeScriptConfig, plan *generationPlan) ([]byte, int, []ir.Warning, error) {
 	var buf bytes.Buffer
 	var warnings []ir.Warning
 	typesGenerated := 0
@@ -173,6 +173,7 @@ func (g *TypeScriptGenerator) generateTypes(ctx context.Context, schema *ir.Sche
 		schema:    schema,
 		config:    config,
 		tsConfig:  tsConfig,
+		plan:      plan,
 		indent:    "",
 		indentStr: computeIndentStr(config),
 	}
@@ -181,7 +182,11 @@ func (g *TypeScriptGenerator) generateTypes(ctx context.Context, schema *ir.Sche
 	sortedTypes := make([]ir.TypeDescriptor, len(schema.Types))
 	copy(sortedTypes, schema.Types)
 	sort.Slice(sortedTypes, func(i, j int) bool {
-		return sortedTypes[i].TypeName().Name < sortedTypes[j].TypeName().Name
+		left, right := sortedTypes[i].TypeName(), sortedTypes[j].TypeName()
+		if left.Package == right.Package {
+			return left.Name < right.Name
+		}
+		return left.Package < right.Package
 	})
 
 	// Emit each type
@@ -219,7 +224,7 @@ type generatedFile struct {
 }
 
 // generateMultiFileTypes generates one file per package plus a barrel file.
-func (g *TypeScriptGenerator) generateMultiFileTypes(ctx context.Context, schema *ir.Schema, config GeneratorConfig, tsConfig TypeScriptConfig) ([]generatedFile, int, []ir.Warning, error) {
+func (g *TypeScriptGenerator) generateMultiFileTypes(ctx context.Context, schema *ir.Schema, config GeneratorConfig, tsConfig TypeScriptConfig, plan *generationPlan) ([]generatedFile, int, []ir.Warning, error) {
 	var warnings []ir.Warning
 	var files []generatedFile
 	typesGenerated := 0
@@ -246,6 +251,7 @@ func (g *TypeScriptGenerator) generateMultiFileTypes(ctx context.Context, schema
 		schema:    schema,
 		config:    config,
 		tsConfig:  tsConfig,
+		plan:      plan,
 		indent:    "",
 		indentStr: computeIndentStr(config),
 	}
@@ -262,6 +268,7 @@ func (g *TypeScriptGenerator) generateMultiFileTypes(ctx context.Context, schema
 		var buf bytes.Buffer
 		buf.WriteString("// Code generated by tygor. DO NOT EDIT.\n")
 		buf.WriteString("\n")
+		emitPackageImports(&buf, pkg, types, plan)
 
 		// Frontmatter (custom type definitions, imports, etc.)
 		if config.Frontmatter != "" {
@@ -293,7 +300,7 @@ func (g *TypeScriptGenerator) generateMultiFileTypes(ctx context.Context, schema
 		content = applyLineEnding(content, config.LineEnding)
 
 		// Generate filename from package path
-		filename := "types_" + sanitizePkgPath(pkg) + ".ts"
+		filename := plan.packageFiles[pkg]
 		generatedFilenames = append(generatedFilenames, filename)
 
 		files = append(files, generatedFile{
@@ -325,6 +332,43 @@ func (g *TypeScriptGenerator) generateMultiFileTypes(ctx context.Context, schema
 	return files, typesGenerated, warnings, nil
 }
 
+func emitPackageImports(buf *bytes.Buffer, pkg string, types []ir.TypeDescriptor, plan *generationPlan) {
+	imports := make(map[string]map[string]bool)
+	for _, typ := range types {
+		for _, ref := range collectDescriptorReferences(typ) {
+			if ref.Package == pkg {
+				continue
+			}
+			filename, ok := plan.packageFiles[ref.Package]
+			if !ok {
+				continue
+			}
+			module := "./" + strings.TrimSuffix(filename, ".ts")
+			if imports[module] == nil {
+				imports[module] = make(map[string]bool)
+			}
+			imports[module][plan.typeNames[ref]] = true
+		}
+	}
+
+	modules := make([]string, 0, len(imports))
+	for module := range imports {
+		modules = append(modules, module)
+	}
+	sort.Strings(modules)
+	for _, module := range modules {
+		names := make([]string, 0, len(imports[module]))
+		for name := range imports[module] {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		buf.WriteString(fmt.Sprintf("import type { %s } from %q;\n", strings.Join(names, ", "), module))
+	}
+	if len(modules) > 0 {
+		buf.WriteString("\n")
+	}
+}
+
 // sanitizePkgPath converts a Go package path to a safe filename component.
 func sanitizePkgPath(pkgPath string) string {
 	// Replace non-alphanumeric characters with underscores
@@ -345,22 +389,37 @@ func sanitizePkgPath(pkgPath string) string {
 }
 
 // generateManifest generates the manifest.ts file content.
-func (g *TypeScriptGenerator) generateManifest(ctx context.Context, schema *ir.Schema, config GeneratorConfig, tsConfig TypeScriptConfig) ([]byte, error) {
+func (g *TypeScriptGenerator) generateManifest(ctx context.Context, schema *ir.Schema, config GeneratorConfig, tsConfig TypeScriptConfig, flavorCfg flavorConfig, plan *generationPlan) ([]byte, error) {
 	var buf bytes.Buffer
 
 	// Header comment
 	buf.WriteString("// Code generated by tygor. DO NOT EDIT.\n")
 	buf.WriteString("\n")
 
-	// Import types
-	buf.WriteString("import * as types from './types';\n")
-	buf.WriteString("\n")
+	typeModule := manifestTypeModule(flavorCfg)
+	hasNamedReferences := servicesHaveNamedReferences(schema.Services)
+	if typeModule == "" && hasNamedReferences {
+		return nil, fmt.Errorf("manifest references generated types, but neither base types nor an inference-bearing flavor is enabled")
+	}
+	if !hasNamedReferences {
+		typeModule = ""
+	}
+	if typeModule != "" {
+		buf.WriteString(fmt.Sprintf("import type * as types from %q;\n\n", typeModule))
+	}
 
 	// Create emitter for type references
 	emitter := &Emitter{
-		schema:    schema,
-		config:    config,
-		tsConfig:  tsConfig,
+		schema:   schema,
+		config:   config,
+		tsConfig: tsConfig,
+		plan:     plan,
+		referencePrefix: func() string {
+			if typeModule != "" {
+				return "types."
+			}
+			return ""
+		}(),
 		indent:    "",
 		indentStr: computeIndentStr(config),
 	}
@@ -396,8 +455,6 @@ func (g *TypeScriptGenerator) generateManifest(ctx context.Context, schema *ir.S
 			if err != nil {
 				return nil, fmt.Errorf("failed to emit request type for %s: %w", endpoint.FullName, err)
 			}
-			// Prefix with "types." for references
-			reqType = prefixTypeReferences(reqType, "types.")
 			buf.WriteString(reqType)
 		}
 		buf.WriteString(";\n")
@@ -408,8 +465,6 @@ func (g *TypeScriptGenerator) generateManifest(ctx context.Context, schema *ir.S
 		if err != nil {
 			return nil, fmt.Errorf("failed to emit response type for %s: %w", endpoint.FullName, err)
 		}
-		// Prefix with "types." for references (including those inside arrays)
-		resType = prefixTypeReferences(resType, "types.")
 		buf.WriteString(resType)
 		buf.WriteString(";\n")
 
@@ -447,6 +502,30 @@ func (g *TypeScriptGenerator) generateManifest(ctx context.Context, schema *ir.S
 	content = applyLineEnding(content, config.LineEnding)
 
 	return content, nil
+}
+
+func manifestTypeModule(config flavorConfig) string {
+	if config.EmitTypes {
+		return "./types"
+	}
+	for _, name := range config.Flavors {
+		f, err := flavor.Get(name)
+		if err == nil && f.EmitInferredType() {
+			return "./schemas" + strings.TrimSuffix(f.FileExtension(), ".ts")
+		}
+	}
+	return ""
+}
+
+func servicesHaveNamedReferences(services []ir.ServiceDescriptor) bool {
+	for _, service := range services {
+		for _, endpoint := range service.Endpoints {
+			if len(collectDescriptorReferences(endpoint.Request)) > 0 || len(collectDescriptorReferences(endpoint.Response)) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // validateOptions validates the generation options.
@@ -613,43 +692,6 @@ func toKebabCase(s string) string {
 	return strings.ReplaceAll(toSnakeCase(s), "_", "-")
 }
 
-// typeIdentifierRe matches type identifiers including version-prefixed ones.
-// Matches:
-// - PascalCase identifiers: User, MigrationRequest
-// - Version-prefixed identifiers: v1_User, v2_GetUserRequest (from StripPackagePrefix)
-var typeIdentifierRe = regexp.MustCompile(`\b((?:[a-z][a-z0-9]*_)?[A-Z][A-Za-z0-9_]*)\b`)
-
-// prefixTypeReferences adds a prefix to type references in a type expression.
-// This is used to add "types." before user-defined types in manifest generation.
-// It preserves TypeScript keywords, primitives, and utility types.
-func prefixTypeReferences(typeExpr string, prefix string) string {
-	// TypeScript primitives and utility types that should not be prefixed
-	skipTypes := map[string]bool{
-		"Record":      true,
-		"Partial":     true,
-		"Required":    true,
-		"Readonly":    true,
-		"Pick":        true,
-		"Omit":        true,
-		"Exclude":     true,
-		"Extract":     true,
-		"NonNullable": true,
-		"ReturnType":  true,
-		"Parameters":  true,
-		"Array":       true,
-		"Promise":     true,
-		"Map":         true,
-		"Set":         true,
-	}
-
-	return typeIdentifierRe.ReplaceAllStringFunc(typeExpr, func(match string) string {
-		if skipTypes[match] {
-			return match
-		}
-		return prefix + match
-	})
-}
-
 // flavorConfig holds flavor-related configuration.
 type flavorConfig struct {
 	Flavors   []string
@@ -678,21 +720,42 @@ func getFlavorConfig(config GeneratorConfig) flavorConfig {
 }
 
 // generateFlavors generates output for each enabled flavor.
-func (g *TypeScriptGenerator) generateFlavors(ctx context.Context, schema *ir.Schema, config GeneratorConfig, flavorCfg flavorConfig) ([]generatedFile, error) {
+func (g *TypeScriptGenerator) generateFlavors(ctx context.Context, schema *ir.Schema, config GeneratorConfig, flavorCfg flavorConfig, plan *generationPlan) ([]generatedFile, error) {
 	var files []generatedFile
 
 	// Topologically sort types so dependencies come before dependents.
 	// This ensures Zod schemas can reference each other without forward declaration issues.
-	sortedTypes := topologicalSortTypes(schema.Types)
+	sortedTypes := topologicalSortTypes(schema.Types, plan.recursive)
 
 	// Build emit context
+	typeDeclarations, err := g.flavorTypeDeclarations(schema, config, plan, flavorCfg.EmitTypes)
+	if err != nil {
+		return nil, err
+	}
 	emitCtx := &flavor.EmitContext{
 		Schema:             schema,
 		IndentStr:          computeIndentStr(config),
 		EmitTypes:          flavorCfg.EmitTypes,
 		TypeMappings:       config.TypeMappings,
 		StripPackagePrefix: config.StripPackagePrefix,
+		TypeNames:          plan.typeNames,
+		RecursiveTypes:     plan.recursive,
+		TypeDeclarations:   typeDeclarations,
 	}
+	referencePrefix := ""
+	if flavorCfg.EmitTypes {
+		referencePrefix = "types."
+	}
+	constraintEmitter := &Emitter{
+		schema:          schema,
+		config:          config,
+		tsConfig:        getTypeScriptConfig(config),
+		plan:            plan,
+		referencePrefix: referencePrefix,
+		indentStr:       computeIndentStr(config),
+	}
+	emitCtx.TypeExpression = constraintEmitter.EmitTypeExpr
+	emitCtx.TypeExpressionWithTypeParameters = constraintEmitter.EmitTypeExprWithTypeParameters
 
 	for _, name := range flavorCfg.Flavors {
 		f, err := flavor.Get(name)
@@ -724,17 +787,60 @@ func (g *TypeScriptGenerator) generateFlavors(ctx context.Context, schema *ir.Sc
 	return files, nil
 }
 
+func (g *TypeScriptGenerator) flavorTypeDeclarations(schema *ir.Schema, config GeneratorConfig, plan *generationPlan, emitTypes bool) (map[ir.GoIdentifier]string, error) {
+	declarations := make(map[ir.GoIdentifier]string)
+	if emitTypes {
+		return declarations, nil
+	}
+	emitter := &Emitter{
+		schema:    schema,
+		config:    config,
+		tsConfig:  getTypeScriptConfig(config),
+		plan:      plan,
+		indentStr: computeIndentStr(config),
+	}
+	for _, typ := range schema.Types {
+		if !plan.recursive[typ.TypeName()] && typeParameterCount(typ) == 0 {
+			continue
+		}
+		var buf bytes.Buffer
+		if _, err := emitter.EmitType(&buf, typ); err != nil {
+			return nil, fmt.Errorf("emit flavor type declaration %s: %w", typ.TypeName().Name, err)
+		}
+		declarations[typ.TypeName()] = buf.String()
+	}
+	return declarations, nil
+}
+
+func typeParameterCount(typ ir.TypeDescriptor) int {
+	switch t := typ.(type) {
+	case *ir.StructDescriptor:
+		return len(t.TypeParameters)
+	case *ir.AliasDescriptor:
+		return len(t.TypeParameters)
+	default:
+		return 0
+	}
+}
+
 // generateSchemaMap generates the schemas.map.ts file for client-side validation.
 // This file maps endpoint names to their input/output Zod schemas.
-func (g *TypeScriptGenerator) generateSchemaMap(ctx context.Context, schema *ir.Schema, config GeneratorConfig, flavorName string) ([]byte, error) {
+func (g *TypeScriptGenerator) generateSchemaMap(ctx context.Context, schema *ir.Schema, config GeneratorConfig, flavorName string, plan *generationPlan) ([]byte, error) {
 	var buf bytes.Buffer
+	isMini := flavorName == "zod-mini"
+	emitCtx := &flavor.EmitContext{
+		Schema:         schema,
+		TypeNames:      plan.typeNames,
+		SchemaPrefix:   "s.",
+		RecursiveTypes: map[ir.GoIdentifier]bool{},
+	}
 
 	// Header comment
 	buf.WriteString("// Code generated by tygor. DO NOT EDIT.\n")
 	buf.WriteString("\n")
 
 	// Import Zod and schemas for the specific flavor
-	if flavorName == "zod-mini" {
+	if isMini {
 		buf.WriteString("import * as z from 'zod/mini';\n")
 		buf.WriteString("import * as s from './schemas.zod-mini';\n")
 	} else {
@@ -766,18 +872,23 @@ func (g *TypeScriptGenerator) generateSchemaMap(ctx context.Context, schema *ir.
 
 		// Request schema
 		buf.WriteString("    request: ")
-		isMini := flavorName == "zod-mini"
 		if endpoint.Request == nil {
 			buf.WriteString("z.object({})")
 		} else {
-			requestSchema := typeToZodSchema(endpoint.Request, isMini)
+			requestSchema, err := flavor.ZodSchemaExpression(emitCtx, endpoint.Request, isMini)
+			if err != nil {
+				return nil, fmt.Errorf("emit request schema for %s: %w", endpoint.FullName, err)
+			}
 			buf.WriteString(requestSchema)
 		}
 		buf.WriteString(",\n")
 
 		// Response schema
 		buf.WriteString("    response: ")
-		responseSchema := typeToZodSchema(endpoint.Response, isMini)
+		responseSchema, err := flavor.ZodSchemaExpression(emitCtx, endpoint.Response, isMini)
+		if err != nil {
+			return nil, fmt.Errorf("emit response schema for %s: %w", endpoint.FullName, err)
+		}
 		buf.WriteString(responseSchema)
 		buf.WriteString(",\n")
 
@@ -800,202 +911,119 @@ func (g *TypeScriptGenerator) generateSchemaMap(ctx context.Context, schema *ir.
 	return content, nil
 }
 
-// typeToZodSchema converts an IR type descriptor to a Zod schema expression.
-// Uses "s." prefix to reference schemas from the schemas.zod.ts import.
-// The mini parameter indicates whether to generate zod-mini compatible code.
-func typeToZodSchema(typ ir.TypeDescriptor, mini bool) string {
-	if typ == nil {
-		return "z.unknown()"
+// topologicalSortTypes sorts types so dependencies precede dependents. Cyclic
+// components are retained in deterministic order and emitted with lazy refs.
+func topologicalSortTypes(types []ir.TypeDescriptor, recursive map[ir.GoIdentifier]bool) []ir.TypeDescriptor {
+	typeMap := make(map[ir.GoIdentifier]ir.TypeDescriptor, len(types))
+	for _, typ := range types {
+		typeMap[typ.TypeName()] = typ
 	}
 
-	switch t := typ.(type) {
-	case *ir.ReferenceDescriptor:
-		return "s." + t.Target.Name + "Schema"
-
-	case *ir.ArrayDescriptor:
-		elem := typeToZodSchema(t.Element, mini)
-		return fmt.Sprintf("z.array(%s)", elem)
-
-	case *ir.MapDescriptor:
-		value := typeToZodSchema(t.Value, mini)
-		return fmt.Sprintf("z.record(z.string(), %s)", value)
-
-	case *ir.PtrDescriptor:
-		elem := typeToZodSchema(t.Element, mini)
-		if mini {
-			return fmt.Sprintf("z.nullable(%s)", elem)
-		}
-		return elem + ".nullable()"
-
-	case *ir.PrimitiveDescriptor:
-		switch t.PrimitiveKind {
-		case ir.PrimitiveBool:
-			return "z.boolean()"
-		case ir.PrimitiveString:
-			return "z.string()"
-		case ir.PrimitiveInt, ir.PrimitiveUint, ir.PrimitiveFloat:
-			return "z.number()"
-		case ir.PrimitiveBytes:
-			return "z.string()"
-		case ir.PrimitiveTime:
-			return "z.string().datetime()"
-		case ir.PrimitiveAny:
-			return "z.unknown()"
-		case ir.PrimitiveEmpty:
-			return "z.object({}).strict()"
-		default:
-			return "z.unknown()"
-		}
-
-	default:
-		return "z.unknown()"
-	}
-}
-
-// topologicalSortTypes sorts types so that dependencies come before dependents.
-// This ensures generated schemas can reference each other without forward declaration issues.
-func topologicalSortTypes(types []ir.TypeDescriptor) []ir.TypeDescriptor {
-	// Build a map of type name to type descriptor
-	typeMap := make(map[string]ir.TypeDescriptor)
-	for _, t := range types {
-		typeMap[t.TypeName().Name] = t
-	}
-
-	// Build dependency graph: type name -> list of type names it depends on
-	deps := make(map[string][]string)
-	for _, t := range types {
-		name := t.TypeName().Name
-		deps[name] = collectTypeDependencies(t)
-	}
-
-	// Kahn's algorithm for topological sort
-	// Calculate in-degree for each type
-	inDegree := make(map[string]int)
-	for _, t := range types {
-		name := t.TypeName().Name
-		if _, exists := inDegree[name]; !exists {
-			inDegree[name] = 0
-		}
-		for _, dep := range deps[name] {
-			// Only count dependencies that are in our type set
-			if _, exists := typeMap[dep]; exists {
-				inDegree[dep]++ // dep is depended on by name
+	dependents := make(map[ir.GoIdentifier][]ir.GoIdentifier, len(types))
+	inDegree := make(map[ir.GoIdentifier]int, len(types))
+	for _, typ := range types {
+		name := typ.TypeName()
+		seen := make(map[ir.GoIdentifier]bool)
+		for _, dependency := range collectEagerSchemaReferences(typ, recursive) {
+			if dependency == name || seen[dependency] {
+				continue
+			}
+			if _, exists := typeMap[dependency]; exists {
+				seen[dependency] = true
+				inDegree[name]++
+				dependents[dependency] = append(dependents[dependency], name)
 			}
 		}
 	}
 
-	// Reverse the dependency direction: we need types with no dependents first
-	// Actually we need types that ARE dependencies first (low in-degree in reverse graph)
-	// Let's rebuild: inDegree[x] = number of types that x depends on
-	inDegree = make(map[string]int)
-	for _, t := range types {
-		name := t.TypeName().Name
-		count := 0
-		for _, dep := range deps[name] {
-			if _, exists := typeMap[dep]; exists {
-				count++
-			}
-		}
-		inDegree[name] = count
-	}
-
-	// Start with types that have no dependencies
-	var queue []string
-	for _, t := range types {
-		name := t.TypeName().Name
-		if inDegree[name] == 0 {
-			queue = append(queue, name)
+	queue := make([]ir.GoIdentifier, 0, len(types))
+	for _, typ := range types {
+		if inDegree[typ.TypeName()] == 0 {
+			queue = append(queue, typ.TypeName())
 		}
 	}
-	// Sort queue alphabetically for determinism
-	sort.Strings(queue)
+	sortIdentifiers(queue)
 
-	var result []ir.TypeDescriptor
-	processed := make(map[string]bool)
-
+	result := make([]ir.TypeDescriptor, 0, len(types))
+	processed := make(map[ir.GoIdentifier]bool, len(types))
 	for len(queue) > 0 {
-		// Pop from queue
 		name := queue[0]
 		queue = queue[1:]
-
 		if processed[name] {
 			continue
 		}
 		processed[name] = true
-
-		if t, exists := typeMap[name]; exists {
-			result = append(result, t)
-		}
-
-		// Find types that depend on this one and decrement their in-degree
-		for _, t := range types {
-			tName := t.TypeName().Name
-			if processed[tName] {
-				continue
-			}
-			for _, dep := range deps[tName] {
-				if dep == name {
-					inDegree[tName]--
-					if inDegree[tName] == 0 {
-						queue = append(queue, tName)
-					}
-					break
-				}
+		result = append(result, typeMap[name])
+		for _, dependent := range dependents[name] {
+			inDegree[dependent]--
+			if inDegree[dependent] == 0 {
+				queue = append(queue, dependent)
 			}
 		}
-		// Re-sort queue for determinism
-		sort.Strings(queue)
+		sortIdentifiers(queue)
 	}
 
-	// Add any remaining types (in case of cycles, which shouldn't happen)
-	for _, t := range types {
-		if !processed[t.TypeName().Name] {
-			result = append(result, t)
+	cyclic := make([]ir.GoIdentifier, 0, len(types)-len(result))
+	for _, typ := range types {
+		if !processed[typ.TypeName()] {
+			cyclic = append(cyclic, typ.TypeName())
 		}
 	}
-
+	sortIdentifiers(cyclic)
+	for _, name := range cyclic {
+		result = append(result, typeMap[name])
+	}
 	return result
 }
 
-// collectTypeDependencies returns the names of types that a type descriptor references.
-func collectTypeDependencies(td ir.TypeDescriptor) []string {
-	var deps []string
-
-	switch t := td.(type) {
-	case *ir.StructDescriptor:
-		for _, field := range t.Fields {
-			deps = append(deps, collectTypeDescriptorDeps(field.Type)...)
+func collectEagerSchemaReferences(typ ir.TypeDescriptor, recursive map[ir.GoIdentifier]bool) []ir.GoIdentifier {
+	seen := make(map[ir.GoIdentifier]bool)
+	var walk func(ir.TypeDescriptor)
+	walk = func(current ir.TypeDescriptor) {
+		if current == nil {
+			return
 		}
-	case *ir.AliasDescriptor:
-		deps = append(deps, collectTypeDescriptorDeps(t.Underlying)...)
-	}
-
-	return deps
-}
-
-// collectTypeDescriptorDeps recursively collects referenced type names from a type descriptor.
-func collectTypeDescriptorDeps(td ir.TypeDescriptor) []string {
-	if td == nil {
-		return nil
-	}
-
-	var deps []string
-
-	switch t := td.(type) {
-	case *ir.ReferenceDescriptor:
-		deps = append(deps, t.Target.Name)
-	case *ir.ArrayDescriptor:
-		deps = append(deps, collectTypeDescriptorDeps(t.Element)...)
-	case *ir.MapDescriptor:
-		deps = append(deps, collectTypeDescriptorDeps(t.Key)...)
-		deps = append(deps, collectTypeDescriptorDeps(t.Value)...)
-	case *ir.PtrDescriptor:
-		deps = append(deps, collectTypeDescriptorDeps(t.Element)...)
-	case *ir.UnionDescriptor:
-		for _, ut := range t.Types {
-			deps = append(deps, collectTypeDescriptorDeps(ut)...)
+		switch t := current.(type) {
+		case *ir.StructDescriptor:
+			for _, extended := range t.Extends {
+				if !recursive[extended] {
+					seen[extended] = true
+				}
+			}
+			for _, field := range t.Fields {
+				if !field.Skip {
+					walk(field.Type)
+				}
+			}
+		case *ir.AliasDescriptor:
+			walk(t.Underlying)
+		case *ir.ReferenceDescriptor:
+			if recursive[t.Target] {
+				return
+			}
+			seen[t.Target] = true
+			for _, arg := range t.TypeArguments {
+				walk(arg)
+			}
+		case *ir.ArrayDescriptor:
+			walk(t.Element)
+		case *ir.MapDescriptor:
+			walk(t.Key)
+			walk(t.Value)
+		case *ir.PtrDescriptor:
+			walk(t.Element)
+		case *ir.UnionDescriptor:
+			for _, member := range t.Types {
+				walk(member)
+			}
 		}
 	}
+	walk(typ)
 
-	return deps
+	refs := make([]ir.GoIdentifier, 0, len(seen))
+	for id := range seen {
+		refs = append(refs, id)
+	}
+	sortIdentifiers(refs)
+	return refs
 }

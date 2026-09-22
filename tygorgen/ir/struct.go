@@ -58,9 +58,9 @@ type FieldDescriptor struct {
 	// concerns that don't affect the generated type signature.
 	Optional bool
 
-	// StringEncoded indicates json:",string" was set.
-	// When true, the field is encoded as a JSON string on the wire.
-	// Only valid for string, integer, floating-point, or boolean types.
+	// StringEncoded indicates encoding/json applies json:",string" to this field.
+	// The raw tag remains available in RawTags even when encoding/json ignores
+	// the option because the field type or pointer depth is ineligible.
 	StringEncoded bool
 
 	// Skip indicates json:"-" was set.

@@ -29,24 +29,31 @@ func (c *Cmd) Run() error {
 	// Print export info
 	fmt.Printf("✓ Found export: %s() %s\n", export.Name, export.Type)
 
-	// Print config function if present
-	if result.ConfigFunc != nil {
-		fmt.Printf("✓ Found config: %s(*tygorgen.Generator) *tygorgen.Generator\n", result.ConfigFunc.Name)
+	var config *discover.ConfigFunc
+	if export.Type == discover.ExportTypeApp {
+		config, err = discover.SelectConfig(result.ConfigFuncs)
+		if err != nil {
+			return err
+		}
+	}
+	if config != nil {
+		fmt.Printf("✓ Found config: %s(*tygorgen.Generator) *tygorgen.Generator\n", config.Name)
 	}
 
 	// Build runner options for check mode
 	opts := runner.Options{
-		Export:     *export,
-		CheckMode:  true,
-		PkgDir:     result.Dir,
-		PkgPath:    result.PackagePath,
-		ModulePath: result.ModulePath,
-		ModuleDir:  result.ModuleDir,
+		Export:          *export,
+		CheckMode:       true,
+		PkgDir:          result.Dir,
+		PkgPath:         result.PackagePath,
+		PackageName:     result.PackageName,
+		CompiledGoFiles: result.CompiledGoFiles,
+		ModulePath:      result.ModulePath,
+		ModuleDir:       result.ModuleDir,
 	}
 
-	// Add config function if present and applicable
-	if result.ConfigFunc != nil && export.Type == discover.ExportTypeApp {
-		opts.ConfigFunc = result.ConfigFunc.Name
+	if config != nil {
+		opts.ConfigFunc = config.Name
 	}
 
 	// Run the check
