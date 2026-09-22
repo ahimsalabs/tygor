@@ -16,12 +16,6 @@ import json "encoding/json/v2"
 // Wire format: {"result": null}
 type Empty = *struct{}
 
-// response is the internal envelope type for successful responses.
-// This wraps the actual result in a {"result": ...} structure.
-type response struct {
-	Result any `json:"result"`
-}
-
 // errorResponse is the internal envelope type for error responses.
 // This wraps the error in an {"error": {...}} structure.
 type errorResponse struct {
@@ -30,12 +24,15 @@ type errorResponse struct {
 
 // marshalResponse serializes the complete success envelope before any response
 // headers or body bytes are committed.
-func marshalResponse(result any) ([]byte, error) {
-	data, err := json.Marshal(response{Result: result})
+func marshalResponse(result any, options ...json.Options) ([]byte, error) {
+	payload, err := json.Marshal(result, options...)
 	if err != nil {
 		return nil, err
 	}
-	return append(data, '\n'), nil
+	data := make([]byte, 0, len(payload)+13)
+	data = append(data, `{"result":`...)
+	data = append(data, payload...)
+	return append(data, '}', '\n'), nil
 }
 
 func marshalErrorResponse(err *Error) ([]byte, error) {

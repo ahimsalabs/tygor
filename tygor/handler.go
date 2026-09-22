@@ -48,6 +48,7 @@ type handlerBase[Req any, Res any] struct {
 	fn             func(context.Context, Req) (Res, error)
 	interceptors   []UnaryInterceptor
 	skipValidation bool
+	jsonOptions    json.Options
 }
 
 type execHandler[Req any, Res any] struct {
@@ -56,7 +57,7 @@ type execHandler[Req any, Res any] struct {
 }
 
 func newExecHandler[Req any, Res any](fn func(context.Context, Req) (Res, error), options ...ExecOption) *execHandler[Req, Res] {
-	config := execConfig{}
+	config := execConfig{jsonOptions: json.DefaultOptionsV2()}
 	for _, option := range options {
 		option.applyExec(&config)
 	}
@@ -69,6 +70,7 @@ func makeExecHandler[Req any, Res any](fn func(context.Context, Req) (Res, error
 			fn:             fn,
 			interceptors:   config.interceptors,
 			skipValidation: config.skipValidation,
+			jsonOptions:    config.jsonOptions,
 		},
 		maxRequestBodySize: config.maxRequestBodySize,
 	}
@@ -122,7 +124,7 @@ type CacheConfig struct {
 }
 
 func newQueryHandler[Req any, Res any](fn func(context.Context, Req) (Res, error), options ...QueryOption) *queryHandler[Req, Res] {
-	config := queryConfig{}
+	config := queryConfig{jsonOptions: json.DefaultOptionsV2()}
 	for _, option := range options {
 		option.applyQuery(&config)
 	}
@@ -135,6 +137,7 @@ func makeQueryHandler[Req any, Res any](fn func(context.Context, Req) (Res, erro
 			fn:             fn,
 			interceptors:   config.interceptors,
 			skipValidation: config.skipValidation,
+			jsonOptions:    config.jsonOptions,
 		},
 		cacheConfig:       config.cacheConfig,
 		strictQueryParams: config.strictQueryParams,
@@ -143,23 +146,21 @@ func makeQueryHandler[Req any, Res any](fn func(context.Context, Req) (Res, erro
 
 // metadata returns the runtime metadata for the exec handler.
 func (h *execHandler[Req, Res]) metadata() *internal.MethodMetadata {
-	var req Req
-	var res Res
 	return &internal.MethodMetadata{
-		Primitive: "exec",
-		Request:   reflect.TypeOf(req),
-		Response:  reflect.TypeOf(res),
+		Primitive:   "exec",
+		Request:     reflect.TypeFor[Req](),
+		Response:    reflect.TypeFor[Res](),
+		JSONOptions: h.jsonOptions,
 	}
 }
 
 // metadata returns the runtime metadata for the query handler.
 func (h *queryHandler[Req, Res]) metadata() *internal.MethodMetadata {
-	var req Req
-	var res Res
 	return &internal.MethodMetadata{
-		Primitive: "query",
-		Request:   reflect.TypeOf(req),
-		Response:  reflect.TypeOf(res),
+		Primitive:   "query",
+		Request:     reflect.TypeFor[Req](),
+		Response:    reflect.TypeFor[Res](),
+		JSONOptions: h.jsonOptions,
 	}
 }
 
@@ -270,7 +271,7 @@ func (h *execHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 				ctx.request.Body = http.MaxBytesReader(ctx.writer, ctx.request.Body, int64(effectiveLimit))
 			}
 
-			if err := decodeJSONBody(ctx.request.Body, &req); err != nil {
+			if err := decodeJSONBody(ctx.request.Body, &req, h.jsonOptions); err != nil {
 				return req, Errorf(CodeInvalidArgument, "failed to decode body: %v", err)
 			}
 		}
@@ -281,8 +282,8 @@ func (h *execHandler[Req, Res]) serveHTTP(ctx *rpcContext) {
 
 // decodeJSONBody decodes at most one JSON value. An empty body leaves dst at
 // its zero value; after a value, only JSON whitespace is allowed.
-func decodeJSONBody(body io.Reader, dst any) error {
-	decoder := jsontext.NewDecoder(body)
+func decodeJSONBody(body io.Reader, dst any, options ...json.Options) error {
+	decoder := jsontext.NewDecoder(body, options...)
 	value, err := decoder.ReadValue()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -290,7 +291,7 @@ func decodeJSONBody(body io.Reader, dst any) error {
 		}
 		return err
 	}
-	if err := json.Unmarshal(value, dst); err != nil {
+	if err := json.Unmarshal(value, dst, options...); err != nil {
 		return err
 	}
 
@@ -374,7 +375,7 @@ func (h *handlerBase[Req, Res]) serve(ctx *rpcContext, cacheControl string, deco
 	}
 
 	// 4. Marshal the complete response before committing success.
-	data, marshalErr := marshalResponse(res)
+	data, marshalErr := marshalResponse(res, h.jsonOptions)
 	if marshalErr != nil {
 		logger := ctx.logger
 		if logger == nil {

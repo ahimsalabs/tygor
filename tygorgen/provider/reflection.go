@@ -616,10 +616,6 @@ func (b *reflectionSchemaBuilder) typeToDescriptor(ctx context.Context, t reflec
 	if t.PkgPath() == "time" && t.Name() == "Duration" {
 		return nil, fmt.Errorf("time.Duration has no default encoding/json/v2 representation")
 	}
-	// Check for special types first
-	if desc := b.checkSpecialType(t); desc != nil {
-		return desc, nil
-	}
 	// Preserve defined pointers as references so aliases and nullability remain
 	// available when classifying encoding/json/v2's json:",string" behavior.
 	if t.Kind() == reflect.Ptr && t.Name() != "" && t.PkgPath() != "" {
@@ -627,6 +623,19 @@ func (b *reflectionSchemaBuilder) typeToDescriptor(ctx context.Context, t reflec
 			return nil, err
 		}
 		return ir.Ref(b.getTypeName(t), t.PkgPath()), nil
+	}
+	// An unnamed pointer is structural even when it implements a custom codec.
+	// Classify its element independently so nullability is not collapsed to any.
+	if t.Kind() == reflect.Ptr {
+		elem, err := b.typeToDescriptor(ctx, t.Elem(), parentName, parentPkg)
+		if err != nil {
+			return nil, err
+		}
+		return ir.Ptr(elem), nil
+	}
+	// Check for special types after preserving pointer shape.
+	if desc := b.checkSpecialType(t); desc != nil {
+		return desc, nil
 	}
 
 	// Check for error types (unsupported)
@@ -770,13 +779,6 @@ func (b *reflectionSchemaBuilder) typeToDescriptor(ctx context.Context, t reflec
 		}
 		return ir.Map(key, value), nil
 
-	case reflect.Ptr:
-		elem, err := b.typeToDescriptor(ctx, t.Elem(), parentName, parentPkg)
-		if err != nil {
-			return nil, err
-		}
-		return ir.Ptr(elem), nil
-
 	case reflect.Struct:
 		// Anonymous struct
 		if t.Name() == "" {
@@ -869,18 +871,31 @@ func isJSONByteArrayReflect(t reflect.Type) bool {
 	return t.Kind() == reflect.Array && t.Elem() == reflect.TypeFor[byte]()
 }
 
-// hasCustomMarshaler checks every codec interface that can alter the v2 wire
-// representation. Both value and pointer method sets matter.
+// hasCustomMarshaler reports whether either direction has a custom codec.
 func (b *reflectionSchemaBuilder) hasCustomMarshaler(t reflect.Type) bool {
-	interfaces := []reflect.Type{
+	return hasCustomMarshalCodec(t) || hasCustomUnmarshalCodec(t)
+}
+
+func hasCustomMarshalCodec(t reflect.Type) bool {
+	return implementsCodecInterface(t, []reflect.Type{
 		jsonMarshalerToType,
 		jsonMarshalerType,
 		textAppenderType,
 		textMarshalerType,
+	})
+}
+
+func hasCustomUnmarshalCodec(t reflect.Type) bool {
+	return implementsCodecInterface(t, []reflect.Type{
 		jsonUnmarshalerFromType,
 		jsonUnmarshalerType,
 		textUnmarshalerType,
-	}
+	})
+}
+
+// implementsCodecInterface checks both value and pointer method sets, as the
+// JSON implementation may address a value before invoking its codec.
+func implementsCodecInterface(t reflect.Type, interfaces []reflect.Type) bool {
 	for _, iface := range interfaces {
 		if t.Implements(iface) || (t.Kind() != reflect.Ptr && reflect.PointerTo(t).Implements(iface)) {
 			return true

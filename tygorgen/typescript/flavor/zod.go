@@ -177,6 +177,7 @@ type fieldSchemaResult struct {
 }
 
 func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, typeName string) (fieldSchemaResult, error) {
+	stringEncoded := field.StringEncoded || descriptorStringEncodedNumber(ctx, field.Type)
 	rules := ParseValidateTag(field.ValidateTag)
 	outerRules, nestedRules, hasDive := splitDiveRules(rules)
 	if hasDive {
@@ -190,7 +191,7 @@ func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, 
 
 	// Get base schema from type, tracking nullability separately
 	// so we can apply validations before .nullable()
-	baseSchema, _, err := f.typeToZodWithNullable(ctx, field.Type, field.StringEncoded)
+	baseSchema, _, err := f.typeToZodWithNullable(ctx, field.Type, stringEncoded)
 	if err != nil {
 		return fieldSchemaResult{}, err
 	}
@@ -226,7 +227,7 @@ func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, 
 	}
 
 	// Get type hint for the underlying type
-	typeHint := f.typeHint(field.Type, field.StringEncoded)
+	typeHint := f.typeHint(field.Type, stringEncoded)
 
 	// Determine type kind for validation semantics
 	isPointer := validationTypeStartsWithPointer(ctx, field.Type)
@@ -239,10 +240,10 @@ func (f *ZodFlavor) emitFieldSchema(ctx *EmitContext, field ir.FieldDescriptor, 
 	var schema string
 	if f.mini {
 		// Zod-mini: use .check() for validations, functional wrapping for optional/nullable
-		schema, err = f.emitFieldSchemaMini(ctx, baseSchema, rules, typeKind, isNullable, isOptional, typeName, field.Name, field.Type, field.StringEncoded)
+		schema, err = f.emitFieldSchemaMini(ctx, baseSchema, rules, typeKind, isNullable, isOptional, typeName, field.Name, field.Type, stringEncoded)
 	} else {
 		// Regular Zod: use method chaining
-		schema, err = f.emitFieldSchemaRegular(ctx, baseSchema, rules, isString, isNullable, isOptional, typeName, field.Name, field.Type, field.StringEncoded)
+		schema, err = f.emitFieldSchemaRegular(ctx, baseSchema, rules, isString, isNullable, isOptional, typeName, field.Name, field.Type, stringEncoded)
 	}
 	if err != nil {
 		return fieldSchemaResult{}, err
@@ -982,6 +983,13 @@ func (f *ZodFlavor) stringEncodedEnumSchema(enum *ir.EnumDescriptor) (string, er
 	if len(enum.Members) == 0 {
 		return "z.never()", nil
 	}
+	if len(enum.StringEncodedValues) == len(enum.Members) {
+		values := make([]string, len(enum.StringEncodedValues))
+		for i, value := range enum.StringEncodedValues {
+			values[i] = strconv.Quote(value)
+		}
+		return "z.enum([" + strings.Join(values, ", ") + "])", nil
+	}
 	refine := func(base, predicate string) string {
 		if f.mini {
 			return base + ".check(z.refine(" + predicate + "))"
@@ -1167,10 +1175,16 @@ func (f *ZodFlavor) stringEncodedValidation(ctx *EmitContext, rule ValidateRule,
 }
 
 func (f *ZodFlavor) primitiveToZod(p *ir.PrimitiveDescriptor, stringEncoded bool) string {
+	stringEncoded = stringEncoded || p.StringEncoded
 	if f.mini {
 		return f.primitiveToZodMini(p, stringEncoded)
 	}
 	return f.primitiveToZodRegular(p, stringEncoded)
+}
+
+func descriptorStringEncodedNumber(ctx *EmitContext, typ ir.TypeDescriptor) bool {
+	primitive, ok := resolveValidationType(ctx, typ).(*ir.PrimitiveDescriptor)
+	return ok && primitive.StringEncoded
 }
 
 func (f *ZodFlavor) primitiveToZodRegular(p *ir.PrimitiveDescriptor, stringEncoded bool) string {
@@ -1479,7 +1493,20 @@ func (f *ZodFlavor) emitEnum(ctx *EmitContext, e *ir.EnumDescriptor) ([]byte, er
 	typeName := ctx.TypeName(e.Name)
 	schemaName := ctx.SchemaName(e.Name)
 
-	// Collect string values
+	if len(e.StringEncodedValues) == len(e.Members) && len(e.Members) > 0 {
+		values := make([]string, len(e.StringEncodedValues))
+		for i, value := range e.StringEncodedValues {
+			values[i] = strconv.Quote(value)
+		}
+		buf.WriteString(fmt.Sprintf("export const %s = z.enum([%s]);\n", schemaName, strings.Join(values, ", ")))
+		if !ctx.EmitTypes {
+			buf.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n", typeName, schemaName))
+		}
+		buf.WriteString("\n")
+		return buf.Bytes(), nil
+	}
+
+	// Collect ordinary member values.
 	values := make([]string, 0, len(e.Members))
 	for _, m := range e.Members {
 		switch v := m.Value.(type) {

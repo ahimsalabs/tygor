@@ -207,13 +207,14 @@ type streamHandler[Req any, Res any] struct {
 	maxRequestBodySize *uint64
 	writeTimeout       *time.Duration
 	heartbeatInterval  *time.Duration
+	jsonOptions        json.Options
 }
 
 // streamIter2 creates a new SSE streaming handler from an iterator function.
 // This is an internal API preserved for potential future use with iterator composition.
 // The public [Service.Stream] method provides a simpler callback-based API.
 func streamIter2[Req any, Res any](fn func(context.Context, Req) iter.Seq2[Res, error], options ...StreamOption) *streamHandler[Req, Res] {
-	config := streamConfig{}
+	config := streamConfig{jsonOptions: json.DefaultOptionsV2()}
 	for _, option := range options {
 		option.applyStream(&config)
 	}
@@ -225,6 +226,7 @@ func streamIter2[Req any, Res any](fn func(context.Context, Req) iter.Seq2[Res, 
 		maxRequestBodySize: config.maxRequestBodySize,
 		writeTimeout:       config.writeTimeout,
 		heartbeatInterval:  config.heartbeatInterval,
+		jsonOptions:        config.jsonOptions,
 	}
 }
 
@@ -255,17 +257,17 @@ func makeStreamHandler[Req any, Res any](fn func(context.Context, Req, StreamWri
 		maxRequestBodySize: config.maxRequestBodySize,
 		writeTimeout:       config.writeTimeout,
 		heartbeatInterval:  config.heartbeatInterval,
+		jsonOptions:        config.jsonOptions,
 	}
 }
 
 // metadata returns the runtime metadata for the stream handler.
 func (h *streamHandler[Req, Res]) metadata() *internal.MethodMetadata {
-	var req Req
-	var res Res
 	return &internal.MethodMetadata{
-		Primitive: "stream",
-		Request:   reflect.TypeOf(req),
-		Response:  reflect.TypeOf(res),
+		Primitive:   "stream",
+		Request:     reflect.TypeFor[Req](),
+		Response:    reflect.TypeFor[Res](),
+		JSONOptions: h.jsonOptions,
 	}
 }
 
@@ -408,7 +410,7 @@ func (h *streamHandler[Req, Res]) decodeRequest(ctx *rpcContext) (Req, error) {
 		if effectiveLimit > 0 {
 			ctx.request.Body = http.MaxBytesReader(ctx.writer, ctx.request.Body, int64(effectiveLimit))
 		}
-		if err := decodeJSONBody(ctx.request.Body, &req); err != nil {
+		if err := decodeJSONBody(ctx.request.Body, &req, h.jsonOptions); err != nil {
 			return req, Errorf(CodeInvalidArgument, "failed to decode body: %v", err)
 		}
 	}
@@ -593,7 +595,7 @@ func (h *streamHandler[Req, Res]) streamEvents(ctx *rpcContext, executionCtx con
 				return result
 			}
 
-			frame, marshalErr := marshalSSEEventFrame(item.event)
+			frame, marshalErr := marshalSSEEventFrame(item.event, h.jsonOptions)
 			if marshalErr != nil {
 				state.serializationErr = marshalErr
 				cause := session.fail(marshalErr)
@@ -631,7 +633,7 @@ func validateSSEEventID(id string) error {
 	return nil
 }
 
-func marshalSSEEventFrame(event any) ([]byte, error) {
+func marshalSSEEventFrame(event any, options ...json.Options) ([]byte, error) {
 	var (
 		eventID    string
 		hasEventID bool
@@ -645,17 +647,30 @@ func marshalSSEEventFrame(event any) ([]byte, error) {
 		return nil, err
 	}
 
-	data, err := json.Marshal(response{Result: event})
+	payload, err := json.Marshal(event, options...)
 	if err != nil {
 		return nil, fmt.Errorf("marshal event: %w", err)
 	}
+	data := make([]byte, 0, len(payload)+11)
+	data = append(data, `{"result":`...)
+	data = append(data, payload...)
+	data = append(data, '}')
 
 	var frame bytes.Buffer
 	if hasEventID {
 		fmt.Fprintf(&frame, "id: %s\n", eventID)
 	}
-	fmt.Fprintf(&frame, "data: %s\n\n", data)
+	appendSSEData(&frame, data)
 	return frame.Bytes(), nil
+}
+
+func appendSSEData(frame *bytes.Buffer, data []byte) {
+	for line := range bytes.SplitSeq(data, []byte{'\n'}) {
+		frame.WriteString("data: ")
+		frame.Write(line)
+		frame.WriteByte('\n')
+	}
+	frame.WriteByte('\n')
 }
 
 func marshalSSEErrorFrame(ctx *rpcContext, err error) []byte {

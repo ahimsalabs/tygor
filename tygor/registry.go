@@ -2,6 +2,7 @@ package tygor
 
 import (
 	"context"
+	json "encoding/json/v2"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -27,6 +28,7 @@ type App struct {
 	streamHeartbeat         time.Duration
 	streamHeartbeatIsSet    bool // distinguishes zero (disabled) from unset (use default)
 	handler                 http.Handler
+	jsonOptions             json.Options
 }
 
 const (
@@ -198,6 +200,7 @@ type Service struct {
 	maxRequestBodySize *uint64
 	streamWriteTimeout *time.Duration
 	streamHeartbeat    *time.Duration
+	jsonOptions        json.Options
 }
 
 // Exec registers a POST handler for a non-streaming API operation. Options are
@@ -206,6 +209,7 @@ func (s *Service) Exec[Req, Res any](name string, fn func(context.Context, Req) 
 	config := execConfig{
 		interceptors:       slices.Clone(s.interceptors),
 		maxRequestBodySize: clonePtr(s.maxRequestBodySize),
+		jsonOptions:        json.JoinOptions(json.DefaultOptionsV2(), s.registry.jsonOptions, s.jsonOptions),
 	}
 	for _, option := range options {
 		option.applyExec(&config)
@@ -217,7 +221,7 @@ func (s *Service) Exec[Req, Res any](name string, fn func(context.Context, Req) 
 // Query registers a GET handler for a read operation. Options are applied
 // before the endpoint becomes visible to requests.
 func (s *Service) Query[Req, Res any](name string, fn func(context.Context, Req) (Res, error), options ...QueryOption) {
-	config := queryConfig{interceptors: slices.Clone(s.interceptors)}
+	config := queryConfig{interceptors: slices.Clone(s.interceptors), jsonOptions: json.JoinOptions(json.DefaultOptionsV2(), s.registry.jsonOptions, s.jsonOptions)}
 	for _, option := range options {
 		option.applyQuery(&config)
 	}
@@ -248,6 +252,7 @@ func (s *Service) Stream[Req, Res any](name string, fn func(context.Context, Req
 		maxRequestBodySize: clonePtr(s.maxRequestBodySize),
 		writeTimeout:       clonePtr(s.streamWriteTimeout),
 		heartbeatInterval:  clonePtr(s.streamHeartbeat),
+		jsonOptions:        json.JoinOptions(json.DefaultOptionsV2(), s.registry.jsonOptions, s.jsonOptions),
 	}
 	for _, option := range options {
 		option.applyStream(&config)
@@ -263,6 +268,7 @@ func (s *Service) LiveValue[T any](name string, value *LiveValue[T], options ...
 		interceptors:      slices.Clone(s.interceptors),
 		writeTimeout:      clonePtr(s.streamWriteTimeout),
 		heartbeatInterval: clonePtr(s.streamHeartbeat),
+		jsonOptions:       json.JoinOptions(json.DefaultOptionsV2(), s.registry.jsonOptions, s.jsonOptions),
 	}
 	for _, option := range options {
 		option.applyLiveValue(&config)

@@ -69,6 +69,20 @@ func TestEmitter_EmitType(t *testing.T) {
 			want:     []string{`export type Status = "active" | "inactive";`},
 		},
 		{
+			name: "stringified numeric enum uses projected wire values",
+			typ: &ir.EnumDescriptor{
+				Name: ir.GoIdentifier{Name: "Amount", Package: "test"},
+				Members: []ir.EnumMember{
+					{Name: "Million", Value: float64(1e6)},
+				},
+				Underlying:          ir.Float(64),
+				StringEncodedValues: []string{"1000000"},
+			},
+			config:   GeneratorConfig{},
+			tsConfig: TypeScriptConfig{EnumStyle: "union", EmitExport: true},
+			want:     []string{`export type Amount = "1000000";`},
+		},
+		{
 			name: "enum as const enum",
 			typ: &ir.EnumDescriptor{
 				Name: ir.GoIdentifier{Name: "Status", Package: "test"},

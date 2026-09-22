@@ -10,6 +10,15 @@ type EnumDescriptor struct {
 	// Members contains all enum variants.
 	Members []EnumMember
 
+	// Underlying preserves the enum's Go numeric width for wire formatting.
+	// It is nil for string enums and legacy descriptors without this metadata.
+	Underlying *PrimitiveDescriptor
+
+	// StringEncodedValues contains each member's exact JSON string contents when
+	// StringifyNumbers projects a numeric enum. Members retain numeric values so
+	// validation keeps the enum's numeric semantics.
+	StringEncodedValues []string
+
 	// Documentation for this type.
 	Documentation Documentation
 

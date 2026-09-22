@@ -791,48 +791,48 @@ function createSSEStream<T>(
               const id = sseFieldValue(line, "id");
               if (id !== undefined && !id.includes("\0")) lastEventId = id;
             }
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
+            const dataLines = lines
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).replace(/^ /, ""));
+            if (dataLines.length === 0) continue;
+            const data = dataLines.join("\n");
+            if (myController.signal.aborted) return;
+            try {
+              const envelope = JSON.parse(data) as Response<T>;
+
+              if (envelope.error) {
+                const code = (envelope.error.code || "internal") as ErrorCode;
+                const msg = envelope.error.message || "Unknown error";
+                emitRpcError(service, method, code, msg, emitErrors);
+                setStatus("error", new ServerError(code, msg, httpStatus, envelope.error.details));
+                return;
+              }
+
+              // Response validation
+              if (validateResponse && schemas?.[opId]?.response) {
+                const schema = schemas[opId].response;
+                const result = await schema["~standard"].validate(envelope.result);
                 if (myController.signal.aborted) return;
-                const data = line.slice(6);
-                try {
-                  const envelope = JSON.parse(data) as Response<T>;
-
-                  if (envelope.error) {
-                    const code = (envelope.error.code || "internal") as ErrorCode;
-                    const msg = envelope.error.message || "Unknown error";
-                    emitRpcError(service, method, code, msg, emitErrors);
-                    setStatus("error", new ServerError(code, msg, httpStatus, envelope.error.details));
-                    return;
-                  }
-
-                  // Response validation
-                  if (validateResponse && schemas?.[opId]?.response) {
-                    const schema = schemas[opId].response;
-                    const result = await schema["~standard"].validate(envelope.result);
-                    if (myController.signal.aborted) return;
-                    if (result.issues) {
-                      const err = new ValidationError(opId, "response", result.issues);
-                      emitRpcError(service, method, "validation_error", err.message, emitErrors);
-                      setStatus("error", err);
-                      return;
-                    }
-                  }
-
-                  // Update data (notifies both listeners and dataListeners)
-                  if (myController.signal.aborted) return;
-                  setData(envelope.result as T);
-                } catch (e) {
-                  if (myController.signal.aborted) return;
-                  if (e instanceof ServerError || e instanceof ValidationError) {
-                    setStatus("error", e);
-                    return;
-                  }
-                  emitRpcError(service, method, "transport_error", "Failed to parse SSE event", emitErrors);
-                  setStatus("error", new TransportError("Failed to parse SSE event", httpStatus, e, data));
+                if (result.issues) {
+                  const err = new ValidationError(opId, "response", result.issues);
+                  emitRpcError(service, method, "validation_error", err.message, emitErrors);
+                  setStatus("error", err);
                   return;
                 }
               }
+
+              // Update data (notifies both listeners and dataListeners)
+              if (myController.signal.aborted) return;
+              setData(envelope.result as T);
+            } catch (e) {
+              if (myController.signal.aborted) return;
+              if (e instanceof ServerError || e instanceof ValidationError) {
+                setStatus("error", e);
+                return;
+              }
+              emitRpcError(service, method, "transport_error", "Failed to parse SSE event", emitErrors);
+              setStatus("error", new TransportError("Failed to parse SSE event", httpStatus, e, data));
+              return;
             }
           }
         }
@@ -1307,48 +1307,48 @@ function createLiveValueClient<T>(
               const id = sseFieldValue(line, "id");
               if (id !== undefined && !id.includes("\0")) lastEventId = id;
             }
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
+            const dataLines = lines
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).replace(/^ /, ""));
+            if (dataLines.length === 0) continue;
+            const data = dataLines.join("\n");
+            if (myController.signal.aborted) return;
+            try {
+              const envelope = JSON.parse(data) as Response<T>;
+
+              if (envelope.error) {
+                const code = (envelope.error.code || "internal") as ErrorCode;
+                const msg = envelope.error.message || "Unknown error";
+                emitRpcError(service, method, code, msg, emitErrors);
+                setStatus("error", new ServerError(code, msg, httpStatus, envelope.error.details));
+                return;
+              }
+
+              // Response validation
+              if (validateResponse && schemas?.[opId]?.response) {
+                const schema = schemas[opId].response;
+                const result = await schema["~standard"].validate(envelope.result);
                 if (myController.signal.aborted) return;
-                const data = line.slice(6);
-                try {
-                  const envelope = JSON.parse(data) as Response<T>;
-
-                  if (envelope.error) {
-                    const code = (envelope.error.code || "internal") as ErrorCode;
-                    const msg = envelope.error.message || "Unknown error";
-                    emitRpcError(service, method, code, msg, emitErrors);
-                    setStatus("error", new ServerError(code, msg, httpStatus, envelope.error.details));
-                    return;
-                  }
-
-                  // Response validation
-                  if (validateResponse && schemas?.[opId]?.response) {
-                    const schema = schemas[opId].response;
-                    const result = await schema["~standard"].validate(envelope.result);
-                    if (myController.signal.aborted) return;
-                    if (result.issues) {
-                      const err = new ValidationError(opId, "response", result.issues);
-                      emitRpcError(service, method, "validation_error", err.message, emitErrors);
-                      setStatus("error", err);
-                      return;
-                    }
-                  }
-
-                  // Update data
-                  if (myController.signal.aborted) return;
-                  setData(envelope.result as T);
-                } catch (e) {
-                  if (myController.signal.aborted) return;
-                  if (e instanceof ServerError || e instanceof ValidationError) {
-                    setStatus("error", e);
-                    return;
-                  }
-                  emitRpcError(service, method, "transport_error", "Failed to parse livevalue event", emitErrors);
-                  setStatus("error", new TransportError("Failed to parse livevalue event", httpStatus, e, data));
+                if (result.issues) {
+                  const err = new ValidationError(opId, "response", result.issues);
+                  emitRpcError(service, method, "validation_error", err.message, emitErrors);
+                  setStatus("error", err);
                   return;
                 }
               }
+
+              // Update data
+              if (myController.signal.aborted) return;
+              setData(envelope.result as T);
+            } catch (e) {
+              if (myController.signal.aborted) return;
+              if (e instanceof ServerError || e instanceof ValidationError) {
+                setStatus("error", e);
+                return;
+              }
+              emitRpcError(service, method, "transport_error", "Failed to parse livevalue event", emitErrors);
+              setStatus("error", new TransportError("Failed to parse livevalue event", httpStatus, e, data));
+              return;
             }
           }
         }

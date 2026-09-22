@@ -108,6 +108,25 @@ func TestZodFlavor_EmitEnum(t *testing.T) {
 	}
 }
 
+func TestZodFlavor_EmitStringifiedNumericEnum(t *testing.T) {
+	f := &ZodFlavor{}
+	ctx := &EmitContext{IndentStr: "  ", EmitTypes: true}
+	e := &ir.EnumDescriptor{
+		Name:                ir.GoIdentifier{Name: "Amount"},
+		Members:             []ir.EnumMember{{Name: "Million", Value: float64(1e6)}},
+		Underlying:          ir.Float(64),
+		StringEncodedValues: []string{"1000000"},
+	}
+
+	got, err := f.EmitType(ctx, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output := string(got); !strings.Contains(output, `z.enum(["1000000"])`) {
+		t.Fatalf("stringified enum schema = %s", output)
+	}
+}
+
 func TestZodFlavor_EmitAlias(t *testing.T) {
 	f := &ZodFlavor{}
 	ctx := &EmitContext{

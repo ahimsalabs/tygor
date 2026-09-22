@@ -1,6 +1,7 @@
 package tygor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
@@ -152,11 +153,15 @@ func (a *LiveValue[T]) Subscribe(ctx context.Context) iter.Seq[T] {
 }
 
 func makeLiveValueHandler[T any](a *LiveValue[T], config liveValueConfig) *liveValueHandler[T] {
+	if config.jsonOptions == nil {
+		config.jsonOptions = json.DefaultOptionsV2()
+	}
 	return &liveValueHandler[T]{
 		liveValue:         a,
 		interceptors:      config.interceptors,
 		writeTimeout:      config.writeTimeout,
 		heartbeatInterval: config.heartbeatInterval,
+		jsonOptions:       config.jsonOptions,
 	}
 }
 
@@ -265,16 +270,16 @@ type liveValueHandler[T any] struct {
 	interceptors      []UnaryInterceptor
 	writeTimeout      *time.Duration
 	heartbeatInterval *time.Duration
+	jsonOptions       json.Options
 }
 
 // metadata returns the runtime metadata for the livevalue handler.
 func (h *liveValueHandler[T]) metadata() *internal.MethodMetadata {
-	var req Empty
-	var res T
 	return &internal.MethodMetadata{
-		Primitive: "livevalue",
-		Request:   reflect.TypeOf(req),
-		Response:  reflect.TypeOf(res),
+		Primitive:   "livevalue",
+		Request:     reflect.TypeFor[Empty](),
+		Response:    reflect.TypeFor[T](),
+		JSONOptions: h.jsonOptions,
 	}
 }
 
@@ -338,6 +343,11 @@ func (h *liveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 		return
 	}
 	defer h.liveValue.removeSubscriber(subID)
+	currentPayload, err := h.encodeSnapshot(current)
+	if err != nil {
+		handleError(ctx, fmt.Errorf("marshal livevalue snapshot: %w", err))
+		return
+	}
 
 	// Set SSE headers
 	ctx.panicRecovery.own(func() {
@@ -370,7 +380,7 @@ func (h *liveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 		abortTransport("failed to flush livevalue headers", err)
 	}
 
-	if err := state.writeFrame(ctx, writeTimeout, liveValueSSEFrame(current)); err != nil {
+	if err := state.writeFrame(ctx, writeTimeout, liveValueSSEFrame(currentPayload)); err != nil {
 		abortTransport("failed to write initial livevalue value", err)
 	}
 
@@ -398,16 +408,35 @@ func (h *liveValueHandler[T]) serveHTTP(ctx *rpcContext) {
 				return // LiveValue was closed
 			}
 
-			if err := state.writeFrame(ctx, writeTimeout, liveValueSSEFrame(data)); err != nil {
+			payload, err := h.encodeSnapshot(data)
+			if err != nil {
+				logger.Error("failed to marshal livevalue update", slog.String("endpoint", ctx.EndpointID()), slog.Any("error", err))
+				if writeErr := state.writeFrame(ctx, writeTimeout, marshalSSEErrorFrame(ctx, fmt.Errorf("marshal livevalue update: %w", err))); writeErr != nil {
+					abortTransport("failed to write terminal livevalue error", writeErr)
+				}
+				return
+			}
+			if err := state.writeFrame(ctx, writeTimeout, liveValueSSEFrame(payload)); err != nil {
 				abortTransport("failed to write livevalue update", err)
 			}
 		}
 	}
 }
 
+func (h *liveValueHandler[T]) encodeSnapshot(data jsontext.Value) ([]byte, error) {
+	value, err := decodeLiveValue[T](data)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(value, h.jsonOptions)
+}
+
 func liveValueSSEFrame(data jsontext.Value) []byte {
-	frame := make([]byte, 0, len(data)+len("data: {\"result\":}\n\n"))
-	frame = append(frame, "data: {\"result\":"...)
-	frame = append(frame, data...)
-	return append(frame, "}\n\n"...)
+	payload := make([]byte, 0, len(data)+11)
+	payload = append(payload, `{"result":`...)
+	payload = append(payload, data...)
+	payload = append(payload, '}')
+	var frame bytes.Buffer
+	appendSSEData(&frame, payload)
+	return frame.Bytes()
 }

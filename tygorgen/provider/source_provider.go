@@ -547,7 +547,7 @@ func (b *schemaBuilder) extractNamedType(tn *types.TypeName) error {
 		if named.Obj() != nil && named.Obj().Pkg() != nil {
 			pkgPath = normalizePkgPath(named.Obj().Pkg())
 		}
-		enumDesc := b.buildEnumDescriptor(tn.Name(), pkgPath, consts, doc, src)
+		enumDesc := b.buildEnumDescriptor(tn.Name(), pkgPath, named.Underlying().(*types.Basic), consts, doc, src)
 		b.namedTypes[key] = enumDesc
 		b.schema.AddType(enumDesc)
 		return nil
@@ -1510,7 +1510,7 @@ func (b *schemaBuilder) scanEnumConstants(tn *types.TypeName) {
 }
 
 // buildEnumDescriptor creates an EnumDescriptor from constants.
-func (b *schemaBuilder) buildEnumDescriptor(name, pkgPath string, consts []enumConstant, doc ir.Documentation, src ir.Source) *ir.EnumDescriptor {
+func (b *schemaBuilder) buildEnumDescriptor(name, pkgPath string, underlying *types.Basic, consts []enumConstant, doc ir.Documentation, src ir.Source) *ir.EnumDescriptor {
 	members := make([]ir.EnumMember, len(consts))
 	for i, c := range consts {
 		value := b.constantValue(c.value)
@@ -1521,9 +1521,14 @@ func (b *schemaBuilder) buildEnumDescriptor(name, pkgPath string, consts []enumC
 		}
 	}
 
+	var underlyingPrimitive *ir.PrimitiveDescriptor
+	if descriptor, err := b.convertBasicType(underlying); err == nil {
+		underlyingPrimitive, _ = descriptor.(*ir.PrimitiveDescriptor)
+	}
 	return &ir.EnumDescriptor{
 		Name:          ir.GoIdentifier{Name: name, Package: pkgPath},
 		Members:       members,
+		Underlying:    underlyingPrimitive,
 		Documentation: doc,
 		Source:        src,
 	}

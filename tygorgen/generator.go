@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"tygor.dev/internal"
+	"tygor.dev/internal/jsoncontract"
 	"tygor.dev/tygor"
 	"tygor.dev/tygorgen/ir"
 	"tygor.dev/tygorgen/provider"
@@ -292,6 +293,9 @@ func Generate(app *tygor.App, cfg *Config) (*GenerateResult, error) {
 
 	// Apply defaults
 	cfg = applyConfigDefaults(cfg)
+	if cfg.OptionalType != "default" {
+		return nil, fmt.Errorf("OptionalType %q is incompatible with app generation: endpoint contracts use encoding/json/v2 wire optionality and nullability", cfg.OptionalType)
+	}
 
 	ctx := context.Background()
 
@@ -317,7 +321,7 @@ func Generate(app *tygor.App, cfg *Config) (*GenerateResult, error) {
 	}
 
 	// 2. Build service descriptors from routes
-	services, err := buildServiceDescriptors(routes, convertEndpointType)
+	services, err := buildServiceDescriptors(schema, routes, convertEndpointType)
 	if err != nil {
 		return nil, err
 	}
@@ -421,9 +425,10 @@ func Generate(app *tygor.App, cfg *Config) (*GenerateResult, error) {
 type endpointTypeConverter func(t reflect.Type, preserveTopPointer bool) (ir.TypeDescriptor, error)
 
 // buildServiceDescriptors converts route metadata to IR service descriptors.
-func buildServiceDescriptors(routes internal.RouteMap, convert endpointTypeConverter) ([]ir.ServiceDescriptor, error) {
+func buildServiceDescriptors(schema *ir.Schema, routes internal.RouteMap, convert endpointTypeConverter) ([]ir.ServiceDescriptor, error) {
 	// Group routes by service
 	serviceMap := make(map[string]*ir.ServiceDescriptor)
+	projector := newJSONProjector(schema)
 
 	// Sort route keys for deterministic output
 	keys := make([]string, 0, len(routes))
@@ -434,6 +439,16 @@ func buildServiceDescriptors(routes internal.RouteMap, convert endpointTypeConve
 
 	for _, key := range keys {
 		route := routes[key]
+		contract := jsoncontract.Normalize(route.JSONOptions)
+		if legacy := contract.LegacyOptions(); len(legacy) > 0 {
+			return nil, fmt.Errorf("endpoint %s uses encoding/json v1 compatibility options unsupported by Tygor's native-v2 contract: %s", key, strings.Join(legacy, ", "))
+		}
+		if contract.Encode.HasMarshalers {
+			return nil, fmt.Errorf("endpoint %s uses json.WithMarshalers; code generation requires an explicit wire declaration for opaque marshalers", key)
+		}
+		if (route.Primitive == "exec" || route.Primitive == "stream") && contract.Decode.HasUnmarshalers {
+			return nil, fmt.Errorf("endpoint %s uses json.WithUnmarshalers; code generation requires an explicit wire declaration for opaque unmarshalers", key)
+		}
 
 		// Parse service and method name from key (e.g., "Users.Create")
 		parts := strings.SplitN(key, ".", 2)
@@ -460,6 +475,7 @@ func buildServiceDescriptors(routes internal.RouteMap, convert endpointTypeConve
 			FullName:  key,
 			Primitive: route.Primitive,
 			Path:      "/" + strings.ReplaceAll(key, ".", "/"),
+			JSON:      jsonContractToIR(contract),
 		}
 
 		// Convert request type to descriptor
@@ -469,6 +485,12 @@ func buildServiceDescriptors(routes internal.RouteMap, convert endpointTypeConve
 			if err != nil {
 				return nil, fmt.Errorf("convert request type for endpoint %s: %w", key, err)
 			}
+			if route.Primitive != "query" {
+				request, err = projector.projectType(request, jsonDecodeProjection, contract)
+				if err != nil {
+					return nil, fmt.Errorf("project request JSON contract for endpoint %s: %w", key, err)
+				}
+			}
 			endpoint.Request = request
 		}
 
@@ -477,6 +499,10 @@ func buildServiceDescriptors(routes internal.RouteMap, convert endpointTypeConve
 			response, err := convert(route.Response, true)
 			if err != nil {
 				return nil, fmt.Errorf("convert response type for endpoint %s: %w", key, err)
+			}
+			response, err = projector.projectType(response, jsonEncodeProjection, contract)
+			if err != nil {
+				return nil, fmt.Errorf("project response JSON contract for endpoint %s: %w", key, err)
 			}
 			endpoint.Response = response
 		} else {
@@ -500,6 +526,39 @@ func buildServiceDescriptors(routes internal.RouteMap, convert endpointTypeConve
 	}
 
 	return services, nil
+}
+
+func jsonContractToIR(contract jsoncontract.Contract) ir.JSONContract {
+	return ir.JSONContract{
+		Encode: ir.JSONEncodeContract{
+			StringifyNumbers:          contract.Encode.StringifyNumbers,
+			FormatNilSliceAsNull:      contract.Encode.FormatNilSliceAsNull,
+			FormatNilMapAsNull:        contract.Encode.FormatNilMapAsNull,
+			OmitZeroStructFields:      contract.Encode.OmitZeroStructFields,
+			MatchCaseInsensitiveNames: contract.Encode.MatchCaseInsensitiveNames,
+			AllowDuplicateNames:       contract.Encode.AllowDuplicateNames,
+			AllowInvalidUTF8:          contract.Encode.AllowInvalidUTF8,
+			EscapeForHTML:             contract.Encode.EscapeForHTML,
+			EscapeForJS:               contract.Encode.EscapeForJS,
+			PreserveRawStrings:        contract.Encode.PreserveRawStrings,
+			CanonicalizeRawInts:       contract.Encode.CanonicalizeRawInts,
+			CanonicalizeRawFloats:     contract.Encode.CanonicalizeRawFloats,
+			ReorderRawObjects:         contract.Encode.ReorderRawObjects,
+			Deterministic:             contract.Encode.Deterministic,
+			SpaceAfterColon:           contract.Encode.SpaceAfterColon,
+			SpaceAfterComma:           contract.Encode.SpaceAfterComma,
+			Multiline:                 contract.Encode.Multiline,
+			Indent:                    contract.Encode.Indent,
+			IndentPrefix:              contract.Encode.IndentPrefix,
+		},
+		Decode: ir.JSONDecodeContract{
+			StringifyNumbers:          contract.Decode.StringifyNumbers,
+			MatchCaseInsensitiveNames: contract.Decode.MatchCaseInsensitiveNames,
+			RejectUnknownMembers:      contract.Decode.RejectUnknownMembers,
+			AllowDuplicateNames:       contract.Decode.AllowDuplicateNames,
+			AllowInvalidUTF8:          contract.Decode.AllowInvalidUTF8,
+		},
+	}
 }
 
 // reflectTypeToIRRef converts a reflected endpoint type to its wire descriptor.

@@ -632,7 +632,6 @@ func TestGenerate_CustomConfig(t *testing.T) {
 		Provider:         "reflection",
 		PreserveComments: "none",
 		EnumStyle:        "enum",
-		OptionalType:     "null",
 		TypeMappings: map[string]string{
 			"custom.Type": "CustomType",
 		},
