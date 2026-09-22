@@ -1,6 +1,6 @@
 package ir
 
-import "encoding/json"
+import json "encoding/json/v2"
 
 // JSON serialization support for IR types.
 // All types include a "kind" field for type discrimination.
@@ -44,13 +44,15 @@ func (d *EnumDescriptor) MarshalJSON() ([]byte, error) {
 // MarshalJSON implements json.Marshaler for PrimitiveDescriptor.
 func (d *PrimitiveDescriptor) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
-		Kind          string `json:"kind"`
-		PrimitiveKind string `json:"primitiveKind"`
-		BitSize       int    `json:"bitSize,omitempty"`
+		Kind            string `json:"kind"`
+		PrimitiveKind   string `json:"primitiveKind"`
+		BitSize         int    `json:"bitSize,omitempty"`
+		ByteArrayLength *int   `json:"byteArrayLength,omitempty"`
 	}{
-		Kind:          "primitive",
-		PrimitiveKind: d.PrimitiveKind.String(),
-		BitSize:       d.BitSize,
+		Kind:            "primitive",
+		PrimitiveKind:   d.PrimitiveKind.String(),
+		BitSize:         d.BitSize,
+		ByteArrayLength: d.ByteArrayLength,
 	})
 }
 
@@ -148,23 +150,27 @@ func (id GoIdentifier) MarshalJSON() ([]byte, error) {
 // MarshalJSON implements json.Marshaler for FieldDescriptor.
 func (f FieldDescriptor) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
-		Name          string         `json:"name"`
-		Type          TypeDescriptor `json:"type"`
-		JSONName      string         `json:"jsonName"`
-		Optional      bool           `json:"optional,omitempty"`
-		StringEncoded bool           `json:"stringEncoded,omitempty"`
-		Skip          bool           `json:"skip,omitempty"`
-		ValidateTag   string         `json:"validateTag,omitempty"`
-		Doc           string         `json:"doc,omitempty"`
+		Name              string         `json:"name"`
+		Type              TypeDescriptor `json:"type"`
+		JSONName          string         `json:"jsonName"`
+		OmitEmpty         bool           `json:"omitEmpty,omitempty"`
+		OmitZero          bool           `json:"omitZero,omitempty"`
+		OmitIfEmbeddedNil bool           `json:"omitIfEmbeddedNil,omitempty"`
+		StringEncoded     bool           `json:"stringEncoded,omitempty"`
+		Skip              bool           `json:"skip,omitempty"`
+		ValidateTag       string         `json:"validateTag,omitempty"`
+		Doc               string         `json:"doc,omitempty"`
 	}{
-		Name:          f.Name,
-		Type:          f.Type,
-		JSONName:      f.JSONName,
-		Optional:      f.Optional,
-		StringEncoded: f.StringEncoded,
-		Skip:          f.Skip,
-		ValidateTag:   f.ValidateTag,
-		Doc:           f.Documentation.Summary,
+		Name:              f.Name,
+		Type:              f.Type,
+		JSONName:          f.JSONName,
+		OmitEmpty:         f.OmitEmpty,
+		OmitZero:          f.OmitZero,
+		OmitIfEmbeddedNil: f.OmitIfEmbeddedNil,
+		StringEncoded:     f.StringEncoded,
+		Skip:              f.Skip,
+		ValidateTag:       f.ValidateTag,
+		Doc:               f.Documentation.Summary,
 	})
 }
 

@@ -2,7 +2,8 @@ package tygorgen
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json"
+	jsonv2 "encoding/json/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -69,13 +70,13 @@ func TestReflectTypeToIRRefPreservesWireShapeAndGenericIdentity(t *testing.T) {
 
 	t.Run("defined byte elements", func(t *testing.T) {
 		descriptor := reflectTypeToIRRef(reflect.TypeFor[[]testdata.Octet](), true, false)
-		primitive, ok := descriptor.(*ir.PrimitiveDescriptor)
-		if !ok || primitive.PrimitiveKind != ir.PrimitiveBytes {
-			t.Fatalf("[]Octet endpoint = %#v, want bytes primitive", descriptor)
+		array, ok := descriptor.(*ir.ArrayDescriptor)
+		if !ok || array.Length != 0 {
+			t.Fatalf("[]Octet endpoint = %#v, want slice descriptor", descriptor)
 		}
 
 		descriptor = reflectTypeToIRRef(reflect.TypeFor[[]testdata.MarshaledOctet](), true, false)
-		array, ok := descriptor.(*ir.ArrayDescriptor)
+		array, ok = descriptor.(*ir.ArrayDescriptor)
 		if !ok || array.Length != 0 {
 			t.Fatalf("[]MarshaledOctet endpoint = %#v, want slice descriptor", descriptor)
 		}
@@ -320,12 +321,16 @@ func TestGenerate_SourceGenericDefinedBytesUseJSONWireType(t *testing.T) {
 			}
 		}
 	}
-	isBytes := func(descriptor ir.TypeDescriptor) bool {
-		primitive, ok := descriptor.(*ir.PrimitiveDescriptor)
-		return ok && primitive.PrimitiveKind == ir.PrimitiveBytes
+	isOctetSlice := func(descriptor ir.TypeDescriptor) bool {
+		array, ok := descriptor.(*ir.ArrayDescriptor)
+		if !ok || array.Length != 0 {
+			return false
+		}
+		ref, ok := array.Element.(*ir.ReferenceDescriptor)
+		return ok && ref.Target.Name == "Octet"
 	}
-	assertArgument("Echo", isBytes, "bytes primitive")
-	assertArgument("Phantom", isBytes, "bytes primitive even though the generic field is unused")
+	assertArgument("Echo", isOctetSlice, "slice of defined Octet")
+	assertArgument("Phantom", isOctetSlice, "slice of defined Octet even though the generic field is unused")
 	assertArgument("Custom", func(descriptor ir.TypeDescriptor) bool {
 		array, ok := descriptor.(*ir.ArrayDescriptor)
 		if !ok || array.Length != 0 {
@@ -340,15 +345,18 @@ func TestGenerate_SourceGenericDefinedBytesUseJSONWireType(t *testing.T) {
 			return false
 		}
 		array, ok := mapping.Value.(*ir.ArrayDescriptor)
-		return ok && array.Length == 0 && isBytes(array.Element)
-	}, "map of byte-slice arrays")
+		if !ok || array.Length != 0 {
+			return false
+		}
+		return isOctetSlice(array.Element)
+	}, "map of nested defined-Octet slices")
 
-	bytePayload, err := json.Marshal(byteResponse{Data: []testdata.Octet{1, 2}})
+	bytePayload, err := jsonv2.Marshal(byteResponse{Data: []testdata.Octet{1, 2}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(bytePayload), `{"data":"AQI="}`; got != want {
-		t.Fatalf("encoding/json payload = %s, want %s", got, want)
+	if got, want := string(bytePayload), `{"data":[1,2]}`; got != want {
+		t.Fatalf("encoding/json/v2 payload = %s, want %s", got, want)
 	}
 }
 
@@ -408,7 +416,7 @@ func TestGenerate_SourceGenericPointerArgumentsResolvePackages(t *testing.T) {
 	}
 }
 
-func TestGenerate_SourceDefinedByteSliceDoesNotExtractUnrelatedPackageTypes(t *testing.T) {
+func TestGenerate_SourceDefinedByteSliceExtractsElementType(t *testing.T) {
 	app := tygor.NewApp()
 	app.Service("Bytes").Exec("Raw", func(context.Context, struct{}) ([]genericbytes.Octet, error) {
 		return []genericbytes.Octet{1, 2}, nil
@@ -417,23 +425,23 @@ func TestGenerate_SourceDefinedByteSliceDoesNotExtractUnrelatedPackageTypes(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Schema.Types) != 0 {
-		t.Fatalf("scalar byte endpoint extracted unrelated types: %#v", result.Schema.Types)
+	if len(result.Schema.Types) != 1 {
+		t.Fatalf("defined byte endpoint types = %#v, want Octet alias", result.Schema.Types)
 	}
 	service := result.Schema.FindService("Bytes")
 	if service == nil || len(service.Endpoints) != 1 {
 		t.Fatalf("Bytes service = %#v, want one endpoint", service)
 	}
-	primitive, ok := service.Endpoints[0].Response.(*ir.PrimitiveDescriptor)
-	if !ok || primitive.PrimitiveKind != ir.PrimitiveBytes {
-		t.Fatalf("defined byte response = %#v, want bytes primitive", service.Endpoints[0].Response)
+	array, ok := service.Endpoints[0].Response.(*ir.ArrayDescriptor)
+	if !ok || array.Length != 0 {
+		t.Fatalf("defined byte response = %#v, want slice", service.Endpoints[0].Response)
 	}
-	payload, err := json.Marshal([]genericbytes.Octet{1, 2})
+	payload, err := jsonv2.Marshal([]genericbytes.Octet{1, 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(payload), `"AQI="`; got != want {
-		t.Fatalf("encoding/json payload = %s, want %s", got, want)
+	if got, want := string(payload), `[1,2]`; got != want {
+		t.Fatalf("encoding/json/v2 payload = %s, want %s", got, want)
 	}
 }
 
@@ -911,7 +919,7 @@ func TestGenerate_PointerNullability(t *testing.T) {
 		t.Error("pointer response should be nullable")
 	}
 
-	if !strings.Contains(manifestStr, "res: ((types.Post | null)[] | null)") {
+	if !strings.Contains(manifestStr, "res: (types.Post | null)[]") {
 		t.Error("slice and pointer elements should preserve nullability")
 	}
 }

@@ -4,7 +4,7 @@ package e2e
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"tygor.dev/tygor"
 	"tygor.dev/tygorgen"
@@ -139,12 +138,12 @@ func TestGeneratedZodContractsCompileAndRun(t *testing.T) {
 					{Name: "UnsignedID", JSONName: "unsigned_id", Type: ir.Uint(64), StringEncoded: true},
 					{Name: "Ratio", JSONName: "ratio", Type: ir.Float(64), StringEncoded: true},
 					{Name: "Maybe", JSONName: "maybe", Type: ir.Ptr(ir.Int(64)), StringEncoded: true},
-					{Name: "Flag", JSONName: "flag", Type: ir.Bool(), StringEncoded: true, ValidateTag: "oneof=false"},
+					{Name: "Flag", JSONName: "flag", Type: ir.Bool(), ValidateTag: "oneof=false"},
 					{Name: "Choice", JSONName: "choice", Type: ir.Int(32), ValidateTag: "oneof=1 2"},
 					{Name: "Exact", JSONName: "exact", Type: ir.Int(32), ValidateTag: "len=5"},
 					{Name: "Quoted", JSONName: "field-name", Type: ir.String(), ValidateTag: "gte=2,lte=10"},
-					{Name: "Encoded", JSONName: "encoded", Type: ir.String(), StringEncoded: true, ValidateTag: "required,email,gte=5"},
-					{Name: "EncodedChoice", JSONName: "encoded_choice", Type: ir.String(), StringEncoded: true, ValidateTag: "oneof=red blue"},
+					{Name: "Encoded", JSONName: "encoded", Type: ir.String(), ValidateTag: "required,email,gte=5"},
+					{Name: "EncodedChoice", JSONName: "encoded_choice", Type: ir.String(), ValidateTag: "oneof=red blue"},
 					{Name: "Status", JSONName: "status", Type: ir.Ref("WireStatus", modelPkg), StringEncoded: true, ValidateTag: "lte=2"},
 					{Name: "StatusNumber", JSONName: "status_number", Type: ir.Ref("WireStatus", modelPkg), ValidateTag: "gte=1,lte=3,oneof=1 3"},
 					{Name: "Mode", JSONName: "mode", Type: ir.Ref("WireMode", modelPkg), ValidateTag: "oneof=red blue"},
@@ -164,7 +163,7 @@ func TestGeneratedZodContractsCompileAndRun(t *testing.T) {
 					{Name: "PairArray", JSONName: "pair_array", Type: ir.Array(ir.Ptr(ir.String()), 2), ValidateTag: "len=2,min=2,max=2"},
 					{Name: "Names", JSONName: "names", Type: ir.Ptr(ir.Ref("Names", modelPkg)), ValidateTag: "gte=1"},
 					{Name: "Labels", JSONName: "labels", Type: ir.Ptr(ir.Ref("Labels", modelPkg)), ValidateTag: "gte=1"},
-					{Name: "Optional", JSONName: "optional", Type: ir.Ptr(ir.String()), Optional: true},
+					{Name: "Optional", JSONName: "optional", Type: ir.Ptr(ir.String()), OmitZero: true},
 				},
 			},
 		},
@@ -194,12 +193,12 @@ func TestGeneratedZodContractsCompileAndRun(t *testing.T) {
 		UnsignedID      uint64               `json:"unsigned_id,string"`
 		Ratio           float64              `json:"ratio,string"`
 		Maybe           *int64               `json:"maybe,string"`
-		Flag            bool                 `json:"flag,string"`
+		Flag            bool                 `json:"flag"`
 		Choice          int32                `json:"choice"`
 		Exact           int32                `json:"exact"`
 		Quoted          string               `json:"field-name"`
-		Encoded         string               `json:"encoded,string"`
-		EncodedChoice   string               `json:"encoded_choice,string"`
+		Encoded         string               `json:"encoded"`
+		EncodedChoice   string               `json:"encoded_choice"`
 		Status          int64                `json:"status,string"`
 		StatusNumber    int64                `json:"status_number"`
 		Mode            string               `json:"mode"`
@@ -298,31 +297,29 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 	double := &single
 	triple := &double
 	depthPayload, err := json.Marshal(testdata.StringEncodingDepths{
-		Direct:   value,
-		Single:   single,
-		Double:   double,
-		Triple:   triple,
-		Duration: time.Second,
-		Defined:  testdata.DefinedIntPointer(single),
+		Direct:  value,
+		Single:  single,
+		Double:  double,
+		Triple:  triple,
+		Defined: testdata.DefinedIntPointer(single),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantDepthPayload = `{"direct":"7","single":"7","double":7,"triple":7,"duration":"1000000000","defined":"7"}`
+	const wantDepthPayload = `{"direct":"7","single":"7","double":"7","triple":"7","defined":"7"}`
 	if string(depthPayload) != wantDepthPayload {
 		t.Fatalf("encoding/json pointer-depth wire payload = %s, want %s", depthPayload, wantDepthPayload)
 	}
 	nilDepthPayload, err := json.Marshal(testdata.StringEncodingDepths{
-		Direct:   value,
-		Single:   single,
-		Double:   double,
-		Triple:   triple,
-		Duration: time.Second,
+		Direct: value,
+		Single: single,
+		Double: double,
+		Triple: triple,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantNilDepthPayload = `{"direct":"7","single":"7","double":7,"triple":7,"duration":"1000000000","defined":null}`
+	const wantNilDepthPayload = `{"direct":"7","single":"7","double":"7","triple":"7","defined":null}`
 	if string(nilDepthPayload) != wantNilDepthPayload {
 		t.Fatalf("encoding/json nil pointer-depth wire payload = %s, want %s", nilDepthPayload, wantNilDepthPayload)
 	}
@@ -336,7 +333,7 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantGenericDepthPayload = `{"applied":"7","double":7,"plain":7}`
+	const wantGenericDepthPayload = `{"applied":"7","double":"7","plain":7}`
 	if string(genericDepthPayload) != wantGenericDepthPayload {
 		t.Fatalf("encoding/json generic pointer-depth wire payload = %s, want %s", genericDepthPayload, wantGenericDepthPayload)
 	}
@@ -347,7 +344,7 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantGenericNilDepthPayload = `{"applied":null,"double":7,"plain":7}`
+	const wantGenericNilDepthPayload = `{"applied":null,"double":"7","plain":7}`
 	if string(genericNilDepthPayload) != wantGenericNilDepthPayload {
 		t.Fatalf("encoding/json nil generic pointer-depth wire payload = %s, want %s", genericNilDepthPayload, wantGenericNilDepthPayload)
 	}
@@ -355,7 +352,7 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(bytePayload), `{"data":"AQI="}`; got != want {
+	if got, want := string(bytePayload), `{"data":[1,2]}`; got != want {
 		t.Fatalf("encoding/json defined-byte wire payload = %s, want %s", got, want)
 	}
 	customBytePayload, err := json.Marshal(testdata.CustomElementByteSlice{Data: []testdata.MarshaledOctet{1, 2}})
@@ -376,7 +373,7 @@ func TestGeneratedJSONWireParityForStringDepthAndDefinedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantAliasMarshalerPayload = `{"json_value":"json-value","json_pointer":"json-pointer","text_value":"text-value","text_pointer":"text-pointer"}`
+	const wantAliasMarshalerPayload = `{"json_value":"json-value","json_pointer":"json-pointer","text_value":"text-value","text_pointer":"text-pointer","v2_json":0,"appended_text":"appended"}`
 	if string(aliasMarshalerPayload) != wantAliasMarshalerPayload {
 		t.Fatalf("encoding/json alias-result marshaler payload = %s, want %s", aliasMarshalerPayload, wantAliasMarshalerPayload)
 	}
@@ -565,7 +562,7 @@ func TestGeneratedFiniteAndProductiveGenericPointerAliasesCompile(t *testing.T) 
 		}
 		mapPayloads = append(mapPayloads, string(payload))
 	}
-	if got, want := strings.Join(mapPayloads, ","), `null,null,{},{"child":null}`; got != want {
+	if got, want := strings.Join(mapPayloads, ","), `null,{},{},{"child":null}`; got != want {
 		t.Fatalf("encoding/json pointer-map payloads = %s, want %s", got, want)
 	}
 

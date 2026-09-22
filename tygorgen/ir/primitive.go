@@ -9,9 +9,9 @@ const (
 	PrimitiveUint                // Unsigned integer (see BitSize)
 	PrimitiveFloat               // Floating point (see BitSize)
 	PrimitiveString
-	PrimitiveBytes    // []byte (base64-encoded in JSON)
+	PrimitiveBytes    // []byte or [N]byte (base64-encoded in JSON)
 	PrimitiveTime     // time.Time (RFC 3339 string in JSON)
-	PrimitiveDuration // time.Duration (nanoseconds as int64 in JSON)
+	PrimitiveDuration // Reserved: invalid under the default encoding/json/v2 contract
 	PrimitiveAny      // interface{} / any
 	PrimitiveEmpty    // struct{} (empty struct, serializes as {})
 )
@@ -60,6 +60,10 @@ type PrimitiveDescriptor struct {
 	// to emit precise types or validation. Generators targeting languages with single numeric
 	// types (TypeScript, Python) MAY ignore BitSize.
 	BitSize int
+
+	// ByteArrayLength distinguishes [N]byte from []byte for PrimitiveBytes.
+	// Nil denotes a slice; a non-nil value denotes an array, including [0]byte.
+	ByteArrayLength *int
 }
 
 // Kind returns KindPrimitive.
@@ -99,12 +103,18 @@ func Bytes() *PrimitiveDescriptor {
 	return &PrimitiveDescriptor{PrimitiveKind: PrimitiveBytes}
 }
 
+// ByteArray returns a PrimitiveDescriptor for [length]byte.
+func ByteArray(length int) *PrimitiveDescriptor {
+	return &PrimitiveDescriptor{PrimitiveKind: PrimitiveBytes, ByteArrayLength: &length}
+}
+
 // Time returns a PrimitiveDescriptor for time.Time.
 func Time() *PrimitiveDescriptor {
 	return &PrimitiveDescriptor{PrimitiveKind: PrimitiveTime}
 }
 
-// Duration returns a PrimitiveDescriptor for time.Duration.
+// Duration returns the reserved duration descriptor. Schemas containing it do
+// not validate because time.Duration has no default encoding/json/v2 format.
 func Duration() *PrimitiveDescriptor {
 	return &PrimitiveDescriptor{PrimitiveKind: PrimitiveDuration}
 }

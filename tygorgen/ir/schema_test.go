@@ -794,9 +794,6 @@ func TestSchema_Validate_StringEncodedOnValidTypes(t *testing.T) {
 			{Name: "IntField", Type: Int(64), StringEncoded: true},
 			{Name: "UintField", Type: Uint(64), StringEncoded: true},
 			{Name: "FloatField", Type: Float(64), StringEncoded: true},
-			{Name: "BoolField", Type: Bool(), StringEncoded: true},
-			{Name: "StringField", Type: String(), StringEncoded: true},
-			{Name: "DurationField", Type: Duration(), StringEncoded: true},
 		},
 	})
 
@@ -844,7 +841,7 @@ func TestSchema_Validate_StringEncodedOnPointerToValid(t *testing.T) {
 	}
 }
 
-func TestSchema_StringEncodingAppliesAtExactPointerDepth(t *testing.T) {
+func TestSchema_StringEncodingAppliesThroughPointers(t *testing.T) {
 	scalarID := GoIdentifier{Name: "Scalar", Package: "test"}
 	pointerID := GoIdentifier{Name: "DefinedPointer", Package: "test"}
 	pointerAliasID := GoIdentifier{Name: "DefinedPointerAlias", Package: "test"}
@@ -860,15 +857,15 @@ func TestSchema_StringEncodingAppliesAtExactPointerDepth(t *testing.T) {
 		want bool
 	}{
 		{name: "direct", typ: Int(64), want: true},
-		{name: "duration", typ: Duration(), want: true},
+		{name: "duration", typ: Duration(), want: false},
 		{name: "single pointer", typ: Ptr(Int(64)), want: true},
-		{name: "double pointer", typ: Ptr(Ptr(Int(64))), want: false},
+		{name: "double pointer", typ: Ptr(Ptr(Int(64))), want: true},
 		{name: "named scalar", typ: Ref(scalarID.Name, scalarID.Package), want: true},
 		{name: "pointer to named scalar", typ: Ptr(Ref(scalarID.Name, scalarID.Package)), want: true},
 		{name: "defined pointer", typ: Ref(pointerID.Name, pointerID.Package), want: true},
 		{name: "alias to defined pointer", typ: Ref(pointerAliasID.Name, pointerAliasID.Package), want: true},
-		{name: "pointer to defined pointer", typ: Ptr(Ref(pointerID.Name, pointerID.Package)), want: false},
-		{name: "pointer to alias to defined pointer", typ: Ptr(Ref(pointerAliasID.Name, pointerAliasID.Package)), want: false},
+		{name: "pointer to defined pointer", typ: Ptr(Ref(pointerID.Name, pointerID.Package)), want: true},
+		{name: "pointer to alias to defined pointer", typ: Ptr(Ref(pointerAliasID.Name, pointerAliasID.Package)), want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -886,6 +883,38 @@ func TestSchema_StringEncodingAppliesAtExactPointerDepth(t *testing.T) {
 	})
 	if errors := s.Validate(); len(errors) != 0 {
 		t.Fatalf("StringEncoded on a defined pointer should validate, got errors: %v", errors)
+	}
+}
+
+func TestSchema_V2FieldPresenceAndNullability(t *testing.T) {
+	three := 3
+	zero := 0
+	schema := &Schema{}
+	tests := []struct {
+		name     string
+		field    FieldDescriptor
+		optional bool
+		nullable bool
+	}{
+		{name: "int omitempty remains required", field: FieldDescriptor{Type: Int(0), OmitEmpty: true}},
+		{name: "int omitzero", field: FieldDescriptor{Type: Int(0), OmitZero: true}, optional: true},
+		{name: "slice is non-null", field: FieldDescriptor{Type: Slice(String())}},
+		{name: "slice omitempty", field: FieldDescriptor{Type: Slice(String()), OmitEmpty: true}, optional: true},
+		{name: "pointer is nullable", field: FieldDescriptor{Type: Ptr(Int(0))}, nullable: true},
+		{name: "pointer omitempty", field: FieldDescriptor{Type: Ptr(Int(0)), OmitEmpty: true}, optional: true},
+		{name: "double pointer omitzero", field: FieldDescriptor{Type: Ptr(Ptr(Int(0))), OmitZero: true}, optional: true, nullable: true},
+		{name: "fixed bytes omitempty remains required", field: FieldDescriptor{Type: &PrimitiveDescriptor{PrimitiveKind: PrimitiveBytes, ByteArrayLength: &three}, OmitEmpty: true}},
+		{name: "empty fixed bytes omitempty", field: FieldDescriptor{Type: &PrimitiveDescriptor{PrimitiveKind: PrimitiveBytes, ByteArrayLength: &zero}, OmitEmpty: true}, optional: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := schema.FieldOptional(tt.field); got != tt.optional {
+				t.Errorf("FieldOptional() = %v, want %v", got, tt.optional)
+			}
+			if got := schema.FieldNullableWhenPresent(tt.field); got != tt.nullable {
+				t.Errorf("FieldNullableWhenPresent() = %v, want %v", got, tt.nullable)
+			}
+		})
 	}
 }
 

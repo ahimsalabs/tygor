@@ -352,7 +352,7 @@ func TestTypeScriptGenerator_Generate_MapWithNamedKeyType(t *testing.T) {
 	t.Logf("Generated:\n%s", content)
 
 	// Map with named key type should preserve the key type
-	want := "users: Record<UserID, string> | null;"
+	want := "users: Record<UserID, string>;"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}
@@ -423,7 +423,7 @@ func TestTypeScriptGenerator_Generate_ReadonlyArrays(t *testing.T) {
 						Name:     "Items",
 						JSONName: "items",
 						Type:     ir.Slice(ir.String()),
-						Optional: true,
+						OmitZero: true,
 					},
 				},
 			},
@@ -450,8 +450,8 @@ func TestTypeScriptGenerator_Generate_ReadonlyArrays(t *testing.T) {
 	content := string(memSink.Get("types.ts"))
 	t.Logf("Generated:\n%s", content)
 
-	// Per §4.9: slices are always nullable, optional is independent
-	want := "items?: readonly string[] | null;"
+	// V2 nil slices encode as non-null empty arrays.
+	want := "items?: readonly string[];"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}
@@ -542,17 +542,17 @@ func TestTypeScriptGenerator_Generate_LineEndings(t *testing.T) {
 }
 
 func TestTypeScriptGenerator_Generate_PointerToSlice(t *testing.T) {
-	// Test the rare case of *[]T with omitempty (optional + nullable)
+	// Test the rare case of *[]T with omitempty (omitted nil pointer).
 	schema := &ir.Schema{
 		Types: []ir.TypeDescriptor{
 			&ir.StructDescriptor{
 				Name: ir.GoIdentifier{Name: "Container", Package: "test"},
 				Fields: []ir.FieldDescriptor{
 					{
-						Name:     "Items",
-						JSONName: "items",
-						Type:     ir.Ptr(ir.Slice(ir.String())),
-						Optional: true, // *[]T with omitempty
+						Name:      "Items",
+						JSONName:  "items",
+						Type:      ir.Ptr(ir.Slice(ir.String())),
+						OmitEmpty: true, // *[]T with omitempty
 					},
 				},
 			},
@@ -575,8 +575,8 @@ func TestTypeScriptGenerator_Generate_PointerToSlice(t *testing.T) {
 	content := string(memSink.Get("types.ts"))
 	t.Logf("Generated:\n%s", content)
 
-	// Should be optional and nullable
-	want := "items?: string[] | null;"
+	// The nil pointer is omitted, so a present value is non-null.
+	want := "items?: string[];"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}
@@ -593,7 +593,7 @@ func TestTypeScriptGenerator_Generate_PointerToMap(t *testing.T) {
 						Name:     "Metadata",
 						JSONName: "metadata",
 						Type:     ir.Ptr(ir.Map(ir.String(), ir.String())),
-						Optional: true,
+						OmitZero: true,
 					},
 				},
 			},
@@ -616,8 +616,8 @@ func TestTypeScriptGenerator_Generate_PointerToMap(t *testing.T) {
 	content := string(memSink.Get("types.ts"))
 	t.Logf("Generated:\n%s", content)
 
-	// Should be optional and nullable
-	want := "metadata?: Record<string, string> | null;"
+	// The nil pointer is omitted, so a present value is non-null.
+	want := "metadata?: Record<string, string>;"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}
@@ -712,7 +712,7 @@ func TestTypeScriptGenerator_Generate_SliceOfPointers(t *testing.T) {
 	content := string(memSink.Get("types.ts"))
 	t.Logf("Generated:\n%s", content)
 
-	want := "tasks: (Task | null)[] | null;"
+	want := "tasks: (Task | null)[];"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}
@@ -763,7 +763,7 @@ func TestTypeScriptGenerator_Generate_SliceOfPointers_NullableElements(t *testin
 	t.Logf("Generated:\n%s", content)
 
 	// Should be (Task | null)[] when NullableSliceElements is true
-	want := "tasks: (Task | null)[] | null;"
+	want := "tasks: (Task | null)[];"
 	if !strings.Contains(content, want) {
 		t.Errorf("output should contain %q, got:\n%s", want, content)
 	}

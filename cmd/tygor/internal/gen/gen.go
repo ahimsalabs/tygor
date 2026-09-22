@@ -3,7 +3,8 @@ package gen
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -234,7 +235,11 @@ func (c *Cmd) reconcileFiles(genDir, outDir string) error {
 		}
 	}
 
-	manifestData, err := json.MarshalIndent(ownershipManifest{Version: ownershipVersion, Files: expected}, "", "  ")
+	manifestData, err := json.Marshal(
+		ownershipManifest{Version: ownershipVersion, Files: expected},
+		json.Deterministic(true),
+		jsontext.WithIndent("  "),
+	)
 	if err != nil {
 		return fmt.Errorf("marshal ownership manifest: %w", err)
 	}

@@ -4,15 +4,8 @@ import "fmt"
 
 // ArrayDescriptor represents an ordered collection (slice or fixed-length array).
 //
-// Nullability: Go slices can be nil, which serializes to JSON null.
-// This is NOT represented with PtrDescriptor; instead, generators derive nullability
-// from context:
-// - If Optional=false: field: T[] | null (always present, can be null)
-// - If Optional=true: field?: T[] | null (optional and nullable are independent)
-// See §4.9 for the complete decision tree.
-//
-// Note: [N]byte fixed arrays serialize as JSON arrays of numbers, NOT base64.
-// Only []byte slices are base64-encoded (represented as PrimitiveBytes).
+// Under default encoding/json/v2 semantics, nil slices encode as [] rather than
+// null. Exact []byte and [N]byte types use PrimitiveBytes instead.
 type ArrayDescriptor struct {
 	exprBase
 
@@ -58,12 +51,7 @@ func Array(element TypeDescriptor, length int) *ArrayDescriptor {
 
 // MapDescriptor represents a key-value mapping.
 //
-// Nullability: Go maps can be nil, which serializes to JSON null.
-// This is NOT represented with PtrDescriptor; instead, generators derive nullability
-// from context:
-// - If Optional=false: field: Record<K,V> | null (always present, can be null)
-// - If Optional=true: field?: Record<K,V> | null (optional and nullable are independent)
-// See §4.9 for the complete decision tree.
+// Under default encoding/json/v2 semantics, nil maps encode as {} rather than null.
 type MapDescriptor struct {
 	exprBase
 
@@ -125,9 +113,8 @@ func RefWithArgs(name string, pkg string, args ...TypeDescriptor) *ReferenceDesc
 }
 
 // PtrDescriptor represents a Go pointer type (*T).
-// The TypeScript output depends on field context (see §4.9):
-// - If Optional=false: field: T | null (always present, can be null)
-// - If Optional=true: field?: T | null (optional and nullable are independent)
+// The generated field type depends on omission context: a pointer without an
+// omission tag is nullable, while an omitted nil pointer is non-null when present.
 type PtrDescriptor struct {
 	exprBase
 

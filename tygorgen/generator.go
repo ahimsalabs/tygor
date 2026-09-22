@@ -2,8 +2,9 @@ package tygorgen
 
 import (
 	"context"
-	"encoding"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"reflect"
 	"sort"
@@ -389,7 +390,7 @@ func Generate(app *tygor.App, cfg *Config) (*GenerateResult, error) {
 
 	// 7. Generate discovery.json if enabled
 	if cfg.EmitDiscovery {
-		discoveryJSON, err := json.MarshalIndent(schema, "", "  ")
+		discoveryJSON, err := json.Marshal(schema, json.Deterministic(true), jsontext.WithIndent("  "))
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal discovery schema: %w", err)
 		}
@@ -551,10 +552,10 @@ func sourceTypeToIR(t reflect.Type, resolve provider.TypeExpressionResolver) (ir
 	case t == reflect.TypeFor[time.Time]():
 		return ir.Time(), nil
 	case t == reflect.TypeFor[time.Duration]():
-		return ir.Duration(), nil
-	case t == reflect.TypeFor[json.Number]():
+		return nil, fmt.Errorf("time.Duration has no default encoding/json/v2 representation")
+	case t == reflect.TypeFor[jsonv1.Number]():
 		return ir.Float(64), nil
-	case t == reflect.TypeFor[json.RawMessage]():
+	case t == reflect.TypeFor[jsonv1.RawMessage]():
 		return ir.Any(), nil
 	case t.Name() != "" && t.PkgPath() != "":
 		if resolve == nil {
@@ -563,6 +564,8 @@ func sourceTypeToIR(t reflect.Type, resolve provider.TypeExpressionResolver) (ir
 		return resolve(t.PkgPath()+"."+t.Name(), t.PkgPath())
 	case isReflectedJSONByteSlice(t):
 		return ir.Bytes(), nil
+	case isReflectedJSONByteArray(t):
+		return ir.ByteArray(t.Len()), nil
 	case t.Kind() == reflect.Slice || t.Kind() == reflect.Array:
 		element, err := sourceTypeToIRPreservePtr(t.Elem(), resolve)
 		if err != nil {
@@ -575,7 +578,7 @@ func sourceTypeToIR(t reflect.Type, resolve provider.TypeExpressionResolver) (ir
 	case t.Kind() == reflect.Map:
 		var key ir.TypeDescriptor
 		var err error
-		if t.Key() == reflect.TypeFor[json.Number]() {
+		if t.Key() == reflect.TypeFor[jsonv1.Number]() {
 			key = ir.String()
 		} else {
 			key, err = sourceTypeToIRPreservePtr(t.Key(), resolve)
@@ -623,9 +626,9 @@ func reflectTypeToIR(t reflect.Type, monomorphizeGenerics bool) ir.TypeDescripto
 		return ir.Time()
 	case t == reflect.TypeFor[time.Duration]():
 		return ir.Duration()
-	case t == reflect.TypeFor[json.Number]():
+	case t == reflect.TypeFor[jsonv1.Number]():
 		return ir.Float(64)
-	case t == reflect.TypeFor[json.RawMessage]():
+	case t == reflect.TypeFor[jsonv1.RawMessage]():
 		return ir.Any()
 	case t.Name() != "" && t.PkgPath() != "":
 		if strings.Contains(t.Name(), "[") && !monomorphizeGenerics {
@@ -634,6 +637,8 @@ func reflectTypeToIR(t reflect.Type, monomorphizeGenerics bool) ir.TypeDescripto
 		return ir.Ref(sanitizeTypeName(t.Name()), t.PkgPath())
 	case isReflectedJSONByteSlice(t):
 		return ir.Bytes()
+	case isReflectedJSONByteArray(t):
+		return ir.ByteArray(t.Len())
 	case t.Kind() == reflect.Slice || t.Kind() == reflect.Array:
 		elem := reflectTypeToIRPreservePtr(t.Elem(), monomorphizeGenerics)
 		if t.Kind() == reflect.Slice {
@@ -654,16 +659,15 @@ func reflectTypeToIR(t reflect.Type, monomorphizeGenerics bool) ir.TypeDescripto
 }
 
 func isReflectedJSONByteSlice(t reflect.Type) bool {
-	if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8 {
-		return false
-	}
-	elemPointer := reflect.PointerTo(t.Elem())
-	return !elemPointer.Implements(reflect.TypeFor[json.Marshaler]()) &&
-		!elemPointer.Implements(reflect.TypeFor[encoding.TextMarshaler]())
+	return t.Kind() == reflect.Slice && t.Elem() == reflect.TypeFor[byte]()
+}
+
+func isReflectedJSONByteArray(t reflect.Type) bool {
+	return t.Kind() == reflect.Array && t.Elem() == reflect.TypeFor[byte]()
 }
 
 func reflectMapKeyToIR(t reflect.Type, monomorphizeGenerics bool) ir.TypeDescriptor {
-	if t == reflect.TypeFor[json.Number]() {
+	if t == reflect.TypeFor[jsonv1.Number]() {
 		return ir.String()
 	}
 	return reflectTypeToIRPreservePtr(t, monomorphizeGenerics)

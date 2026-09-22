@@ -79,6 +79,7 @@ type SliceAndArrayTypes struct {
 type MapTypes struct {
 	StringMap  map[string]int     `json:"string_map"`
 	IntMap     map[int]string     `json:"int_map"`
+	FloatMap   map[float64]string `json:"float_map"`
 	UintptrMap map[uintptr]string `json:"uintptr_map"`
 	NestedMap  map[string][]User  `json:"nested_map,omitempty"`
 }
@@ -121,19 +122,18 @@ type TaggedFields struct {
 
 type DefinedIntPointer *int
 
-// StringEncodingDepths exercises encoding/json's exact ,string applicability.
+// StringEncodingDepths exercises encoding/json/v2's ,string applicability.
 type StringEncodingDepths struct {
-	Direct   int               `json:"direct,string"`
-	Single   *int              `json:"single,string"`
-	Double   **int             `json:"double,string"`
-	Triple   ***int            `json:"triple,string"`
-	Duration time.Duration     `json:"duration,string"`
-	Defined  DefinedIntPointer `json:"defined,string"`
+	Direct  int               `json:"direct,string"`
+	Single  *int              `json:"single,string"`
+	Double  **int             `json:"double,string"`
+	Triple  ***int            `json:"triple,string"`
+	Defined DefinedIntPointer `json:"defined,string"`
 }
 
 type Octet uint8
 
-// DefinedByteSlices exercises encoding/json's base64 treatment of []Octet.
+// DefinedByteSlices verifies that encoding/json/v2 does not treat []Octet as bytes.
 type DefinedByteSlices struct {
 	Data []Octet `json:"data"`
 }

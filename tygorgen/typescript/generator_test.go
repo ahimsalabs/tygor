@@ -30,19 +30,17 @@ func TestTypeScriptGenerator_Generate_BasicStruct(t *testing.T) {
 						Name:     "ID",
 						JSONName: "id",
 						Type:     ir.String(),
-						Optional: false,
 					},
 					{
 						Name:     "Email",
 						JSONName: "email",
 						Type:     ir.String(),
-						Optional: false,
 					},
 					{
 						Name:     "Age",
 						JSONName: "age",
 						Type:     ir.Ptr(ir.Int(0)),
-						Optional: true,
+						OmitZero: true,
 					},
 				},
 			},
@@ -74,13 +72,12 @@ func TestTypeScriptGenerator_Generate_BasicStruct(t *testing.T) {
 	t.Logf("Generated:\n%s", content)
 
 	// Check for expected output
-	// Note: age is *int with omitempty, so it's both optional (?:) and nullable (| null)
-	// per §4.9 - optional and nullable are independent properties
+	// A nil *int with omitzero is omitted, so a present value is non-null.
 	want := []string{
 		"export interface User {",
 		"  id: string;",
 		"  email: string;",
-		"  age?: number /* int */ | null;",
+		"  age?: number /* int */;",
 		"}",
 	}
 
@@ -88,6 +85,34 @@ func TestTypeScriptGenerator_Generate_BasicStruct(t *testing.T) {
 		if !strings.Contains(content, w) {
 			t.Errorf("output missing expected string %q", w)
 		}
+	}
+}
+
+func TestTypeScriptGenerator_RecursiveMapUsesV2NonNullMap(t *testing.T) {
+	pkg := "example.com/test"
+	mapID := ir.GoIdentifier{Name: "RecursiveMap", Package: pkg}
+	schema := &ir.Schema{
+		Package: ir.PackageInfo{Path: pkg, Name: "test"},
+		Types: []ir.TypeDescriptor{
+			&ir.AliasDescriptor{
+				Name:       mapID,
+				Underlying: ir.Map(ir.String(), ir.Ref(mapID.Name, mapID.Package)),
+			},
+		},
+	}
+	memSink := sink.NewMemorySink()
+	_, err := (&TypeScriptGenerator{}).Generate(context.Background(), schema, GenerateOptions{
+		Sink: memSink,
+		Config: GeneratorConfig{
+			SingleFile: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(memSink.Get("types.ts"))
+	if !strings.Contains(content, "export type RecursiveMap = { [key: string]: RecursiveMap };") || strings.Contains(content, "RecursiveMap } | null") {
+		t.Fatalf("recursive map retained v1 nullability:\n%s", content)
 	}
 }
 
@@ -101,7 +126,6 @@ func TestTypeScriptGenerator_Generate_NullableField(t *testing.T) {
 						Name:     "Data",
 						JSONName: "data",
 						Type:     ir.Ptr(ir.String()),
-						Optional: false, // pointer without omitempty
 					},
 				},
 			},
@@ -131,7 +155,7 @@ func TestTypeScriptGenerator_Generate_NullableField(t *testing.T) {
 }
 
 func TestTypeScriptGenerator_Generate_SliceField(t *testing.T) {
-	// Per §4.9: slices are always nullable (can be nil), and optional is independent
+	// V2 nil slices encode as non-null empty arrays; omission is independent.
 	tests := []struct {
 		name     string
 		optional bool
@@ -140,12 +164,12 @@ func TestTypeScriptGenerator_Generate_SliceField(t *testing.T) {
 		{
 			name:     "non-optional slice",
 			optional: false,
-			want:     "items: string[] | null;",
+			want:     "items: string[];",
 		},
 		{
 			name:     "optional slice",
 			optional: true,
-			want:     "items?: string[] | null;", // both optional AND nullable
+			want:     "items?: string[];",
 		},
 	}
 
@@ -160,7 +184,7 @@ func TestTypeScriptGenerator_Generate_SliceField(t *testing.T) {
 								Name:     "Items",
 								JSONName: "items",
 								Type:     ir.Slice(ir.String()),
-								Optional: tt.optional,
+								OmitZero: tt.optional,
 							},
 						},
 					},
@@ -198,12 +222,12 @@ func TestTypeScriptGenerator_Generate_MapField(t *testing.T) {
 		{
 			name:     "non-optional map",
 			optional: false,
-			want:     "metadata: Record<string, string> | null;",
+			want:     "metadata: Record<string, string>;",
 		},
 		{
 			name:     "optional map",
 			optional: true,
-			want:     "metadata?: Record<string, string> | null;", // both optional AND nullable
+			want:     "metadata?: Record<string, string>;",
 		},
 	}
 
@@ -218,7 +242,7 @@ func TestTypeScriptGenerator_Generate_MapField(t *testing.T) {
 								Name:     "Metadata",
 								JSONName: "metadata",
 								Type:     ir.Map(ir.String(), ir.String()),
-								Optional: tt.optional,
+								OmitZero: tt.optional,
 							},
 						},
 					},
@@ -261,7 +285,7 @@ func TestTypeScriptGenerator_Generate_Primitives(t *testing.T) {
 		{"uint", ir.Uint(0), "number /* uint */"},
 		{"float32", ir.Float(32), "number /* float32 */"},
 		{"float64", ir.Float(64), "number /* float64 */"},
-		{"bytes", ir.Bytes(), "string /* base64 */ | null"},
+		{"bytes", ir.Bytes(), "string /* base64 */"},
 		{"time", ir.Time(), "string /* RFC3339 */"},
 		{"duration", ir.Duration(), "number /* nanoseconds */"},
 		{"any", ir.Any(), "unknown"},
@@ -279,7 +303,6 @@ func TestTypeScriptGenerator_Generate_Primitives(t *testing.T) {
 								Name:     "Field",
 								JSONName: "field",
 								Type:     tt.irType,
-								Optional: false,
 							},
 						},
 					},
@@ -625,7 +648,7 @@ func TestTypeScriptGenerator_Generate_Manifest(t *testing.T) {
 		"res: types.User;",
 		`"Users.List": {`,
 		"req: Record<string, never>;",
-		"res: (types.User[] | null);",
+		"res: types.User[];",
 	}
 
 	for _, want := range wants {

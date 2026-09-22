@@ -161,7 +161,7 @@ func TestEmitter_EmitStruct(t *testing.T) {
 			struc: &ir.StructDescriptor{
 				Name: ir.GoIdentifier{Name: "User", Package: "test"},
 				Fields: []ir.FieldDescriptor{
-					{Name: "Name", JSONName: "name", Type: ir.String(), Optional: true},
+					{Name: "Name", JSONName: "name", Type: ir.String(), OmitZero: true},
 				},
 			},
 			config:   GeneratorConfig{},
@@ -173,7 +173,7 @@ func TestEmitter_EmitStruct(t *testing.T) {
 			struc: &ir.StructDescriptor{
 				Name: ir.GoIdentifier{Name: "User", Package: "test"},
 				Fields: []ir.FieldDescriptor{
-					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0)), Optional: false},
+					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0))},
 				},
 			},
 			config:   GeneratorConfig{},
@@ -185,20 +185,20 @@ func TestEmitter_EmitStruct(t *testing.T) {
 			struc: &ir.StructDescriptor{
 				Name: ir.GoIdentifier{Name: "User", Package: "test"},
 				Fields: []ir.FieldDescriptor{
-					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0)), Optional: true},
+					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0)), OmitZero: true},
 				},
 			},
 			config:   GeneratorConfig{},
 			tsConfig: TypeScriptConfig{UseInterface: true, EmitTypeHints: false},
-			want:     []string{"age?: number | null;"},
+			want:     []string{"age?: number;"},
 		},
 		{
 			name: "struct with OptionalType=null",
 			struc: &ir.StructDescriptor{
 				Name: ir.GoIdentifier{Name: "User", Package: "test"},
 				Fields: []ir.FieldDescriptor{
-					{Name: "Name", JSONName: "name", Type: ir.String(), Optional: true},
-					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0)), Optional: false},
+					{Name: "Name", JSONName: "name", Type: ir.String(), OmitZero: true},
+					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0))},
 				},
 			},
 			config:   GeneratorConfig{},
@@ -211,8 +211,8 @@ func TestEmitter_EmitStruct(t *testing.T) {
 			struc: &ir.StructDescriptor{
 				Name: ir.GoIdentifier{Name: "User", Package: "test"},
 				Fields: []ir.FieldDescriptor{
-					{Name: "Name", JSONName: "name", Type: ir.String(), Optional: true},
-					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0)), Optional: false},
+					{Name: "Name", JSONName: "name", Type: ir.String(), OmitZero: true},
+					{Name: "Age", JSONName: "age", Type: ir.Ptr(ir.Int(0))},
 				},
 			},
 			config:   GeneratorConfig{},
@@ -368,7 +368,7 @@ func TestEmitter_EmitTypeExpr(t *testing.T) {
 			name:     "primitive bytes",
 			typ:      ir.Bytes(),
 			tsConfig: TypeScriptConfig{EmitTypeHints: true},
-			want:     "(string /* base64 */ | null)",
+			want:     "string /* base64 */",
 		},
 		{
 			name:     "primitive time",
@@ -404,13 +404,13 @@ func TestEmitter_EmitTypeExpr(t *testing.T) {
 			name:     "array of strings",
 			typ:      ir.Slice(ir.String()),
 			tsConfig: TypeScriptConfig{},
-			want:     "(string[] | null)",
+			want:     "string[]",
 		},
 		{
 			name:     "readonly array",
 			typ:      ir.Slice(ir.String()),
 			tsConfig: TypeScriptConfig{UseReadonlyArrays: true},
-			want:     "(readonly string[] | null)",
+			want:     "readonly string[]",
 		},
 		{
 			name:     "fixed array small (tuple)",
@@ -428,13 +428,13 @@ func TestEmitter_EmitTypeExpr(t *testing.T) {
 			name:     "map with string key",
 			typ:      ir.Map(ir.String(), ir.Int(0)),
 			tsConfig: TypeScriptConfig{EmitTypeHints: true},
-			want:     "(Record<string, number /* int */> | null)",
+			want:     "Record<string, number /* int */>",
 		},
 		{
 			name:     "map with named key type",
 			typ:      ir.Map(ir.Ref("UserID", "test"), ir.String()),
 			tsConfig: TypeScriptConfig{},
-			want:     "(Record<string, string> | null)",
+			want:     "Record<string, string>",
 		},
 		{
 			name:     "reference type",
@@ -827,29 +827,6 @@ func TestEmitter_LargeIntegerWarning(t *testing.T) {
 	}
 }
 
-func TestEmitter_StringEncodedNamedBoolUsesWireStrings(t *testing.T) {
-	pkg := "example.com/model"
-	flagID := ir.GoIdentifier{Name: "Flag", Package: pkg}
-	model := &ir.StructDescriptor{
-		Name: ir.GoIdentifier{Name: "Model", Package: pkg},
-		Fields: []ir.FieldDescriptor{{
-			Name: "Flag", JSONName: "flag", Type: ir.Ref(flagID.Name, flagID.Package), StringEncoded: true,
-		}},
-	}
-	emitter := &Emitter{
-		schema:    &ir.Schema{Types: []ir.TypeDescriptor{&ir.AliasDescriptor{Name: flagID, Underlying: ir.Bool()}, model}},
-		tsConfig:  TypeScriptConfig{EmitExport: true},
-		indentStr: "  ",
-	}
-	var buf bytes.Buffer
-	if _, err := emitter.EmitType(&buf, model); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(buf.String(), `flag: "true" | "false";`) {
-		t.Fatalf("named bool did not use strict wire strings:\n%s", buf.String())
-	}
-}
-
 func TestEmitter_StringEncodedDefinedPointerPreservesNullability(t *testing.T) {
 	pkg := "example.com/model"
 	pointerID := ir.GoIdentifier{Name: "DefinedPointer", Package: pkg}
@@ -880,6 +857,32 @@ func TestEmitter_StringEncodedDefinedPointerPreservesNullability(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `value: string | null;`) {
 		t.Fatalf("string-encoded applied defined pointer lost nullability:\n%s", buf.String())
+	}
+}
+
+func TestEmitter_OmittedNamedPointerExcludesPresentNull(t *testing.T) {
+	pkg := "example.com/model"
+	pointerID := ir.GoIdentifier{Name: "Pointer", Package: pkg}
+	model := &ir.StructDescriptor{
+		Name: ir.GoIdentifier{Name: "Model", Package: pkg},
+		Fields: []ir.FieldDescriptor{{
+			Name: "Value", JSONName: "value", Type: ir.Ref(pointerID.Name, pointerID.Package), OmitEmpty: true,
+		}},
+	}
+	emitter := &Emitter{
+		schema: &ir.Schema{Types: []ir.TypeDescriptor{
+			&ir.AliasDescriptor{Name: pointerID, Underlying: ir.Ptr(ir.Int(64))},
+			model,
+		}},
+		tsConfig:  TypeScriptConfig{EmitExport: true},
+		indentStr: "  ",
+	}
+	var buf bytes.Buffer
+	if _, err := emitter.EmitType(&buf, model); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "value?: Exclude<Pointer, null>;") {
+		t.Fatalf("omitted named pointer retained present null:\n%s", buf.String())
 	}
 }
 
@@ -1117,25 +1120,25 @@ func TestEmitter_SliceElements(t *testing.T) {
 			name:                  "slice of pointers - nullable by default",
 			sliceType:             ir.Slice(ir.Ptr(ir.Ref("User", "test"))),
 			nullableSliceElements: false,
-			want:                  "((User | null)[] | null)",
+			want:                  "(User | null)[]",
 		},
 		{
 			name:                  "slice of pointers - preserve with config",
 			sliceType:             ir.Slice(ir.Ptr(ir.Ref("User", "test"))),
 			nullableSliceElements: true,
-			want:                  "((User | null)[] | null)",
+			want:                  "(User | null)[]",
 		},
 		{
 			name:                  "slice of double pointers - nullable by default",
 			sliceType:             ir.Slice(ir.Ptr(ir.Ptr(ir.String()))),
 			nullableSliceElements: false,
-			want:                  "((string | null)[] | null)",
+			want:                  "(string | null)[]",
 		},
 		{
 			name:                  "slice of non-pointers - unaffected",
 			sliceType:             ir.Slice(ir.String()),
 			nullableSliceElements: false,
-			want:                  "(string[] | null)",
+			want:                  "string[]",
 		},
 	}
 

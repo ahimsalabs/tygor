@@ -12,6 +12,7 @@ import (
 	"tygor.dev/tygorgen/provider/testdata"
 	"tygor.dev/tygorgen/provider/testdata/anona"
 	"tygor.dev/tygorgen/provider/testdata/anonb"
+	"tygor.dev/tygorgen/provider/testdata/jsonv2invalid"
 )
 
 // Test types for comprehensive coverage
@@ -55,9 +56,10 @@ type SliceAndArray struct {
 }
 
 type MapTypes struct {
-	StringMap map[string]int    `json:"string_map"`
-	IntMap    map[int]string    `json:"int_map"`
-	MapOmit   map[string]string `json:"map_omit,omitempty"`
+	StringMap map[string]int     `json:"string_map"`
+	IntMap    map[int]string     `json:"int_map"`
+	FloatMap  map[float64]string `json:"float_map"`
+	MapOmit   map[string]string  `json:"map_omit,omitempty"`
 }
 
 type JSONNumberAlias = json.Number
@@ -65,7 +67,6 @@ type DefinedJSONNumber json.Number
 
 type SpecialTypes struct {
 	Time              time.Time              `json:"time"`
-	Duration          time.Duration          `json:"duration"`
 	JSONNumber        json.Number            `json:"json_number"`
 	JSONNumberString  json.Number            `json:"json_number_string,string"`
 	JSONNumberAlias   JSONNumberAlias        `json:"json_number_alias"`
@@ -122,8 +123,23 @@ type NestedAnonymous struct {
 }
 
 type StringEncoded struct {
-	NumberAsString int  `json:"number,string"`
-	BoolAsString   bool `json:"bool,string"`
+	NumberAsString int `json:"number,string"`
+}
+
+type InvalidStringEncoded struct {
+	BoolAsString bool `json:"bool,string"`
+}
+
+type InvalidDuration struct {
+	Duration time.Duration `json:"duration"`
+}
+
+type InvalidFormat struct {
+	Value []byte `json:"value,format:base64"`
+}
+
+type InvalidEmbed struct {
+	Value struct{ X int } `json:",embed"`
 }
 
 type ValidateTags struct {
@@ -213,7 +229,7 @@ func TestReflectionProvider_SimpleStruct(t *testing.T) {
 	}
 
 	emailField := structDesc.Fields[2]
-	if !emailField.Optional {
+	if !schema.FieldOptional(emailField) {
 		t.Error("Email field should be optional")
 	}
 }
@@ -280,7 +296,7 @@ func TestReflectionProvider_PointerFields(t *testing.T) {
 	}
 
 	ptrIntField := findField(structDesc.Fields, "PtrInt")
-	if !ptrIntField.Optional {
+	if !schema.FieldOptional(*ptrIntField) {
 		t.Error("PtrInt should be optional")
 	}
 }
@@ -321,10 +337,11 @@ func TestReflectionProvider_SliceAndArray(t *testing.T) {
 		t.Errorf("ByteSlice should be PrimitiveBytes")
 	}
 
-	// ByteArray should be [16]byte - an array of bytes, NOT PrimitiveBytes
+	// ByteArray uses v2's base64 representation and retains its decoded length.
 	byteArrayField := findField(structDesc.Fields, "ByteArray")
-	if byteArrayField.Type.Kind() != ir.KindArray {
-		t.Errorf("ByteArray should be KindArray, got %v", byteArrayField.Type.Kind())
+	byteArray, ok := byteArrayField.Type.(*ir.PrimitiveDescriptor)
+	if !ok || byteArray.PrimitiveKind != ir.PrimitiveBytes || byteArray.ByteArrayLength == nil || *byteArray.ByteArrayLength != 16 {
+		t.Errorf("ByteArray should be a 16-byte primitive, got %#v", byteArrayField.Type)
 	}
 }
 
@@ -346,7 +363,7 @@ func TestReflectionProvider_MapTypes(t *testing.T) {
 	}
 
 	mapOmitField := findField(structDesc.Fields, "MapOmit")
-	if !mapOmitField.Optional {
+	if !schema.FieldOptional(*mapOmitField) {
 		t.Error("MapOmit should be optional")
 	}
 }
@@ -373,16 +390,35 @@ func TestReflectionProvider_SpecialTypes(t *testing.T) {
 		t.Errorf("Time should be PrimitiveTime")
 	}
 
-	durationField := findField(structDesc.Fields, "Duration")
-	primDesc = durationField.Type.(*ir.PrimitiveDescriptor)
-	if primDesc.PrimitiveKind != ir.PrimitiveDuration {
-		t.Errorf("Duration should be PrimitiveDuration")
-	}
-
 	jsonNumberField := findField(structDesc.Fields, "JSONNumber")
 	primDesc = jsonNumberField.Type.(*ir.PrimitiveDescriptor)
 	if primDesc.PrimitiveKind != ir.PrimitiveFloat || primDesc.BitSize != 64 {
 		t.Errorf("JSONNumber should be PrimitiveFloat(64), got %#v", primDesc)
+	}
+
+	_, err = provider.BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{reflect.TypeOf(InvalidDuration{})},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no default encoding/json/v2 representation") {
+		t.Fatalf("duration error = %v", err)
+	}
+	for _, typ := range []reflect.Type{reflect.TypeFor[time.Duration](), reflect.TypeFor[*time.Duration]()} {
+		_, err = provider.BuildSchema(context.Background(), ReflectionInputOptions{RootTypes: []reflect.Type{typ}})
+		if err == nil || !strings.Contains(err.Error(), "no default encoding/json/v2 representation") {
+			t.Fatalf("duration root %v error = %v", typ, err)
+		}
+	}
+	_, err = provider.BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{reflect.TypeOf(InvalidFormat{})},
+	})
+	if err == nil || !strings.Contains(err.Error(), `does not support "format:base64"`) {
+		t.Fatalf("format error = %v", err)
+	}
+	_, err = provider.BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{reflect.TypeOf(InvalidEmbed{})},
+	})
+	if err == nil || !strings.Contains(err.Error(), "explicit encoding/json/v2 embed fields are not supported") {
+		t.Fatalf("embed error = %v", err)
 	}
 
 	jsonNumberStringField := findField(structDesc.Fields, "JSONNumberString")
@@ -586,9 +622,11 @@ func TestReflectionProvider_StringEncoded(t *testing.T) {
 		t.Error("NumberAsString should have StringEncoded=true")
 	}
 
-	boolField := findField(structDesc.Fields, "BoolAsString")
-	if !boolField.StringEncoded {
-		t.Error("BoolAsString should have StringEncoded=true")
+	_, err = provider.BuildSchema(context.Background(), ReflectionInputOptions{
+		RootTypes: []reflect.Type{reflect.TypeOf(InvalidStringEncoded{})},
+	})
+	if err == nil || !strings.Contains(err.Error(), "only applies to numeric types") {
+		t.Fatalf("invalid bool ,string error = %v", err)
 	}
 }
 
@@ -692,12 +730,12 @@ func TestReflectionProvider_OmitZero(t *testing.T) {
 	structDesc := schema.Types[0].(*ir.StructDescriptor)
 
 	field1 := findField(structDesc.Fields, "Field1")
-	if !field1.Optional {
+	if !field1.OmitZero {
 		t.Error("Field1 with omitzero should be optional")
 	}
 
 	field2 := findField(structDesc.Fields, "Field2")
-	if !field2.Optional {
+	if !field2.OmitEmpty {
 		t.Error("Field2 with omitempty should be optional")
 	}
 }
@@ -863,16 +901,6 @@ func TestReflectionProvider_UnsupportedMapKeys(t *testing.T) {
 			keyType: reflect.TypeOf(true),
 			wantErr: "unsupported map key type: bool",
 		},
-		{
-			name:    "float32 key",
-			keyType: reflect.TypeOf(float32(0)),
-			wantErr: "unsupported map key type",
-		},
-		{
-			name:    "float64 key",
-			keyType: reflect.TypeOf(float64(0)),
-			wantErr: "unsupported map key type",
-		},
 	}
 
 	for _, tt := range tests {
@@ -947,7 +975,8 @@ func TestParseJSONTag(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.tag, func(t *testing.T) {
-			jsonName, optional, skip, stringEnc := parseJSONTag(tt.tag, tt.fieldName)
+			jsonName, omitEmpty, omitZero, skip, stringEnc, format := parseJSONTag(tt.tag, tt.fieldName)
+			optional := omitEmpty || omitZero
 
 			if jsonName != tt.wantJSON {
 				t.Errorf("jsonName: got %q, want %q", jsonName, tt.wantJSON)
@@ -960,6 +989,9 @@ func TestParseJSONTag(t *testing.T) {
 			}
 			if stringEnc != tt.wantStringEnc {
 				t.Errorf("stringEncoded: got %v, want %v", stringEnc, tt.wantStringEnc)
+			}
+			if format != "" {
+				t.Errorf("format: got %q, want empty", format)
 			}
 		})
 	}
@@ -1583,7 +1615,7 @@ func TestReflectionProvider_EmbeddedPointer(t *testing.T) {
 	if promotedField == nil {
 		t.Fatal("promoted PtrField not found")
 	}
-	if !promotedField.Optional {
+	if !schema.FieldOptional(*promotedField) {
 		t.Error("field promoted through a pointer embed should be optional")
 	}
 
@@ -2092,9 +2124,8 @@ func TestReflectionProvider_JSONEmbeddingParity(t *testing.T) {
 	}{
 		{name: "equal-depth conflict", typ: reflect.TypeOf(testdata.EqualDepthConflict{}), wantFields: []string{"A", "B", "Own"}, absent: []string{"Clash"}},
 		{name: "tagged dominance", typ: reflect.TypeOf(testdata.TaggedDominance{}), wantFields: []string{"Tagged"}, absent: []string{"Same"}},
-		{name: "options-only embed", typ: reflect.TypeOf(testdata.OptionsOnlyEmbedding{}), wantFields: []string{"Clash", "A"}},
 		{name: "tagged embed", typ: reflect.TypeOf(testdata.TaggedEmbedding{}), wantFields: []string{"ConflictA"}},
-		{name: "scalar embeds", typ: reflect.TypeOf(testdata.ScalarEmbedding{}), wantFields: []string{"EmbeddedString", "EmbeddedInterface"}},
+		{name: "Unicode JSON name", typ: reflect.TypeOf(testdata.UnicodeJSONName{}), wantFields: []string{"Value"}},
 	}
 
 	provider := &ReflectionProvider{}
@@ -2124,6 +2155,36 @@ func TestReflectionProvider_JSONEmbeddingParity(t *testing.T) {
 		})
 	}
 
+	for _, tt := range []struct {
+		name    string
+		typ     reflect.Type
+		wantErr string
+	}{
+		{name: "options-only embed", typ: reflect.TypeOf(jsonv2invalid.OptionsOnlyEmbedding{}), wantErr: "cannot have options without an explicit JSON name"},
+		{name: "scalar embeds", typ: reflect.TypeOf(jsonv2invalid.ScalarEmbedding{}), wantErr: "embedded non-struct field"},
+		{name: "direct name conflict", typ: reflect.TypeOf(jsonv2invalid.DirectNameConflict{}), wantErr: "conflict over JSON object name"},
+	} {
+		t.Run(tt.name+" rejected", func(t *testing.T) {
+			_, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{RootTypes: []reflect.Type{tt.typ}})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("BuildSchema error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("Unicode JSON name", func(t *testing.T) {
+		schema, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{
+			RootTypes: []reflect.Type{reflect.TypeOf(testdata.UnicodeJSONName{})},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		field := findField(findType(schema, "UnicodeJSONName").(*ir.StructDescriptor).Fields, "Value")
+		if field == nil || field.JSONName != "💡" {
+			t.Fatalf("Unicode field = %#v, want JSON name 💡", field)
+		}
+	})
+
 	t.Run("pointer promotion is optional", func(t *testing.T) {
 		schema, err := provider.BuildSchema(context.Background(), ReflectionInputOptions{
 			RootTypes: []reflect.Type{reflect.TypeOf(testdata.PointerEmbedding{})},
@@ -2132,7 +2193,7 @@ func TestReflectionProvider_JSONEmbeddingParity(t *testing.T) {
 			t.Fatal(err)
 		}
 		field := findField(findType(schema, "PointerEmbedding").(*ir.StructDescriptor).Fields, "FromPointer")
-		if field == nil || !field.Optional {
+		if field == nil || !schema.FieldOptional(*field) {
 			t.Fatalf("promoted pointer field = %#v, want optional", field)
 		}
 	})

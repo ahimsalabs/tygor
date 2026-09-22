@@ -21,7 +21,7 @@ func TestZodFlavor_EmitStruct(t *testing.T) {
 		Fields: []ir.FieldDescriptor{
 			{Name: "ID", JSONName: "id", Type: ir.Int(64)},
 			{Name: "Email", JSONName: "email", Type: ir.String(), ValidateTag: "required,email"},
-			{Name: "Name", JSONName: "name", Type: ir.String(), Optional: true},
+			{Name: "Name", JSONName: "name", Type: ir.String(), OmitZero: true},
 		},
 	}
 
@@ -765,7 +765,6 @@ func TestZodFlavor_StringEncoded(t *testing.T) {
 		Fields: []ir.FieldDescriptor{
 			{Name: "BigID", JSONName: "big_id", Type: ir.Int(64), StringEncoded: true},
 			{Name: "Count", JSONName: "count", Type: ir.Int(32), StringEncoded: false},
-			{Name: "Flag", JSONName: "flag", Type: ir.Bool(), StringEncoded: true},
 		},
 	}
 
@@ -790,23 +789,17 @@ func TestZodFlavor_StringEncoded(t *testing.T) {
 		t.Errorf("expected regular z.number().int() for non-StringEncoded, got: %s", output)
 	}
 
-	if !strings.Contains(output, `"flag": z.enum(["true", "false"])`) {
-		t.Errorf("expected strict bool wire strings, got: %s", output)
-	}
 }
 
-func TestZodFlavor_StringEncodedNamedScalars(t *testing.T) {
+func TestZodFlavor_StringEncodedNamedNumericEnum(t *testing.T) {
 	pkg := "example.com/model"
-	boolID := ir.GoIdentifier{Name: "Flag", Package: pkg}
 	enumID := ir.GoIdentifier{Name: "Level", Package: pkg}
 	schema := &ir.Schema{Types: []ir.TypeDescriptor{
-		&ir.AliasDescriptor{Name: boolID, Underlying: ir.Bool()},
 		&ir.EnumDescriptor{Name: enumID, Members: []ir.EnumMember{{Name: "Low", Value: int64(1)}, {Name: "High", Value: int64(2)}}},
 	}}
 	model := &ir.StructDescriptor{
 		Name: ir.GoIdentifier{Name: "Named", Package: pkg},
 		Fields: []ir.FieldDescriptor{
-			{Name: "Flag", JSONName: "flag", Type: ir.Ref(boolID.Name, boolID.Package), StringEncoded: true},
 			{Name: "Level", JSONName: "level", Type: ir.Ref(enumID.Name, enumID.Package), StringEncoded: true},
 		},
 	}
@@ -818,9 +811,6 @@ func TestZodFlavor_StringEncodedNamedScalars(t *testing.T) {
 				t.Fatal(err)
 			}
 			output := string(got)
-			if !strings.Contains(output, `z.enum(["true", "false"])`) {
-				t.Fatalf("named bool did not retain strict wire strings: %s", output)
-			}
 			if !strings.Contains(output, `BigInt(v).toString()`) {
 				t.Fatalf("numeric enum did not validate encoded wire members: %s", output)
 			}
@@ -882,7 +872,7 @@ func TestZodMiniFlavor_EmitStruct(t *testing.T) {
 		Fields: []ir.FieldDescriptor{
 			{Name: "ID", JSONName: "id", Type: ir.Int(64)},
 			{Name: "Email", JSONName: "email", Type: ir.String(), ValidateTag: "required,email"},
-			{Name: "Name", JSONName: "name", Type: ir.String(), Optional: true},
+			{Name: "Name", JSONName: "name", Type: ir.String(), OmitZero: true},
 		},
 	}
 
@@ -918,7 +908,7 @@ func TestZodMiniFlavor_NullableField(t *testing.T) {
 		Name: ir.GoIdentifier{Name: "Test"},
 		Fields: []ir.FieldDescriptor{
 			{Name: "Ptr", JSONName: "ptr", Type: ir.Ptr(ir.String())},
-			{Name: "OptPtr", JSONName: "opt_ptr", Type: ir.Ptr(ir.Int(32)), Optional: true},
+			{Name: "OptPtr", JSONName: "opt_ptr", Type: ir.Ptr(ir.Int(32)), OmitZero: true},
 		},
 	}
 
@@ -935,9 +925,9 @@ func TestZodMiniFlavor_NullableField(t *testing.T) {
 		t.Errorf("expected z.nullable(z.string()) for pointer, got: %s", output)
 	}
 
-	// Should wrap nullable in optional: z.optional(z.nullable(...))
-	if !strings.Contains(output, "z.optional(z.nullable(") {
-		t.Errorf("expected z.optional(z.nullable(...)) for optional pointer, got: %s", output)
+	// omitzero removes the nil pointer state, so a present value is non-null.
+	if !strings.Contains(output, "z.optional(z.number()") || strings.Contains(output, "z.optional(z.nullable(") {
+		t.Errorf("expected non-null optional pointer schema, got: %s", output)
 	}
 }
 
@@ -1041,7 +1031,7 @@ func TestZodMiniFlavor_OneOf(t *testing.T) {
 		Name: ir.GoIdentifier{Name: "Priority"},
 		Fields: []ir.FieldDescriptor{
 			{Name: "Level", JSONName: "level", Type: ir.String(), ValidateTag: "oneof=low medium high"},
-			{Name: "OptLevel", JSONName: "opt_level", Type: ir.String(), ValidateTag: "oneof=a b c", Optional: true},
+			{Name: "OptLevel", JSONName: "opt_level", Type: ir.String(), ValidateTag: "oneof=a b c", OmitZero: true},
 		},
 	}
 

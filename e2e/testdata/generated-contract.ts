@@ -5,27 +5,29 @@ import { schemaMap as miniSchemaMap } from './schemas.map.zod-mini';
 import type { Contract } from './types';
 
 const valid = JSON.parse(__WIRE_JSON__);
-const nullCollections: Pick<Contract, 'items' | 'counts' | 'lookup' | 'groups' | 'bytes' | 'byte_groups' | 'names' | 'labels' | 'optional' | 'maybe'> = {
-  items: null,
-  counts: null,
-  lookup: null,
-  groups: null,
-  bytes: null,
-  byte_groups: null,
+const normalizedCollections: Pick<Contract, 'items' | 'counts' | 'lookup' | 'groups' | 'bytes' | 'byte_groups' | 'names' | 'labels' | 'maybe'> = {
+  items: [null],
+  counts: {},
+  lookup: {},
+  groups: [],
+  bytes: "",
+  byte_groups: [],
   names: null,
   labels: null,
-  optional: null,
   maybe: null,
 };
 const pointerElements: Contract['items'] = [null];
-const nestedNilSlice: Contract['groups'] = [null];
-void [nullCollections, pointerElements, nestedNilSlice];
+const nestedEmptySlice: Contract['groups'] = [[]];
+void [normalizedCollections, pointerElements, nestedEmptySlice];
 for (const schema of [ContractSchema, MiniContractSchema]) {
   schema.parse(valid);
-  schema.parse({ ...valid, optional: null });
-  schema.parse({ ...valid, ...nullCollections });
+  schema.parse({ ...valid, ...normalizedCollections });
+  if (schema.safeParse({ ...valid, optional: null }).success) throw new Error('accepted present null omitzero pointer');
+  for (const field of ['items', 'counts', 'lookup', 'groups', 'bytes', 'byte_groups']) {
+    if (schema.safeParse({ ...valid, [field]: null }).success) throw new Error('accepted null collection: ' + field);
+  }
   if (schema.safeParse({ ...valid, flag: "garbage" }).success) throw new Error('accepted invalid bool string');
-  if (schema.safeParse({ ...valid, flag: "true" }).success) throw new Error('ignored bool oneof');
+  if (schema.safeParse({ ...valid, flag: true }).success) throw new Error('ignored bool oneof');
   if (schema.safeParse({ ...valid, big_id: "9223372036854775808" }).success) throw new Error('accepted overflowing int64');
   if (schema.safeParse({ ...valid, unsigned_id: "18446744073709551616" }).success) throw new Error('accepted overflowing uint64');
   if (schema.safeParse({ ...valid, ratio: "NaN" }).success) throw new Error('accepted non-JSON float string');
@@ -39,8 +41,8 @@ for (const schema of [ContractSchema, MiniContractSchema]) {
   }
   if (schema.safeParse({ ...valid, unsigned_counts: { "+1": "bad" } }).success) throw new Error('accepted signed unsigned map key');
   if (schema.safeParse({ ...valid, unsigned_counts: { "256": "bad" } }).success) throw new Error('accepted overflowing uint8 map key');
-  if (schema.safeParse({ ...valid, encoded: JSON.stringify("not-an-email") }).success) throw new Error('validated encoded source text instead of its Go string value');
-  if (schema.safeParse({ ...valid, encoded_choice: JSON.stringify("green") }).success) throw new Error('ignored encoded string oneof');
+  if (schema.safeParse({ ...valid, encoded: "not-an-email" }).success) throw new Error('ignored email validation');
+  if (schema.safeParse({ ...valid, encoded_choice: "green" }).success) throw new Error('ignored string oneof');
   if (schema.safeParse({ ...valid, status: "2" }).success) throw new Error('accepted invalid encoded integer enum');
   if (schema.safeParse({ ...valid, status: "3" }).success) throw new Error('ignored encoded numeric enum validation');
   if (schema.safeParse({ ...valid, status_number: 2 }).success) throw new Error('ignored numeric enum oneof');

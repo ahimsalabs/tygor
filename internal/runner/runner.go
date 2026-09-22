@@ -7,7 +7,7 @@ package runner
 
 import (
 	"bytes"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -158,7 +158,7 @@ func execOverlay(opts Options) (output []byte, err error) {
 		Replace map[string]string `json:"Replace"`
 	}{Replace: overlay}
 
-	overlayJSON, err := json.Marshal(overlayData)
+	overlayJSON, err := json.Marshal(overlayData, json.Deterministic(true))
 	if err != nil {
 		return nil, fmt.Errorf("marshal overlay: %w", err)
 	}
@@ -261,7 +261,7 @@ func execImport(opts Options) (output []byte, err error) {
 		Replace map[string]string `json:"Replace"`
 	}{Replace: overlay}
 
-	overlayJSON, err := json.Marshal(overlayData)
+	overlayJSON, err := json.Marshal(overlayData, json.Deterministic(true))
 	if err != nil {
 		return nil, fmt.Errorf("marshal overlay: %w", err)
 	}

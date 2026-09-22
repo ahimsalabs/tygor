@@ -441,7 +441,7 @@ func TestTypeScriptGenerator_Generate_ArrayFixedLengthEdgeCase(t *testing.T) {
 								Name:     "Items",
 								JSONName: "items",
 								Type:     ir.Array(ir.String(), tt.length),
-								Optional: true,
+								OmitZero: true,
 							},
 						},
 					},
